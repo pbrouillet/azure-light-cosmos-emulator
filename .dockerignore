@@ -1,0 +1,10 @@
+**/bin
+**/obj
+.git
+.gitignore
+.sdk-tests
+.vs
+TestResults
+coverage
+node_modules
+src/Explorer/node_modules

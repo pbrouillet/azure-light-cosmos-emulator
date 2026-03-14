@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Restore
+        run: dotnet restore Azure.Cosmos.LightEmulator.slnx
+      - name: Build
+        run: dotnet build Azure.Cosmos.LightEmulator.slnx -c Release --no-restore
+      - name: Test
+        run: dotnet test Azure.Cosmos.LightEmulator.slnx -c Release --no-build --verbosity normal
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -f docker/Dockerfile .

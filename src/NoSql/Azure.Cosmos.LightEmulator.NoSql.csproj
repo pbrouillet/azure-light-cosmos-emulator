@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Jint" />
+    <PackageReference Include="Antlr4.Runtime.Standard" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Core\Azure.Cosmos.LightEmulator.Core.csproj" />
+    <ProjectReference Include="..\Storage\Azure.Cosmos.LightEmulator.Storage.csproj" />
+    <ProjectReference Include="..\Auth\Azure.Cosmos.LightEmulator.Auth.csproj" />
+  </ItemGroup>
+
+</Project>

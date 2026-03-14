@@ -416,3 +416,13 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Project-specific
+dist/
+.sdk-tests/
+.idea/
+*.swp
+*.swo
+.env.local
+appsettings.Development.json
+coverage/

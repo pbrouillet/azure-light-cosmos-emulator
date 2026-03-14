@@ -1,0 +1,16 @@
+services:
+  cosmos-emulator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8081:8081"
+      - "10255:10255"
+    volumes:
+      - cosmos-data:/data
+    environment:
+      Emulator__DataDirectory: /data
+      Emulator__EnableSsl: "false"
+
+volumes:
+  cosmos-data:

@@ -1,0 +1,46 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/Auth/">
+    <Project Path="src/Auth/Azure.Cosmos.LightEmulator.Auth.csproj" />
+  </Folder>
+  <Folder Name="/src/Cli/">
+    <Project Path="src/Cli/Azure.Cosmos.LightEmulator.Cli.csproj" />
+  </Folder>
+  <Folder Name="/src/Core/">
+    <Project Path="src/Core/Azure.Cosmos.LightEmulator.Core.csproj" />
+  </Folder>
+  <Folder Name="/src/Host/">
+    <Project Path="src/Host/Azure.Cosmos.LightEmulator.Host.csproj" />
+  </Folder>
+  <Folder Name="/src/MongoDB/">
+    <Project Path="src/MongoDB/Azure.Cosmos.LightEmulator.MongoDB.csproj" />
+  </Folder>
+  <Folder Name="/src/NoSql/">
+    <Project Path="src/NoSql/Azure.Cosmos.LightEmulator.NoSql.csproj" />
+  </Folder>
+  <Folder Name="/src/Storage/">
+    <Project Path="src/Storage/Azure.Cosmos.LightEmulator.Storage.csproj" />
+  </Folder>
+  <Folder Name="/src/Triggers/">
+    <Project Path="src/Triggers/Azure.Cosmos.LightEmulator.Triggers.csproj" />
+  </Folder>
+  <Folder Name="/tests/" />
+  <Folder Name="/tests/Auth.Tests/">
+    <Project Path="tests/Auth.Tests/Azure.Cosmos.LightEmulator.Auth.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/Core.Tests/">
+    <Project Path="tests/Core.Tests/Azure.Cosmos.LightEmulator.Core.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/MongoDB.Tests/">
+    <Project Path="tests/MongoDB.Tests/Azure.Cosmos.LightEmulator.MongoDB.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/NoSql.Tests/">
+    <Project Path="tests/NoSql.Tests/Azure.Cosmos.LightEmulator.NoSql.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/Parity/">
+    <Project Path="tests/Parity/Azure.Cosmos.LightEmulator.Parity.csproj" />
+  </Folder>
+  <Folder Name="/tests/Storage.Tests/">
+    <Project Path="tests/Storage.Tests/Azure.Cosmos.LightEmulator.Storage.Tests.csproj" />
+  </Folder>
+</Solution>

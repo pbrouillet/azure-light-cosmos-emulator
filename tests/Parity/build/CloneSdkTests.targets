@@ -1,0 +1,20 @@
+<Project>
+  <PropertyGroup>
+    <RepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..'))</RepositoryRoot>
+    <SdkTestsDirectory>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..\.sdk-tests'))</SdkTestsDirectory>
+  </PropertyGroup>
+
+  <Target Name="CloneSdkTests" BeforeTargets="Build" Condition="'$(SkipCloneSdkTests)' != 'true'">
+    <Exec
+      Condition="!Exists('$(SdkTestsDirectory)')"
+      Command="git clone --depth 1 https://github.com/Azure/azure-cosmos-dotnet-v3.git &quot;$(SdkTestsDirectory)&quot;"
+      WorkingDirectory="$(RepositoryRoot)"
+      ContinueOnError="true" />
+
+    <Exec
+      Condition="Exists('$(SdkTestsDirectory)')"
+      Command="git -C &quot;$(SdkTestsDirectory)&quot; fetch --depth 1 origin master &amp;&amp; git -C &quot;$(SdkTestsDirectory)&quot; checkout FETCH_HEAD"
+      WorkingDirectory="$(RepositoryRoot)"
+      ContinueOnError="true" />
+  </Target>
+</Project>
