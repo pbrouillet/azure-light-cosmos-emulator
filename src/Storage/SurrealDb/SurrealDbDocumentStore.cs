@@ -23,6 +23,9 @@ internal sealed class DbDatabaseRecord
 
     [JsonPropertyName("timestamp")]
     public long Timestamp { get; set; }
+
+    [JsonPropertyName("maxThroughput")]
+    public int? MaxThroughput { get; set; }
 }
 
 internal sealed class DbContainerRecord
@@ -50,6 +53,9 @@ internal sealed class DbContainerRecord
 
     [JsonPropertyName("defaultTimeToLive")]
     public int? DefaultTimeToLive { get; set; }
+
+    [JsonPropertyName("maxThroughput")]
+    public int? MaxThroughput { get; set; }
 
     [JsonPropertyName("uniqueKeyPolicyJson")]
     public string? UniqueKeyPolicyJson { get; set; }
@@ -154,6 +160,24 @@ public class SurrealDbDocumentStore : IDocumentStore
         };
     }
 
+    public async Task<CosmosDatabase> ReplaceDatabaseAsync(CosmosDatabase database, CancellationToken ct = default)
+    {
+        var databaseKey = MakeDatabaseRecordKey(database.Id);
+        var existing = await GetRequiredRecordAsync<DbDatabaseRecord>(DatabaseTable, databaseKey, "Database", database.Id, ct);
+
+        var updated = new CosmosDatabase
+        {
+            Id = database.Id,
+            Rid = existing.Rid,
+            ETag = ETagGenerator.Generate(),
+            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            MaxThroughput = database.MaxThroughput
+        };
+
+        await UpsertRecordAsync(DatabaseTable, databaseKey, ToRecord(updated), ct);
+        return updated;
+    }
+
     public async Task DeleteDatabaseAsync(string id, CancellationToken ct = default)
     {
         var databaseKey = MakeDatabaseRecordKey(id);
@@ -230,6 +254,7 @@ public class SurrealDbDocumentStore : IDocumentStore
             PartitionKey = container.PartitionKey,
             IndexingPolicy = container.IndexingPolicy,
             DefaultTimeToLive = container.DefaultTimeToLive,
+            MaxThroughput = container.MaxThroughput,
             UniqueKeyPolicy = container.UniqueKeyPolicy,
             ConflictResolutionPolicy = container.ConflictResolutionPolicy,
             Rid = existing.Rid,
@@ -278,6 +303,7 @@ public class SurrealDbDocumentStore : IDocumentStore
             ContainerId = containerId,
             PartitionKey = partitionKey,
             Body = document.DeepClone().AsObject(),
+            TimeToLive = ExtractTimeToLive(document),
             Lsn = await GetNextLsnAsync(ct),
             Self = $"dbs/{databaseId}/colls/{containerId}/docs/{id}/"
         };
@@ -320,7 +346,7 @@ public class SurrealDbDocumentStore : IDocumentStore
             ContainerId = containerId,
             PartitionKey = partitionKey,
             Body = document.DeepClone().AsObject(),
-            TimeToLive = existing.TimeToLive,
+            TimeToLive = ExtractTimeToLive(document),
             Lsn = await GetNextLsnAsync(ct),
             Self = existing.Self,
             ETag = ETagGenerator.Generate(),
@@ -354,9 +380,17 @@ public class SurrealDbDocumentStore : IDocumentStore
         var documentKey = MakeDocumentRecordKey(databaseId, containerId, documentId, partitionKey);
         var removedRecord = await GetRequiredRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, "Document", documentId, ct);
         var removed = ToCosmosDocument(removedRecord);
+        removed.Lsn = await GetNextLsnAsync(ct);
+        removed.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         await DeleteRecordAsync(DocumentTable, documentKey, "Document", documentId, ct);
         await _changeFeed.RecordChangeAsync(databaseId, containerId, removed, ChangeType.Delete, ct: ct);
+    }
+
+    public async Task<long> GetGlobalLsnAsync(CancellationToken ct = default)
+    {
+        var meta = await SelectRecordAsync<DbMetaRecord>(MetaTable, MakeMetaRecordKey(GlobalLsnKey), ct);
+        return meta?.Value ?? await GetLatestLsnAsync(ct);
     }
 
     public async Task<FeedResponse<CosmosDocument>> ReadManyDocumentsAsync(string databaseId, string containerId, IEnumerable<(string id, PartitionKeyValue pk)> items, CancellationToken ct = default)
@@ -504,7 +538,8 @@ public class SurrealDbDocumentStore : IDocumentStore
         Id = database.Id,
         Rid = database.Rid,
         ETag = database.ETag,
-        Timestamp = database.Timestamp
+        Timestamp = database.Timestamp,
+        MaxThroughput = database.MaxThroughput
     };
 
     private static CosmosDatabase ToCosmosDatabase(DbDatabaseRecord record) => new()
@@ -512,7 +547,8 @@ public class SurrealDbDocumentStore : IDocumentStore
         Id = record.Id,
         Rid = record.Rid,
         ETag = record.ETag,
-        Timestamp = record.Timestamp
+        Timestamp = record.Timestamp,
+        MaxThroughput = record.MaxThroughput
     };
 
     private static DbContainerRecord ToRecord(CosmosContainer container) => new()
@@ -525,6 +561,7 @@ public class SurrealDbDocumentStore : IDocumentStore
         PartitionKeyJson = JsonSerializer.Serialize(container.PartitionKey, JsonOptions),
         IndexingPolicyJson = JsonSerializer.Serialize(container.IndexingPolicy, JsonOptions),
         DefaultTimeToLive = container.DefaultTimeToLive,
+        MaxThroughput = container.MaxThroughput,
         UniqueKeyPolicyJson = SerializeNullable(container.UniqueKeyPolicy),
         ConflictResolutionPolicyJson = SerializeNullable(container.ConflictResolutionPolicy)
     };
@@ -542,6 +579,7 @@ public class SurrealDbDocumentStore : IDocumentStore
             ? new IndexingPolicy()
             : DeserializeRequired<IndexingPolicy>(record.IndexingPolicyJson),
         DefaultTimeToLive = record.DefaultTimeToLive,
+        MaxThroughput = record.MaxThroughput ?? 400,
         UniqueKeyPolicy = DeserializeNullable<UniqueKeyPolicy>(record.UniqueKeyPolicyJson),
         ConflictResolutionPolicy = DeserializeNullable<ConflictResolutionPolicy>(record.ConflictResolutionPolicyJson)
     };
@@ -634,6 +672,16 @@ public class SurrealDbDocumentStore : IDocumentStore
         }
 
         return new PartitionKeyValue { Components = values };
+    }
+
+    private static int? ExtractTimeToLive(JsonObject document)
+    {
+        if (document["ttl"] is null)
+        {
+            return null;
+        }
+
+        return document["ttl"]?.GetValue<int>();
     }
 
     private static object? ConvertJsonNodeToValue(JsonNode? node) => node switch

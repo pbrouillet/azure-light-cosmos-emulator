@@ -111,6 +111,8 @@ public sealed class EmulatorRequestTrackingMiddleware(RequestDelegate next)
 
         return !value.Equals("/", StringComparison.OrdinalIgnoreCase)
             && !value.Equals("/api/emulator/activity", StringComparison.OrdinalIgnoreCase)
+            && !value.Equals("/api/emulator/explain", StringComparison.OrdinalIgnoreCase)
+            && !value.StartsWith("/api/emulator/throughput", StringComparison.OrdinalIgnoreCase)
             && !value.StartsWith("/explorer", StringComparison.OrdinalIgnoreCase)
             && !value.StartsWith("/health", StringComparison.OrdinalIgnoreCase)
             && !value.StartsWith("/swagger", StringComparison.OrdinalIgnoreCase);

@@ -4,6 +4,7 @@ using System.Text.Json.Nodes;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
@@ -13,11 +14,12 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 /// </summary>
 [ApiController]
 [Route("dbs")]
-public class DatabasesController : ControllerBase
+public class DatabasesController : CosmosControllerBase
 {
     private readonly IDocumentStore _store;
 
-    public DatabasesController(IDocumentStore store)
+    public DatabasesController(IDocumentStore store, CosmosResponseHeaderService responseHeaders)
+        : base(responseHeaders)
     {
         _store = store;
     }
@@ -33,7 +35,11 @@ public class DatabasesController : ControllerBase
         try
         {
             var db = await _store.CreateDatabaseAsync(id, ct);
-            SetCommonHeaders(RuCostCalculator.CreateDatabase());
+
+            if (body["maxThroughput"]?.GetValue<int>() is int maxThroughput)
+                db.MaxThroughput = maxThroughput;
+
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = RuCostCalculator.CreateDatabase() }, ct);
             return StatusCode((int)HttpStatusCode.Created, FormatDatabase(db));
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
@@ -46,7 +52,7 @@ public class DatabasesController : ControllerBase
     public async Task<IActionResult> List(CancellationToken ct)
     {
         var result = await _store.ListDatabasesAsync(ct);
-        SetCommonHeaders(RuCostCalculator.ListDatabases());
+        await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = RuCostCalculator.ListDatabases() }, ct);
         return Ok(new
         {
             _rid = "",
@@ -61,7 +67,7 @@ public class DatabasesController : ControllerBase
         try
         {
             var db = await _store.GetDatabaseAsync(dbId, ct);
-            SetCommonHeaders(RuCostCalculator.GetDatabase());
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = RuCostCalculator.GetDatabase() }, ct);
             return Ok(FormatDatabase(db));
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -76,7 +82,7 @@ public class DatabasesController : ControllerBase
         try
         {
             await _store.DeleteDatabaseAsync(dbId, ct);
-            SetCommonHeaders(RuCostCalculator.DeleteDatabase());
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = RuCostCalculator.DeleteDatabase() }, ct);
             return NoContent();
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -98,14 +104,6 @@ public class DatabasesController : ControllerBase
         }
     }
 
-    private void SetCommonHeaders(double ru = 1.0)
-    {
-        Response.Headers[CosmosHeaders.RequestCharge] = ru.ToString("F2");
-        Response.Headers[CosmosHeaders.ActivityId] = Guid.NewGuid().ToString();
-        Response.Headers[CosmosHeaders.ServiceVersion] = CosmosHeaders.CurrentServiceVersion;
-        Response.Headers[CosmosHeaders.SchemaVersion] = CosmosHeaders.CurrentSchemaVersion;
-    }
-
     private static object FormatDatabase(CosmosDatabase db) => new
     {
         id = db.Id,
@@ -114,7 +112,8 @@ public class DatabasesController : ControllerBase
         _etag = db.ETag,
         _ts = db.Timestamp,
         _colls = db.Colls,
-        _users = db.Users
+        _users = db.Users,
+        maxThroughput = db.MaxThroughput
     };
 
     private static object ErrorResponse(string code, string message) => new

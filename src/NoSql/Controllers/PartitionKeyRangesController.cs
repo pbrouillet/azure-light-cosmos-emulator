@@ -1,19 +1,18 @@
 using Azure.Cosmos.LightEmulator.Core.Models;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 
 [ApiController]
 [Route("dbs/{dbId}/colls/{collId}/pkranges")]
-public class PartitionKeyRangesController : ControllerBase
+public class PartitionKeyRangesController(CosmosResponseHeaderService responseHeaders) : CosmosControllerBase(responseHeaders)
 {
     [HttpGet]
-    public IActionResult List(string collId)
+    public async Task<IActionResult> List(string dbId, string collId, CancellationToken ct)
     {
-        Response.Headers[CosmosHeaders.RequestCharge] = "1";
-        Response.Headers[CosmosHeaders.ActivityId] = Guid.NewGuid().ToString();
+        await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { DatabaseId = dbId, ContainerId = collId }, ct);
         Response.Headers[CosmosHeaders.ItemCount] = "1";
-        Response.Headers[CosmosHeaders.ServiceVersion] = CosmosHeaders.CurrentServiceVersion;
 
         return Ok(new
         {

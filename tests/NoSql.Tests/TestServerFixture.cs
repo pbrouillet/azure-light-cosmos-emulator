@@ -1,12 +1,14 @@
 using System.Globalization;
 using System.Net.Http.Json;
+using System.Text.Json.Nodes;
 using Azure.Cosmos.LightEmulator.Auth.KeyAuth;
 using Azure.Cosmos.LightEmulator.Core.Consistency;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
-using Azure.Cosmos.LightEmulator.NoSql;
 using Azure.Cosmos.LightEmulator.NoSql.Controllers;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Azure.Cosmos.LightEmulator.NoSql.Middleware;
+using Azure.Cosmos.LightEmulator.NoSql.Query;
 using Azure.Cosmos.LightEmulator.NoSql.StoredProcedures;
 using Azure.Cosmos.LightEmulator.Storage.ChangeFeed;
 using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
@@ -75,6 +77,18 @@ public sealed class TestServerFixture : IAsyncDisposable
         };
     }
 
+    public HttpClient CreateUnauthenticatedClient()
+    {
+        if (_app is null)
+        {
+            throw new InvalidOperationException("The test server has not been initialized.");
+        }
+
+        var client = _app.GetTestServer().CreateClient();
+        client.BaseAddress = new Uri("http://localhost");
+        return client;
+    }
+
     private async Task InitializeAsync()
     {
         Directory.CreateDirectory(_dataDirectory);
@@ -96,10 +110,14 @@ public sealed class TestServerFixture : IAsyncDisposable
         builder.Services.AddSingleton<IChangeFeedProvider, InMemoryChangeFeedProvider>();
         builder.Services.AddSingleton<SurrealDbDocumentStore>();
         builder.Services.AddSingleton<IDocumentStore>(sp => sp.GetRequiredService<SurrealDbDocumentStore>());
-        builder.Services.AddSingleton<IQueryEngine, StubQueryEngine>();
+        builder.Services.AddSingleton<EmulatorRuntimeState>();
+        builder.Services.AddSingleton<IEmulatorInfoService, FakeEmulatorInfoService>();
+        builder.Services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
+        builder.Services.AddSingleton<QueryExplainService>();
         builder.Services.AddSingleton<IAuthProvider>(_ => new MasterKeyAuthProvider(KnownMasterKey));
         builder.Services.AddSingleton<IProgrammabilityEngine, JintProgrammabilityEngine>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ConsistencyLevel.Session));
+        builder.Services.AddSingleton<CosmosResponseHeaderService>();
 
         _app = builder.Build();
         _app.UseMiddleware<CosmosExceptionMiddleware>();
@@ -204,5 +222,15 @@ public sealed class TestServerFixture : IAsyncDisposable
             fixture.ApplyAuthHeaders(request);
             return base.SendAsync(request, cancellationToken);
         }
+    }
+
+    private sealed class FakeEmulatorInfoService : IEmulatorInfoService
+    {
+        public Task<JsonObject> GetInfoAsync(CancellationToken ct = default) => Task.FromResult(new JsonObject());
+
+        public Task<JsonObject> GetStatsAsync(CancellationToken ct = default) => Task.FromResult(new JsonObject());
+
+        public Task<JsonObject> UpdateSettingsAsync(bool enableEntraId, string? tenantId, string? clientId, CancellationToken ct = default) =>
+            Task.FromResult(new JsonObject());
     }
 }

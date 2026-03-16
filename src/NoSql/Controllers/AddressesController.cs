@@ -1,4 +1,4 @@
-using Azure.Cosmos.LightEmulator.Core.Models;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
 
@@ -6,27 +6,25 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 
 [ApiController]
 [Route("addresses")]
-public class AddressesController : ControllerBase
+public class AddressesController : CosmosControllerBase
 {
     private readonly IConfiguration _configuration;
 
-    public AddressesController(IConfiguration configuration)
+    public AddressesController(IConfiguration configuration, CosmosResponseHeaderService responseHeaders)
+        : base(responseHeaders)
     {
         _configuration = configuration;
     }
 
     [HttpGet]
-    public IActionResult GetAddresses()
+    public async Task<IActionResult> GetAddresses(CancellationToken ct)
     {
         var port = _configuration.GetValue<int>("Emulator:Port", 8081);
         var enableSsl = _configuration.GetValue<bool>("Emulator:EnableSsl", false);
         var scheme = enableSsl ? "https" : "http";
         var endpoint = $"{scheme}://localhost:{port}";
 
-        Response.Headers[CosmosHeaders.RequestCharge] = "1.00";
-        Response.Headers[CosmosHeaders.ActivityId] = Guid.NewGuid().ToString();
-        Response.Headers[CosmosHeaders.ServiceVersion] = CosmosHeaders.CurrentServiceVersion;
-
+        await SetCommonHeadersAsync(ct: ct);
         return Ok(new
         {
             _count = 1,

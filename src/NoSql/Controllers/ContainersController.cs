@@ -1,10 +1,10 @@
-using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
@@ -14,11 +14,12 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 /// </summary>
 [ApiController]
 [Route("dbs/{dbId}/colls")]
-public class ContainersController : ControllerBase
+public class ContainersController : CosmosControllerBase
 {
     private readonly IDocumentStore _store;
 
-    public ContainersController(IDocumentStore store)
+    public ContainersController(IDocumentStore store, CosmosResponseHeaderService responseHeaders)
+        : base(responseHeaders)
     {
         _store = store;
     }
@@ -51,10 +52,19 @@ public class ContainersController : ControllerBase
         if (body["defaultTtl"]?.GetValue<int>() is int ttl)
             container.DefaultTimeToLive = ttl;
 
+        if (body["maxThroughput"]?.GetValue<int>() is int maxThroughput)
+            container.MaxThroughput = maxThroughput;
+
         try
         {
             var result = await _store.CreateContainerAsync(dbId, container, ct);
-            SetCommonHeaders(RuCostCalculator.CreateContainer());
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.CreateContainer(),
+                DatabaseId = dbId,
+                ContainerId = result.Id,
+                IncludeSessionToken = true
+            }, ct);
             return StatusCode((int)HttpStatusCode.Created, FormatContainer(result));
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
@@ -73,7 +83,7 @@ public class ContainersController : ControllerBase
         try
         {
             var result = await _store.ListContainersAsync(dbId, ct);
-            SetCommonHeaders(RuCostCalculator.ListContainers());
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = RuCostCalculator.ListContainers() }, ct);
             return Ok(new
             {
                 _rid = "",
@@ -93,7 +103,7 @@ public class ContainersController : ControllerBase
         try
         {
             var container = await _store.GetContainerAsync(dbId, collId, ct);
-            SetCommonHeaders(RuCostCalculator.GetContainer());
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = RuCostCalculator.GetContainer() }, ct);
             return Ok(FormatContainer(container));
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -117,8 +127,17 @@ public class ContainersController : ControllerBase
             if (body["defaultTtl"]?.GetValue<int>() is int ttl)
                 existing.DefaultTimeToLive = ttl;
 
+            if (body["maxThroughput"]?.GetValue<int>() is int maxThroughput)
+                existing.MaxThroughput = maxThroughput;
+
             var result = await _store.ReplaceContainerAsync(dbId, existing, ct);
-            SetCommonHeaders(5.0);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = 5.0,
+                DatabaseId = dbId,
+                ContainerId = result.Id,
+                IncludeSessionToken = true
+            }, ct);
             return Ok(FormatContainer(result));
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -133,7 +152,13 @@ public class ContainersController : ControllerBase
         try
         {
             await _store.DeleteContainerAsync(dbId, collId, ct);
-            SetCommonHeaders(RuCostCalculator.DeleteContainer());
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.DeleteContainer(),
+                DatabaseId = dbId,
+                ContainerId = collId,
+                IncludeSessionToken = true
+            }, ct);
             return NoContent();
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -153,13 +178,6 @@ public class ContainersController : ControllerBase
         {
             throw CosmosEmulatorException.BadRequest("Request body must be valid JSON.");
         }
-    }
-
-    private void SetCommonHeaders(double ru = 1.0)
-    {
-        Response.Headers[CosmosHeaders.RequestCharge] = ru.ToString("F2", CultureInfo.InvariantCulture);
-        Response.Headers[CosmosHeaders.ActivityId] = Guid.NewGuid().ToString();
-        Response.Headers[CosmosHeaders.ServiceVersion] = CosmosHeaders.CurrentServiceVersion;
     }
 
     private static PartitionKeyDefinition DeserializePartitionKey(JsonNode node)
@@ -200,7 +218,8 @@ public class ContainersController : ControllerBase
             version = c.PartitionKey.Version
         },
         indexingPolicy = c.IndexingPolicy,
-        defaultTtl = c.DefaultTimeToLive
+        defaultTtl = c.DefaultTimeToLive,
+        maxThroughput = c.MaxThroughput
     };
 
     private static object ErrorResponse(string code, string message) => new { code, message };

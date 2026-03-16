@@ -1,5 +1,5 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
-import type { ReactNode, RefObject } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { MutableRefObject, ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Button,
@@ -17,9 +17,10 @@ import {
   MessageBarBody,
   MessageBarTitle,
   Option,
+  Popover,
+  PopoverSurface,
+  PopoverTrigger,
   makeStyles,
-  Tab,
-  TabList,
   Text,
   Toolbar,
   ToolbarButton,
@@ -29,6 +30,7 @@ import {
 import {
   ArrowSyncRegular,
   DatabaseRegular,
+  DismissRegular,
   DocumentSearchRegular,
   PlayRegular,
   SettingsRegular,
@@ -56,14 +58,30 @@ import { useTheme } from './theme'
 import type { CosmosContainer, CosmosDatabase } from './types/cosmos'
 
 type ContainerTab = 'query' | 'sprocs' | 'triggers' | 'udfs'
+type WorkspaceTabType = 'query' | 'container' | 'document'
 
 interface ExplorerSelection {
   dbId?: string
   collId?: string
+  docId?: string
   section?: ContainerTab
 }
 
-const QueryExecuteContext = createContext<RefObject<QueryEditorHandle | null> | null>(null)
+interface WorkspaceTab {
+  id: string
+  type: WorkspaceTabType
+  label: string
+  dbId: string
+  collId: string
+  section?: ContainerTab
+  docId?: string
+  partitionKey?: unknown
+}
+
+interface OpenTabOptions {
+  replace?: boolean
+  syncLocation?: boolean
+}
 
 const useStyles = makeStyles({
   root: {
@@ -122,24 +140,6 @@ const useStyles = makeStyles({
     gap: tokens.spacingVerticalM,
     minWidth: '20rem',
   },
-  rescopeBackdrop: {
-    position: 'fixed',
-    inset: 0,
-    zIndex: 1000,
-  },
-  rescopePanel: {
-    position: 'absolute',
-    zIndex: 1001,
-    backgroundColor: tokens.colorNeutralBackground1,
-    borderRadius: tokens.borderRadiusMedium,
-    boxShadow: tokens.shadow16,
-    border: `1px solid ${tokens.colorNeutralStroke1}`,
-    padding: tokens.spacingHorizontalL,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: tokens.spacingVerticalM,
-    minWidth: '20rem',
-  },
   dialogFields: {
     display: 'flex',
     flexDirection: 'column',
@@ -186,12 +186,64 @@ const useStyles = makeStyles({
     display: 'flex',
     flex: 1,
     minHeight: 0,
-    overflow: 'auto',
+    flexDirection: 'column',
+    gap: tokens.spacingVerticalL,
+    overflow: 'hidden',
     paddingBottom: tokens.spacingVerticalXL,
     paddingLeft: tokens.spacingHorizontalXL,
     paddingRight: tokens.spacingHorizontalXL,
     paddingTop: tokens.spacingVerticalXL,
     backgroundColor: tokens.colorNeutralBackground3,
+  },
+  tabBar: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '1px',
+    overflowX: 'auto',
+    flexShrink: 0,
+    backgroundColor: tokens.colorNeutralBackground1,
+    borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
+    borderRadius: `${tokens.borderRadiusMedium} ${tokens.borderRadiusMedium} 0 0`,
+  },
+  workspaceTab: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: tokens.spacingHorizontalXS,
+    paddingLeft: tokens.spacingHorizontalM,
+    paddingRight: tokens.spacingHorizontalXS,
+    paddingTop: tokens.spacingVerticalS,
+    paddingBottom: tokens.spacingVerticalS,
+    cursor: 'pointer',
+    backgroundColor: tokens.colorNeutralBackground3,
+    borderRight: `1px solid ${tokens.colorNeutralStroke2}`,
+    whiteSpace: 'nowrap',
+    maxWidth: '200px',
+    flexShrink: 0,
+    ':hover': {
+      backgroundColor: tokens.colorNeutralBackground1Hover,
+    },
+  },
+  workspaceTabActive: {
+    backgroundColor: tokens.colorNeutralBackground1,
+    borderBottom: `2px solid ${tokens.colorBrandStroke1}`,
+  },
+  tabCloseButton: {
+    minWidth: 'auto',
+    padding: '2px',
+  },
+  tabContent: {
+    display: 'flex',
+    flex: 1,
+    minHeight: 0,
+    overflow: 'hidden',
+  },
+  hiddenTabPanel: {
+    display: 'none',
+  },
+  visibleTabPanel: {
+    display: 'flex',
+    flex: 1,
+    minHeight: 0,
   },
   workspaceSection: {
     display: 'flex',
@@ -250,35 +302,123 @@ const useStyles = makeStyles({
     flexWrap: 'wrap',
     gap: tokens.spacingHorizontalS,
   },
-  tabbedContent: {
-    display: 'flex',
-    flex: 1,
-    minHeight: 0,
-    flexDirection: 'column',
-    gap: tokens.spacingVerticalL,
-  },
-  tabPanel: {
-    display: 'flex',
-    flex: 1,
-    minHeight: 0,
-  },
 })
 
 function App() {
   const styles = useStyles()
   const location = useLocation()
+  const navigate = useNavigate()
   const { isDark, toggle } = useTheme()
-  const queryEditorRef = useRef<QueryEditorHandle | null>(null)
   const selection = parseSelection(location.pathname)
+  const queryCounter = useRef(0)
+  const tabsRef = useRef<WorkspaceTab[]>([])
+  const queryExecuteRefs = useRef<Map<string, QueryEditorHandle>>(new Map())
 
   const [sidebarWidth, setSidebarWidth] = useState(384) // 24rem
   const [isDragging, setIsDragging] = useState(false)
   const [activeView, setActiveView] = useState<'explorer' | 'settings'>('explorer')
+  const [tabs, setTabs] = useState<WorkspaceTab[]>([])
+  const [activeTabId, setActiveTabId] = useState<string | null>(null)
+
+  const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null
+  const activeQueryTab = activeTab?.type === 'query' ? activeTab : null
 
   const startResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
     setIsDragging(true)
   }, [])
+
+  const navigateToTab = useCallback(
+    (tab: WorkspaceTab, replace = false) => {
+      navigate(buildWorkspaceTabPath(tab), { replace })
+    },
+    [navigate],
+  )
+
+  const openTab = useCallback(
+    (tab: WorkspaceTab, options?: OpenTabOptions) => {
+      const existing = tabsRef.current.find((candidate) => candidate.id === tab.id)
+      const nextTab = existing ?? tab
+
+      if (!existing) {
+        const nextTabs = [...tabsRef.current, tab]
+        tabsRef.current = nextTabs
+        setTabs(nextTabs)
+      }
+
+      setActiveTabId(nextTab.id)
+
+      if (options?.syncLocation) {
+        navigateToTab(nextTab, options.replace)
+      }
+
+      return nextTab
+    },
+    [navigateToTab],
+  )
+
+  const openNewQuery = useCallback(
+    (dbId: string, collId: string, options?: OpenTabOptions & { tabId?: string }) => {
+      const nextTab = createQueryWorkspaceTab(queryCounter, dbId, collId, options?.tabId)
+      return openTab(nextTab, options)
+    },
+    [openTab],
+  )
+
+  const closeTab = useCallback(
+    (tabId: string) => {
+      const currentTabs = tabsRef.current
+      const closingIndex = currentTabs.findIndex((tab) => tab.id === tabId)
+      if (closingIndex === -1) {
+        return
+      }
+
+      const filteredTabs = currentTabs.filter((tab) => tab.id !== tabId)
+      tabsRef.current = filteredTabs
+      setTabs(filteredTabs)
+      queryExecuteRefs.current.delete(tabId)
+
+      const wasActive = activeTabId === tabId
+      const nextActiveId = wasActive
+        ? filteredTabs.length > 0
+          ? filteredTabs[filteredTabs.length - 1].id
+          : null
+        : activeTabId
+
+      setActiveTabId(nextActiveId)
+
+      if (wasActive) {
+        const nextActiveTab = filteredTabs.find((tab) => tab.id === nextActiveId) ?? null
+        if (nextActiveTab) {
+          navigateToTab(nextActiveTab, true)
+        } else {
+          navigate(buildWorkspaceLandingPath(currentTabs[closingIndex].dbId), { replace: true })
+        }
+      }
+    },
+    [activeTabId, navigate, navigateToTab],
+  )
+
+  const registerQueryExecuteRef = useCallback((tabId: string, handle: QueryEditorHandle | null) => {
+    if (handle) {
+      queryExecuteRefs.current.set(tabId, handle)
+      return
+    }
+
+    queryExecuteRefs.current.delete(tabId)
+  }, [])
+
+  const executeActiveQuery = useCallback(() => {
+    if (!activeQueryTab) {
+      return
+    }
+
+    queryExecuteRefs.current.get(activeQueryTab.id)?.execute()
+  }, [activeQueryTab])
+
+  useEffect(() => {
+    tabsRef.current = tabs
+  }, [tabs])
 
   useEffect(() => {
     if (!isDragging) return
@@ -303,63 +443,237 @@ function App() {
     }
   }, [isDragging])
 
+  useEffect(() => {
+    const routeSelection = parseSelection(location.pathname)
+    if (!routeSelection.dbId || !routeSelection.collId) {
+      return
+    }
+
+    const searchParams = new URLSearchParams(location.search)
+    const requestedTabId = searchParams.get('tab') ?? undefined
+
+    if (routeSelection.docId) {
+      const rawPartitionKey = searchParams.get('pk')
+      if (rawPartitionKey === null) {
+        return
+      }
+
+      const openedTab = openTab({
+        id: requestedTabId ?? buildDocumentTabId(routeSelection.dbId, routeSelection.collId, routeSelection.docId, rawPartitionKey),
+        type: 'document',
+        label: routeSelection.docId,
+        dbId: routeSelection.dbId,
+        collId: routeSelection.collId,
+        docId: routeSelection.docId,
+        partitionKey: parsePartitionKey(rawPartitionKey),
+      })
+
+      if (!requestedTabId) {
+        navigateToTab(openedTab, true)
+      }
+
+      return
+    }
+
+    if (!routeSelection.section) {
+      return
+    }
+
+    if (routeSelection.section === 'query') {
+      const existingQueryTab = requestedTabId
+        ? tabsRef.current.find((tab) => tab.id === requestedTabId && tab.type === 'query')
+        : undefined
+
+      if (existingQueryTab) {
+        openTab(existingQueryTab)
+        return
+      }
+
+      const openedTab = openNewQuery(routeSelection.dbId, routeSelection.collId, { tabId: requestedTabId })
+      if (!requestedTabId) {
+        navigateToTab(openedTab, true)
+      }
+
+      return
+    }
+
+    const openedTab = openTab({
+      id: requestedTabId ?? buildContainerTabId(routeSelection.dbId, routeSelection.collId, routeSelection.section),
+      type: 'container',
+      label: `${routeSelection.collId} – ${sectionLabel(routeSelection.section)}`,
+      dbId: routeSelection.dbId,
+      collId: routeSelection.collId,
+      section: routeSelection.section,
+    })
+
+    if (!requestedTabId) {
+      navigateToTab(openedTab, true)
+    }
+  }, [location.key, location.pathname, location.search, navigateToTab, openNewQuery, openTab])
+
+  const renderTabContent = (tab: WorkspaceTab) => {
+    if (tab.type === 'query') {
+      return (
+        <WorkspacePanel dbId={tab.dbId} subtitle={`Container: ${tab.collId}`} title={tab.label}>
+          <QueryEditor
+            key={tab.id}
+            collId={tab.collId}
+            dbId={tab.dbId}
+            executeRef={(handle) => registerQueryExecuteRef(tab.id, handle)}
+          />
+        </WorkspacePanel>
+      )
+    }
+
+    if (tab.type === 'container') {
+      const section: Exclude<ContainerTab, 'query'> =
+        tab.section === 'triggers' || tab.section === 'udfs' ? tab.section : 'sprocs'
+      const label = sectionEditorLabel(section)
+
+      return (
+        <WorkspacePanel dbId={tab.dbId} subtitle={`Container: ${tab.collId}`} title={tab.label}>
+          <ProgrammabilityEditor
+            key={tab.id}
+            collId={tab.collId}
+            dbId={tab.dbId}
+            label={label}
+            resourceType={section}
+          />
+        </WorkspacePanel>
+      )
+    }
+
+    if (tab.type === 'document' && tab.docId) {
+      return (
+        <WorkspacePanel
+          dbId={tab.dbId}
+          subtitle={`Document · ${tab.collId}`}
+          title={tab.label}
+          toolbar={
+            <Button appearance="secondary" onClick={() => openNewQuery(tab.dbId, tab.collId, { syncLocation: true })}>
+              Open query view
+            </Button>
+          }
+        >
+          <DocumentEditor
+            key={tab.id}
+            collId={tab.collId}
+            dbId={tab.dbId}
+            docId={tab.docId}
+            onDeleted={() => closeTab(tab.id)}
+            partitionKey={tab.partitionKey}
+          />
+        </WorkspacePanel>
+      )
+    }
+
+    return null
+  }
+
   return (
-    <QueryExecuteContext.Provider value={queryEditorRef}>
-      <div className={styles.root}>
-        <header className={styles.header}>
-          <div className={styles.headerRow}>
-            <div className={styles.branding}>
-              <Text block className={styles.eyebrow} size={300} weight="semibold">
-                Azure Cosmos DB
-              </Text>
-              <Text as="h1" block size={800} weight="bold">
-                Cosmos DB Emulator Explorer
-              </Text>
-              <Text block className={styles.subtleText} size={300}>
-                Explorer UI served from /explorer
-              </Text>
-            </div>
-
-            <Toolbar aria-label="Theme actions">
-              <ToolbarButton
-                appearance="subtle"
-                icon={isDark ? <WeatherSunnyRegular /> : <WeatherMoonRegular />}
-                onClick={toggle}
-              >
-                {isDark ? 'Light theme' : 'Dark theme'}
-              </ToolbarButton>
-            </Toolbar>
-          </div>
-        </header>
-
-        <GlobalToolbar queryEditorRef={queryEditorRef} selection={selection} />
-
-        <div className={styles.content}>
-          <div className={styles.iconNav}>
-            <Button
-              appearance={activeView === 'explorer' ? 'subtle' : 'transparent'}
-              icon={<DatabaseRegular />}
-              onClick={() => setActiveView('explorer')}
-              title="Explorer"
-            />
-            <Button
-              appearance={activeView === 'settings' ? 'subtle' : 'transparent'}
-              icon={<SettingsRegular />}
-              onClick={() => setActiveView('settings')}
-              title="Cluster Settings"
-            />
+    <div className={styles.root}>
+      <header className={styles.header}>
+        <div className={styles.headerRow}>
+          <div className={styles.branding}>
+            <Text block className={styles.eyebrow} size={300} weight="semibold">
+              Azure Cosmos DB
+            </Text>
+            <Text as="h1" block size={800} weight="bold">
+              Cosmos DB Emulator Explorer
+            </Text>
+            <Text block className={styles.subtleText} size={300}>
+              Explorer UI served from /explorer
+            </Text>
           </div>
 
-          {activeView === 'explorer' ? (
-            <>
-              <aside className={styles.sidebar} style={{ width: sidebarWidth }}>
-                <DatabaseTree />
-              </aside>
-              <div
-                className={`${styles.resizeHandle} ${isDragging ? styles.resizeHandleActive : ''}`}
-                onMouseDown={startResize}
-              />
-              <main className={styles.main}>
+          <Toolbar aria-label="Theme actions">
+            <ToolbarButton
+              appearance="subtle"
+              icon={isDark ? <WeatherSunnyRegular /> : <WeatherMoonRegular />}
+              onClick={toggle}
+            >
+              {isDark ? 'Light theme' : 'Dark theme'}
+            </ToolbarButton>
+          </Toolbar>
+        </div>
+      </header>
+
+      <GlobalToolbar
+        activeQueryTab={activeQueryTab}
+        onExecuteQuery={executeActiveQuery}
+        onOpenNewQuery={(dbId, collId) => {
+          openNewQuery(dbId, collId, { syncLocation: true })
+        }}
+        selection={selection}
+      />
+
+      <div className={styles.content}>
+        <div className={styles.iconNav}>
+          <Button
+            appearance={activeView === 'explorer' ? 'subtle' : 'transparent'}
+            icon={<DatabaseRegular />}
+            onClick={() => setActiveView('explorer')}
+            title="Explorer"
+          />
+          <Button
+            appearance={activeView === 'settings' ? 'subtle' : 'transparent'}
+            icon={<SettingsRegular />}
+            onClick={() => setActiveView('settings')}
+            title="Cluster Settings"
+          />
+        </div>
+
+        {activeView === 'explorer' ? (
+          <>
+            <aside className={styles.sidebar} style={{ width: sidebarWidth }}>
+              <DatabaseTree />
+            </aside>
+            <div
+              className={`${styles.resizeHandle} ${isDragging ? styles.resizeHandleActive : ''}`}
+              onMouseDown={startResize}
+            />
+            <main className={styles.main}>
+              {tabs.length > 0 ? (
+                <>
+                  <div className={styles.tabBar}>
+                    {tabs.map((tab) => (
+                      <div
+                        className={`${styles.workspaceTab} ${tab.id === activeTabId ? styles.workspaceTabActive : ''}`}
+                        key={tab.id}
+                        onClick={() => {
+                          setActiveTabId(tab.id)
+                          navigateToTab(tab)
+                        }}
+                      >
+                        <Text size={200} truncate>
+                          {tab.label}
+                        </Text>
+                        <Button
+                          appearance="transparent"
+                          aria-label={`Close ${tab.label}`}
+                          className={styles.tabCloseButton}
+                          icon={<DismissRegular />}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            closeTab(tab.id)
+                          }}
+                          size="small"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <div className={styles.tabContent}>
+                    {tabs.map((tab) => (
+                      <div
+                        className={tab.id === activeTabId ? styles.visibleTabPanel : styles.hiddenTabPanel}
+                        key={tab.id}
+                      >
+                        {renderTabContent(tab)}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
                 <Routes>
                   <Route
                     element={
@@ -371,33 +685,37 @@ function App() {
                     path="/"
                   />
                   <Route element={<DatabaseLanding />} path="/db/:dbId" />
-                  <Route element={<ContainerView />} path="/db/:dbId/container/:collId" />
-                  <Route element={<ContainerView />} path="/db/:dbId/container/:collId/query" />
-                  <Route element={<ContainerView />} path="/db/:dbId/container/:collId/sprocs" />
-                  <Route element={<ContainerView />} path="/db/:dbId/container/:collId/triggers" />
-                  <Route element={<ContainerView />} path="/db/:dbId/container/:collId/udfs" />
-                  <Route element={<DocumentRoute />} path="/db/:dbId/container/:collId/doc/:docId" />
+                  <Route element={<WorkspaceRoutePlaceholder />} path="/db/:dbId/container/:collId" />
+                  <Route element={<WorkspaceRoutePlaceholder />} path="/db/:dbId/container/:collId/query" />
+                  <Route element={<WorkspaceRoutePlaceholder />} path="/db/:dbId/container/:collId/sprocs" />
+                  <Route element={<WorkspaceRoutePlaceholder />} path="/db/:dbId/container/:collId/triggers" />
+                  <Route element={<WorkspaceRoutePlaceholder />} path="/db/:dbId/container/:collId/udfs" />
+                  <Route element={<DocumentRoutePlaceholder />} path="/db/:dbId/container/:collId/doc/:docId" />
                   <Route element={<Navigate replace to="/" />} path="*" />
                 </Routes>
-              </main>
-            </>
-          ) : (
-            <main className={styles.main}>
-              <ClusterSettings />
+              )}
             </main>
-          )}
-        </div>
+          </>
+        ) : (
+          <main className={styles.main}>
+            <ClusterSettings />
+          </main>
+        )}
       </div>
-    </QueryExecuteContext.Provider>
+    </div>
   )
 }
 
 function GlobalToolbar({
+  activeQueryTab,
+  onExecuteQuery,
+  onOpenNewQuery,
   selection,
-  queryEditorRef,
 }: {
+  activeQueryTab: WorkspaceTab | null
+  onExecuteQuery: () => void
+  onOpenNewQuery: (dbId: string, collId: string) => void
   selection: ExplorerSelection
-  queryEditorRef: RefObject<QueryEditorHandle | null>
 }) {
   const styles = useStyles()
   const navigate = useNavigate()
@@ -408,13 +726,15 @@ function GlobalToolbar({
   const [containerId, setContainerId] = useState('')
   const [partitionKeyPath, setPartitionKeyPath] = useState('/id')
   const [isRescopeOpen, setIsRescopeOpen] = useState(false)
-  const [scopeDbId, setScopeDbId] = useState(selection.dbId ?? '')
-  const [scopeCollId, setScopeCollId] = useState(selection.collId ?? '')
+  const currentDbId = activeQueryTab?.dbId ?? selection.dbId ?? ''
+  const currentCollId = activeQueryTab?.collId ?? selection.collId ?? ''
+  const [scopeDbId, setScopeDbId] = useState(currentDbId)
+  const [scopeCollId, setScopeCollId] = useState(currentCollId)
 
   const canCreateContainer = Boolean(selection.dbId)
-  const canOpenQuery = Boolean(selection.dbId && selection.collId)
-  const isQueryView = Boolean(selection.dbId && selection.collId && selection.section === 'query')
-  const scopeLabel = selection.dbId && selection.collId ? `${selection.dbId} / ${selection.collId}` : 'No scope'
+  const canOpenQuery = Boolean(currentDbId && currentCollId)
+  const isQueryView = activeQueryTab?.type === 'query'
+  const scopeLabel = currentDbId && currentCollId ? `${currentDbId} / ${currentCollId}` : 'No scope'
 
   const databasesQuery = useQuery({
     queryKey: ['databases'],
@@ -445,7 +765,7 @@ function GlobalToolbar({
       resetCreateContainerDialog()
       setIsCreateContainerOpen(false)
       await queryClient.invalidateQueries({ queryKey: ['containers', variables.dbId] })
-      navigate(buildContainerSectionPath(variables.dbId, container.id, 'query'))
+      onOpenNewQuery(variables.dbId, container.id)
     },
   })
 
@@ -496,8 +816,8 @@ function GlobalToolbar({
           disabled={!canOpenQuery}
           icon={<DocumentSearchRegular />}
           onClick={() => {
-            if (selection.dbId && selection.collId) {
-              navigate(buildContainerSectionPath(selection.dbId, selection.collId, 'query'))
+            if (currentDbId && currentCollId) {
+              onOpenNewQuery(currentDbId, currentCollId)
             }
           }}
         >
@@ -508,84 +828,85 @@ function GlobalToolbar({
           appearance={isQueryView ? 'primary' : 'subtle'}
           disabled={!isQueryView}
           icon={<PlayRegular />}
-          onClick={() => queryEditorRef.current?.execute()}
+          onClick={onExecuteQuery}
         >
           Execute
         </ToolbarButton>
         <ToolbarDivider />
         {isQueryView ? (
-          <div style={{ position: 'relative' }}>
-            <ToolbarButton icon={<ArrowSyncRegular />} onClick={() => {
-              if (!isRescopeOpen) {
-                setScopeDbId(selection.dbId ?? '')
-                setScopeCollId(selection.collId ?? '')
+          <Popover
+            onOpenChange={(_, data) => {
+              setIsRescopeOpen(data.open)
+              if (data.open) {
+                setScopeDbId(currentDbId)
+                setScopeCollId(currentCollId)
               }
-              setIsRescopeOpen(!isRescopeOpen)
-            }}>
-              Re-scope <span className={styles.scopeLabel}>{scopeLabel}</span>
-            </ToolbarButton>
-            {isRescopeOpen && (
-              <>
-                <div className={styles.rescopeBackdrop} onClick={() => setIsRescopeOpen(false)} />
-                <div className={styles.rescopePanel}>
-                  <Text block size={300} weight="semibold">
-                    Select query scope
-                  </Text>
-                  <Field label="Database">
-                    <Combobox
-                      onOptionSelect={(_, data) => {
-                        const nextDbId = data.optionValue ?? ''
-                        setScopeDbId(nextDbId)
-                        setScopeCollId(nextDbId === selection.dbId ? selection.collId ?? '' : '')
-                      }}
-                      placeholder="Select a database"
-                      selectedOptions={scopeDbId ? [scopeDbId] : []}
-                      value={scopeDbId}
-                    >
-                      {(databasesQuery.data?.items ?? []).map((database: CosmosDatabase) => (
-                        <Option key={database.id} value={database.id}>
-                          {database.id}
-                        </Option>
-                      ))}
-                    </Combobox>
-                  </Field>
-                  <Field label="Container">
-                    <Combobox
-                      disabled={!scopeDbId || containersQuery.isPending || (containersQuery.data?.items.length ?? 0) === 0}
-                      onOptionSelect={(_, data) => {
-                        const nextCollId = data.optionValue ?? ''
-                        setScopeCollId(nextCollId)
-                        if (scopeDbId && nextCollId) {
-                          setIsRescopeOpen(false)
-                          navigate(buildContainerSectionPath(scopeDbId, nextCollId, 'query'))
-                        }
-                      }}
-                      placeholder={scopeDbId ? 'Select a container' : 'Select a database first'}
-                      selectedOptions={scopeCollId ? [scopeCollId] : []}
-                      value={scopeCollId}
-                    >
-                      {(containersQuery.data?.items ?? []).map((container: CosmosContainer) => (
-                        <Option key={container.id} value={container.id}>
-                          {container.id}
-                        </Option>
-                      ))}
-                    </Combobox>
-                  </Field>
-                  {databasesQuery.isError && (
-                    <InlineStatus title="Could not load databases">{toErrorMessage(databasesQuery.error)}</InlineStatus>
-                  )}
-                  {containersQuery.isError && (
-                    <InlineStatus title="Could not load containers">{toErrorMessage(containersQuery.error)}</InlineStatus>
-                  )}
-                  {scopeDbId && containersQuery.isSuccess && (containersQuery.data?.items.length ?? 0) === 0 && (
-                    <Text block className={styles.subtleText} size={200}>
-                      No containers found for the selected database.
-                    </Text>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
+            }}
+            open={isRescopeOpen}
+            positioning="below-start"
+          >
+            <PopoverTrigger disableButtonEnhancement>
+              <ToolbarButton icon={<ArrowSyncRegular />}>
+                Re-scope <span className={styles.scopeLabel}>{scopeLabel}</span>
+              </ToolbarButton>
+            </PopoverTrigger>
+            <PopoverSurface className={styles.scopePopover}>
+              <Text block size={300} weight="semibold">
+                Select query scope
+              </Text>
+              <Field label="Database">
+                <Combobox
+                  onOptionSelect={(_, data) => {
+                    const nextDbId = data.optionValue ?? ''
+                    setScopeDbId(nextDbId)
+                    setScopeCollId(nextDbId === currentDbId ? currentCollId : '')
+                  }}
+                  placeholder="Select a database"
+                  selectedOptions={scopeDbId ? [scopeDbId] : []}
+                  value={scopeDbId}
+                >
+                  {(databasesQuery.data?.items ?? []).map((database: CosmosDatabase) => (
+                    <Option key={database.id} value={database.id}>
+                      {database.id}
+                    </Option>
+                  ))}
+                </Combobox>
+              </Field>
+              <Field label="Container">
+                <Combobox
+                  disabled={!scopeDbId || containersQuery.isPending || (containersQuery.data?.items.length ?? 0) === 0}
+                  onOptionSelect={(_, data) => {
+                    const nextCollId = data.optionValue ?? ''
+                    setScopeCollId(nextCollId)
+                    if (scopeDbId && nextCollId) {
+                      setIsRescopeOpen(false)
+                      onOpenNewQuery(scopeDbId, nextCollId)
+                    }
+                  }}
+                  placeholder={scopeDbId ? 'Select a container' : 'Select a database first'}
+                  selectedOptions={scopeCollId ? [scopeCollId] : []}
+                  value={scopeCollId}
+                >
+                  {(containersQuery.data?.items ?? []).map((container: CosmosContainer) => (
+                    <Option key={container.id} value={container.id}>
+                      {container.id}
+                    </Option>
+                  ))}
+                </Combobox>
+              </Field>
+              {databasesQuery.isError && (
+                <InlineStatus title="Could not load databases">{toErrorMessage(databasesQuery.error)}</InlineStatus>
+              )}
+              {containersQuery.isError && (
+                <InlineStatus title="Could not load containers">{toErrorMessage(containersQuery.error)}</InlineStatus>
+              )}
+              {scopeDbId && containersQuery.isSuccess && (containersQuery.data?.items.length ?? 0) === 0 && (
+                <Text block className={styles.subtleText} size={200}>
+                  No containers found for the selected database.
+                </Text>
+              )}
+            </PopoverSurface>
+          </Popover>
         ) : (
           <ToolbarButton disabled icon={<ArrowSyncRegular />}>
             Re-scope <span className={styles.scopeLabel}>{scopeLabel}</span>
@@ -593,109 +914,115 @@ function GlobalToolbar({
         )}
       </Toolbar>
 
-      <Dialog
-        open={isCreateDatabaseOpen}
-        onOpenChange={(_, data) => {
-          setIsCreateDatabaseOpen(data.open)
-          if (!data.open) {
-            resetCreateDatabaseDialog()
-          }
-        }}
-      >
-        <DialogSurface>
-          <DialogBody>
-            <DialogTitle>Create database</DialogTitle>
-            <DialogContent>
-              <div className={styles.dialogFields}>
-                <Field label="Database id">
-                  <Input
-                    autoFocus
-                    onChange={(_, data) => setDatabaseId(data.value)}
-                    placeholder="Enter a database id"
-                    value={databaseId}
-                  />
-                </Field>
-                {createDatabaseMutation.isError && (
-                  <InlineStatus title="Create failed">{toErrorMessage(createDatabaseMutation.error)}</InlineStatus>
-                )}
-              </div>
-            </DialogContent>
-            <DialogActions>
-              <Button
-                appearance="secondary"
-                onClick={() => {
-                  resetCreateDatabaseDialog()
-                  setIsCreateDatabaseOpen(false)
-                }}
-              >
-                Cancel
-              </Button>
-              <Button
-                appearance="primary"
-                disabled={!databaseId.trim() || createDatabaseMutation.isPending}
-                onClick={submitCreateDatabase}
-              >
-                {createDatabaseMutation.isPending ? 'Creating…' : 'Create'}
-              </Button>
-            </DialogActions>
-          </DialogBody>
-        </DialogSurface>
-      </Dialog>
+      {isCreateDatabaseOpen && (
+        <Dialog
+          modalType="non-modal"
+          open
+          onOpenChange={(_, data) => {
+            if (!data.open) {
+              resetCreateDatabaseDialog()
+              setIsCreateDatabaseOpen(false)
+            }
+          }}
+        >
+          <DialogSurface backdrop={{ onClick: () => { resetCreateDatabaseDialog(); setIsCreateDatabaseOpen(false) } }}>
+            <DialogBody>
+              <DialogTitle>Create database</DialogTitle>
+              <DialogContent>
+                <div className={styles.dialogFields}>
+                  <Field label="Database id">
+                    <Input
+                      autoFocus
+                      onChange={(_, data) => setDatabaseId(data.value)}
+                      placeholder="Enter a database id"
+                      value={databaseId}
+                    />
+                  </Field>
+                  {createDatabaseMutation.isError && (
+                    <InlineStatus title="Create failed">{toErrorMessage(createDatabaseMutation.error)}</InlineStatus>
+                  )}
+                </div>
+              </DialogContent>
+              <DialogActions>
+                <Button
+                  appearance="secondary"
+                  onClick={() => {
+                    resetCreateDatabaseDialog()
+                    setIsCreateDatabaseOpen(false)
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  appearance="primary"
+                  disabled={!databaseId.trim() || createDatabaseMutation.isPending}
+                  onClick={submitCreateDatabase}
+                >
+                  {createDatabaseMutation.isPending ? 'Creating…' : 'Create'}
+                </Button>
+              </DialogActions>
+            </DialogBody>
+          </DialogSurface>
+        </Dialog>
+      )}
 
-      <Dialog
-        open={isCreateContainerOpen}
-        onOpenChange={(_, data) => {
-          setIsCreateContainerOpen(data.open)
-          if (!data.open) {
-            resetCreateContainerDialog()
-          }
-        }}
-      >
-        <DialogSurface>
-          <DialogBody>
-            <DialogTitle>Create container</DialogTitle>
-            <DialogContent>
-              <div className={styles.dialogFields}>
-                <Field label="Database id">
-                  <Input readOnly value={selection.dbId ?? ''} />
-                </Field>
-                <Field label="Container id">
-                  <Input
-                    autoFocus
-                    onChange={(_, data) => setContainerId(data.value)}
-                    placeholder={selection.dbId ? `Container id for ${selection.dbId}` : 'Select a database'}
-                    value={containerId}
-                  />
-                </Field>
-                <Field label="Partition key path">
-                  <Input onChange={(_, data) => setPartitionKeyPath(data.value)} placeholder="/id" value={partitionKeyPath} />
-                </Field>
-                {createContainerMutation.isError && (
-                  <InlineStatus title="Create failed">{toErrorMessage(createContainerMutation.error)}</InlineStatus>
-                )}
-              </div>
-            </DialogContent>
-            <DialogActions>
-              <Button
-                appearance="secondary"
-                onClick={() => {
-                  resetCreateContainerDialog()
-                  setIsCreateContainerOpen(false)
-                }}
-              >
-                Cancel
-              </Button>
-              <Button
-                appearance="primary"
-                disabled={!selection.dbId || !containerId.trim() || createContainerMutation.isPending}
-                onClick={submitCreateContainer}
-              >
-                {createContainerMutation.isPending ? 'Creating…' : 'Create'}
-              </Button>
-            </DialogActions>
-          </DialogBody>
-        </DialogSurface>
-      </Dialog>
+      {isCreateContainerOpen && (
+        <Dialog
+          modalType="non-modal"
+          open
+          onOpenChange={(_, data) => {
+            if (!data.open) {
+              resetCreateContainerDialog()
+              setIsCreateContainerOpen(false)
+            }
+          }}
+        >
+          <DialogSurface backdrop={{ onClick: () => { resetCreateContainerDialog(); setIsCreateContainerOpen(false) } }}>
+            <DialogBody>
+              <DialogTitle>Create container</DialogTitle>
+              <DialogContent>
+                <div className={styles.dialogFields}>
+                  <Field label="Database id">
+                    <Input readOnly value={selection.dbId ?? ''} />
+                  </Field>
+                  <Field label="Container id">
+                    <Input
+                      autoFocus
+                      onChange={(_, data) => setContainerId(data.value)}
+                      placeholder={selection.dbId ? `Container id for ${selection.dbId}` : 'Select a database'}
+                      value={containerId}
+                    />
+                  </Field>
+                  <Field label="Partition key path">
+                    <Input onChange={(_, data) => setPartitionKeyPath(data.value)} placeholder="/id" value={partitionKeyPath} />
+                  </Field>
+                  {createContainerMutation.isError && (
+                    <InlineStatus title="Create failed">{toErrorMessage(createContainerMutation.error)}</InlineStatus>
+                  )}
+                </div>
+              </DialogContent>
+              <DialogActions>
+                <Button
+                  appearance="secondary"
+                  onClick={() => {
+                    resetCreateContainerDialog()
+                    setIsCreateContainerOpen(false)
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  appearance="primary"
+                  disabled={!selection.dbId || !containerId.trim() || createContainerMutation.isPending}
+                  onClick={submitCreateContainer}
+                >
+                  {createContainerMutation.isPending ? 'Creating…' : 'Create'}
+                </Button>
+              </DialogActions>
+            </DialogBody>
+          </DialogSurface>
+        </Dialog>
+      )}
     </>
   )
 }
@@ -717,72 +1044,11 @@ function DatabaseLanding() {
   )
 }
 
-function ContainerView() {
-  const styles = useStyles()
-  const navigate = useNavigate()
-  const { collId, dbId } = useParams<{ dbId: string; collId: string }>()
-  const location = useLocation()
-  const queryExecuteRef = useContext(QueryExecuteContext)
-
-  if (!dbId || !collId) {
-    return <Navigate replace to="/" />
-  }
-
-  const activeTab = parseSelection(location.pathname).section ?? 'query'
-  const basePath = `/db/${encodeURIComponent(dbId)}/container/${encodeURIComponent(collId)}`
-
-  return (
-    <WorkspacePanel dbId={dbId} subtitle="Container" title={collId}>
-      <div className={styles.tabbedContent}>
-        <TabList
-          selectedValue={activeTab}
-          onTabSelect={(_, data) => navigate(`${basePath}/${String(data.value)}`)}
-        >
-          <Tab value="query">Query</Tab>
-          <Tab value="sprocs">Stored Procedures</Tab>
-          <Tab value="triggers">Triggers</Tab>
-          <Tab value="udfs">UDFs</Tab>
-        </TabList>
-
-        <div className={styles.tabPanel}>
-          {activeTab === 'query' && (
-            <QueryEditor collId={collId} dbId={dbId} executeRef={queryExecuteRef ?? undefined} />
-          )}
-          {activeTab === 'sprocs' && (
-            <ProgrammabilityEditor
-              collId={collId}
-              dbId={dbId}
-              key={`${dbId}:${collId}:sprocs`}
-              label="Stored procedures"
-              resourceType="sprocs"
-            />
-          )}
-          {activeTab === 'triggers' && (
-            <ProgrammabilityEditor
-              collId={collId}
-              dbId={dbId}
-              key={`${dbId}:${collId}:triggers`}
-              label="Triggers"
-              resourceType="triggers"
-            />
-          )}
-          {activeTab === 'udfs' && (
-            <ProgrammabilityEditor
-              collId={collId}
-              dbId={dbId}
-              key={`${dbId}:${collId}:udfs`}
-              label="User-defined functions"
-              resourceType="udfs"
-            />
-          )}
-        </div>
-      </div>
-    </WorkspacePanel>
-  )
+function WorkspaceRoutePlaceholder() {
+  return null
 }
 
-function DocumentRoute() {
-  const navigate = useNavigate()
+function DocumentRoutePlaceholder() {
   const { collId, dbId, docId } = useParams<{ dbId: string; collId: string; docId: string }>()
   const [searchParams] = useSearchParams()
 
@@ -790,44 +1056,16 @@ function DocumentRoute() {
     return <Navigate replace to="/" />
   }
 
-  const rawPartitionKey = searchParams.get('pk')
-  if (rawPartitionKey === null) {
-    return (
-      <WorkspacePanel dbId={dbId} subtitle="Document selected" title={docId}>
-        <WorkspaceMessage
-          description="The document route is missing the partition key information required to load the item. Re-open the document from the tree."
-          title="Partition key required"
-          tone="error"
-        />
-      </WorkspacePanel>
-    )
+  if (searchParams.get('pk') !== null) {
+    return null
   }
 
   return (
-    <WorkspacePanel
-      dbId={dbId}
-      subtitle="Document selected"
-      title={docId}
-      toolbar={
-        <Button
-          appearance="secondary"
-          onClick={() =>
-            navigate(`/db/${encodeURIComponent(dbId)}/container/${encodeURIComponent(collId)}/query`)
-          }
-        >
-          Open query view
-        </Button>
-      }
-    >
-      <DocumentEditor
-        key={`${docId}:${rawPartitionKey}`}
-        collId={collId}
-        dbId={dbId}
-        docId={docId}
-        onDeleted={() =>
-          navigate(`/db/${encodeURIComponent(dbId)}/container/${encodeURIComponent(collId)}/query`)
-        }
-        partitionKey={parsePartitionKey(rawPartitionKey)}
+    <WorkspacePanel dbId={dbId} subtitle="Document selected" title={docId}>
+      <WorkspaceMessage
+        description="The document route is missing the partition key information required to load the item. Re-open the document from the tree."
+        title="Partition key required"
+        tone="error"
       />
     </WorkspacePanel>
   )
@@ -911,9 +1149,11 @@ function parseSelection(pathname: string): ExplorerSelection {
     return {}
   }
 
+  const isContainerRoute = segments[2] === 'container' && Boolean(segments[3])
   const sectionSegment = segments[4]
+  const docId = sectionSegment === 'doc' ? segments[5] : undefined
   const section: ContainerTab | undefined =
-    segments[2] === 'container' && segments[3]
+    isContainerRoute && sectionSegment !== 'doc'
       ? sectionSegment === 'sprocs' || sectionSegment === 'triggers' || sectionSegment === 'udfs'
         ? sectionSegment
         : sectionSegment === 'query' || sectionSegment === undefined
@@ -924,7 +1164,104 @@ function parseSelection(pathname: string): ExplorerSelection {
   return {
     dbId: segments[1],
     collId: segments[3],
+    docId,
     section,
+  }
+}
+
+function createQueryWorkspaceTab(
+  queryCounter: MutableRefObject<number>,
+  dbId: string,
+  collId: string,
+  requestedId?: string,
+): WorkspaceTab {
+  if (requestedId) {
+    const match = /^query-(\d+)$/u.exec(requestedId)
+    if (match) {
+      const queryNumber = Number(match[1])
+      queryCounter.current = Math.max(queryCounter.current, queryNumber)
+      return {
+        id: requestedId,
+        type: 'query',
+        label: `Query ${queryNumber}`,
+        dbId,
+        collId,
+        section: 'query',
+      }
+    }
+
+    return {
+      id: requestedId,
+      type: 'query',
+      label: 'Query',
+      dbId,
+      collId,
+      section: 'query',
+    }
+  }
+
+  queryCounter.current += 1
+
+  return {
+    id: `query-${queryCounter.current}`,
+    type: 'query',
+    label: `Query ${queryCounter.current}`,
+    dbId,
+    collId,
+    section: 'query',
+  }
+}
+
+function buildWorkspaceLandingPath(dbId?: string): string {
+  return dbId ? `/db/${encodeURIComponent(dbId)}` : '/'
+}
+
+function buildContainerTabId(dbId: string, collId: string, section: Exclude<ContainerTab, 'query'>): string {
+  return `${section}-${dbId}-${collId}`
+}
+
+function buildDocumentTabId(dbId: string, collId: string, docId: string, rawPartitionKey: string): string {
+  return `doc-${dbId}-${collId}-${docId}-${rawPartitionKey}`
+}
+
+function buildWorkspaceTabPath(tab: WorkspaceTab): string {
+  const searchParams = new URLSearchParams()
+  searchParams.set('tab', tab.id)
+
+  if (tab.type === 'document' && tab.docId) {
+    if (tab.partitionKey !== undefined) {
+      searchParams.set('pk', JSON.stringify(tab.partitionKey))
+    }
+
+    return `/db/${encodeURIComponent(tab.dbId)}/container/${encodeURIComponent(tab.collId)}/doc/${encodeURIComponent(tab.docId)}?${searchParams.toString()}`
+  }
+
+  if (tab.type === 'container') {
+    return `${buildContainerSectionPath(tab.dbId, tab.collId, tab.section ?? 'sprocs')}?${searchParams.toString()}`
+  }
+
+  return `${buildContainerSectionPath(tab.dbId, tab.collId, 'query')}?${searchParams.toString()}`
+}
+
+function sectionLabel(section: Exclude<ContainerTab, 'query'>): string {
+  switch (section) {
+    case 'sprocs':
+      return 'Sprocs'
+    case 'triggers':
+      return 'Triggers'
+    case 'udfs':
+      return 'UDFs'
+  }
+}
+
+function sectionEditorLabel(section: Exclude<ContainerTab, 'query'>): 'Stored procedures' | 'Triggers' | 'User-defined functions' {
+  switch (section) {
+    case 'sprocs':
+      return 'Stored procedures'
+    case 'triggers':
+      return 'Triggers'
+    case 'udfs':
+      return 'User-defined functions'
   }
 }
 

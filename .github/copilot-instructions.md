@@ -110,6 +110,43 @@ The known test master key is: `C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDu
 - Data fetching: `@tanstack/react-query` with `cosmosClient` singleton
 - Routing: React Router v7, routes follow `/db/:dbId/container/:collId/...` pattern
 
+### Fluent UI v9 — Overlays, Dialogs & Portals
+
+Fluent UI v9 components that render portals (dropdowns, comboboxes, dialogs) need careful handling to avoid content-disappearing bugs:
+
+- **Never use custom backdrop/panel overlays with manual z-index for popover-style panels.** Fluent UI `Combobox`, `Dropdown`, and `Select` render their listboxes through portals at the `FluentProvider` root. A custom `position: fixed; z-index: 1000` backdrop will sit above these portals and intercept clicks, making dropdowns appear broken. Use `Popover` + `PopoverSurface` + `PopoverTrigger` instead — they share the same portal z-index stack and nest correctly with other Fluent portals.
+
+- **Always use `modalType="non-modal"` on `<Dialog>` components with an explicit backdrop.** Modal Dialogs (`modalType="modal"`, the default) trigger three side-effects that can cause content to visually disappear or become unresponsive: (1) `useDisableBodyScroll` adds `overflow-y: hidden/clip` plus `scrollbar-gutter: stable` to `<html>` and `<body>`, which can break `height: 100%` layout chains; (2) tabster's modalizer walks `document.body` and sets `aria-hidden="true"` on all sibling elements, which may interact poorly with custom CSS or browser extensions; (3) legacy focus trapping intercepts keyboard events and can cause focus-loss glitches. Using `modalType="non-modal"` disables all three mechanisms. Add an explicit `backdrop` prop to `<DialogSurface>` to restore the visual overlay and click-outside-to-close behavior:
+  ```tsx
+  <Dialog modalType="non-modal" open={isOpen} onOpenChange={(_, d) => setIsOpen(d.open)}>
+    <DialogSurface backdrop={{ onClick: () => setIsOpen(false) }}>
+      <DialogBody>
+        <DialogTitle>Title</DialogTitle>
+        <DialogContent>...</DialogContent>
+        <DialogActions>
+          <Button onClick={() => setIsOpen(false)}>Cancel</Button>
+          <Button appearance="primary">OK</Button>
+        </DialogActions>
+      </DialogBody>
+    </DialogSurface>
+  </Dialog>
+  ```
+
+- **Pattern for floating panels with nested interactive portals:**
+  ```tsx
+  <Popover positioning="below-start" trapFocus open={isOpen} onOpenChange={(_, d) => setIsOpen(d.open)}>
+    <PopoverTrigger disableButtonEnhancement>
+      <Button>Open panel</Button>
+    </PopoverTrigger>
+    <PopoverSurface>
+      {/* Combobox/Dropdown inside here will portal correctly */}
+      <Combobox>
+        <Option>Item</Option>
+      </Combobox>
+    </PopoverSurface>
+  </Popover>
+  ```
+
 ## Testing Patterns
 
 - **Framework**: xUnit with FluentAssertions and Moq

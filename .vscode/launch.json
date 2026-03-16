@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug CLI (start)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build-explorer-and-cli",
+      "program": "${workspaceFolder}/src/Cli/bin/Debug/net10.0/Azure.Cosmos.LightEmulator.Cli.dll",
+      "args": ["start"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    }
+  ]
+}

@@ -103,11 +103,13 @@ public class JintProgrammabilityEngine : IProgrammabilityEngine
     private static readonly IReadOnlyDictionary<string, object?> EmptyParameters = new Dictionary<string, object?>();
 
     private readonly IDocumentStore _store;
+    private readonly IQueryEngine _queryEngine;
     private readonly SurrealDbConnectionManager _connectionManager;
 
-    public JintProgrammabilityEngine(IDocumentStore store, SurrealDbConnectionManager connectionManager)
+    public JintProgrammabilityEngine(IDocumentStore store, IQueryEngine queryEngine, SurrealDbConnectionManager connectionManager)
     {
         _store = store;
+        _queryEngine = queryEngine;
         _connectionManager = connectionManager;
     }
 
@@ -177,7 +179,7 @@ public class JintProgrammabilityEngine : IProgrammabilityEngine
     {
         var sproc = await GetStoredProcedureAsync(databaseId, containerId, sprocId, ct);
         var engine = new Engine();
-        var context = new CosmosJsContext(_store, databaseId, containerId, partitionKey, ct);
+        var context = new CosmosJsContext(_store, _queryEngine, databaseId, containerId, partitionKey, ct);
         context.Bind(engine);
 
         engine.SetValue("getContext", new Func<CosmosJsContext>(() => context.getContext()));

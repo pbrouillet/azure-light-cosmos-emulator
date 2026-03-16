@@ -27,6 +27,8 @@ public class CosmosAuthMiddleware
         if (path.StartsWith("/explorer", StringComparison.OrdinalIgnoreCase) ||
             path.Equals("/", StringComparison.OrdinalIgnoreCase) ||
             path.StartsWith("/health", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/api/emulator/explain", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/api/emulator/throughput", StringComparison.OrdinalIgnoreCase) ||
             path.Contains("/pkranges", StringComparison.OrdinalIgnoreCase))
         {
             await _next(context);

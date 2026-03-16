@@ -1,10 +1,10 @@
-using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
@@ -13,11 +13,12 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 /// Cosmos DB REST API controller for stored procedures, triggers, and UDFs.
 /// </summary>
 [ApiController]
-public class ProgrammabilityController : ControllerBase
+public class ProgrammabilityController : CosmosControllerBase
 {
     private readonly IProgrammabilityEngine _engine;
 
-    public ProgrammabilityController(IProgrammabilityEngine engine)
+    public ProgrammabilityController(IProgrammabilityEngine engine, CosmosResponseHeaderService responseHeaders)
+        : base(responseHeaders)
     {
         _engine = engine;
     }
@@ -44,7 +45,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             var result = await _engine.CreateStoredProcedureAsync(dbId, collId, sproc, ct);
-            SetCommonHeaders(5.0);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 5.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return StatusCode((int)HttpStatusCode.Created, FormatSproc(result));
         }
         catch (CosmosEmulatorException ex)
@@ -57,7 +58,7 @@ public class ProgrammabilityController : ControllerBase
     public async Task<IActionResult> ListSprocs(string dbId, string collId, CancellationToken ct)
     {
         var result = await _engine.ListStoredProceduresAsync(dbId, collId, ct);
-        SetCommonHeaders(1.0);
+        await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 1.0, DatabaseId = dbId, ContainerId = collId }, ct);
         return Ok(new
         {
             _rid = "",
@@ -85,7 +86,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             var result = await _engine.ReplaceStoredProcedureAsync(dbId, collId, sproc, ct);
-            SetCommonHeaders();
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 1.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return Ok(FormatSproc(result));
         }
         catch (CosmosEmulatorException ex)
@@ -104,7 +105,7 @@ public class ProgrammabilityController : ControllerBase
         {
             var argsArray = args.Select(a => (object?)a).ToArray();
             var result = await _engine.ExecuteStoredProcedureAsync(dbId, collId, sprocId, argsArray, pk, ct);
-            SetCommonHeaders(5.0);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 5.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return Ok(result);
         }
         catch (CosmosEmulatorException ex)
@@ -119,7 +120,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             await _engine.DeleteStoredProcedureAsync(dbId, collId, sprocId, ct);
-            SetCommonHeaders(5.0);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 5.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return NoContent();
         }
         catch (CosmosEmulatorException ex)
@@ -154,7 +155,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             var result = await _engine.CreateTriggerAsync(dbId, collId, trigger, ct);
-            SetCommonHeaders(5.0);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 5.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return StatusCode((int)HttpStatusCode.Created, FormatTrigger(result));
         }
         catch (CosmosEmulatorException ex)
@@ -167,7 +168,7 @@ public class ProgrammabilityController : ControllerBase
     public async Task<IActionResult> ListTriggers(string dbId, string collId, CancellationToken ct)
     {
         var result = await _engine.ListTriggersAsync(dbId, collId, ct);
-        SetCommonHeaders(1.0);
+        await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 1.0, DatabaseId = dbId, ContainerId = collId }, ct);
         return Ok(new
         {
             _rid = "",
@@ -199,7 +200,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             var result = await _engine.ReplaceTriggerAsync(dbId, collId, trigger, ct);
-            SetCommonHeaders();
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 1.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return Ok(FormatTrigger(result));
         }
         catch (CosmosEmulatorException ex)
@@ -214,7 +215,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             await _engine.DeleteTriggerAsync(dbId, collId, triggerId, ct);
-            SetCommonHeaders(5.0);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 5.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return NoContent();
         }
         catch (CosmosEmulatorException ex)
@@ -245,7 +246,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             var result = await _engine.CreateUdfAsync(dbId, collId, udf, ct);
-            SetCommonHeaders(5.0);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 5.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return StatusCode((int)HttpStatusCode.Created, FormatUdf(result));
         }
         catch (CosmosEmulatorException ex)
@@ -258,7 +259,7 @@ public class ProgrammabilityController : ControllerBase
     public async Task<IActionResult> ListUdfs(string dbId, string collId, CancellationToken ct)
     {
         var result = await _engine.ListUdfsAsync(dbId, collId, ct);
-        SetCommonHeaders(1.0);
+        await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 1.0, DatabaseId = dbId, ContainerId = collId }, ct);
         return Ok(new
         {
             _rid = "",
@@ -286,7 +287,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             var result = await _engine.ReplaceUdfAsync(dbId, collId, udf, ct);
-            SetCommonHeaders();
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 1.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return Ok(FormatUdf(result));
         }
         catch (CosmosEmulatorException ex)
@@ -301,7 +302,7 @@ public class ProgrammabilityController : ControllerBase
         try
         {
             await _engine.DeleteUdfAsync(dbId, collId, udfId, ct);
-            SetCommonHeaders(5.0);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { RequestCharge = 5.0, DatabaseId = dbId, ContainerId = collId, IncludeSessionToken = true }, ct);
             return NoContent();
         }
         catch (CosmosEmulatorException ex)
@@ -311,13 +312,6 @@ public class ProgrammabilityController : ControllerBase
     }
 
     // Helpers
-
-    private void SetCommonHeaders(double ru = 1.0)
-    {
-        Response.Headers[CosmosHeaders.RequestCharge] = ru.ToString("F2", CultureInfo.InvariantCulture);
-        Response.Headers[CosmosHeaders.ActivityId] = Guid.NewGuid().ToString();
-        Response.Headers[CosmosHeaders.ServiceVersion] = CosmosHeaders.CurrentServiceVersion;
-    }
 
     private static PartitionKeyValue ParsePartitionKey(string? header)
     {

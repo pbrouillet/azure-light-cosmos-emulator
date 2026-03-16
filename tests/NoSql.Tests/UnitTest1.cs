@@ -3,6 +3,7 @@ using System.Text.Json.Nodes;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
+using Azure.Cosmos.LightEmulator.NoSql.Query;
 using Azure.Cosmos.LightEmulator.NoSql.StoredProcedures;
 using Azure.Cosmos.LightEmulator.Storage.ChangeFeed;
 using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
@@ -130,6 +131,53 @@ public class UnitTest1
     }
 
     [Fact]
+    public async Task ExecuteStoredProcedureAsync_QueryDocuments_UsesQueryEngineFiltering()
+    {
+        var (store, engine) = CreateSut();
+        await store.CreateDocumentAsync("db", "coll", new JsonObject
+        {
+            ["id"] = "doc-a",
+            ["tenantId"] = "tenant-1",
+            ["category"] = "keep"
+        });
+        await store.CreateDocumentAsync("db", "coll", new JsonObject
+        {
+            ["id"] = "doc-b",
+            ["tenantId"] = "tenant-1",
+            ["category"] = "skip"
+        });
+
+        await engine.CreateStoredProcedureAsync("db", "coll", new StoredProcedure
+        {
+            Id = "query-filter",
+            DatabaseId = "db",
+            ContainerId = "coll",
+            Body = """
+                function() {
+                    var response = getContext().getResponse();
+                    getContext().getCollection().queryDocuments(
+                        getContext().getCollection().getSelfLink(),
+                        { query: 'SELECT * FROM c WHERE c.category = @category', parameters: [{ name: '@category', value: 'keep' }] },
+                        {},
+                        function(err, docs) {
+                            if (err) {
+                                throw new Error(err.message);
+                            }
+
+                            response.setBody({ count: docs.length, id: docs[0].id });
+                        });
+                }
+                """
+        });
+
+        var result = await engine.ExecuteStoredProcedureAsync("db", "coll", "query-filter", Array.Empty<object?>(), PartitionKeyValue.Create("tenant-1"));
+        var response = AsDictionary(result);
+
+        Convert.ToInt32(response["count"]).Should().Be(1);
+        response["id"].Should().Be("doc-a");
+    }
+
+    [Fact]
     public async Task ExecuteStoredProcedureAsync_WrapsJavaScriptErrors()
     {
         var (_, engine) = CreateSut();
@@ -167,7 +215,7 @@ public class UnitTest1
             }
         }).GetAwaiter().GetResult();
 
-        return (store, new JintProgrammabilityEngine(store, connectionManager));
+        return (store, new JintProgrammabilityEngine(store, new CosmosQueryEngine(store), connectionManager));
     }
 
     private static IDictionary<string, object?> AsDictionary(object? value)

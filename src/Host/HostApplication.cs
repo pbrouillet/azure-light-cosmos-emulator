@@ -1,8 +1,10 @@
 using Azure.Cosmos.LightEmulator.Auth.KeyAuth;
+using Azure.Cosmos.LightEmulator.Core.Consistency;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
 using Azure.Cosmos.LightEmulator.Host.Configuration;
 using Azure.Cosmos.LightEmulator.NoSql.Controllers;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Azure.Cosmos.LightEmulator.NoSql.Middleware;
 using Azure.Cosmos.LightEmulator.NoSql.Query;
 using Azure.Cosmos.LightEmulator.NoSql.StoredProcedures;
@@ -42,12 +44,17 @@ public static class HostApplication
         services.AddSingleton(new SurrealDbConnectionManager(emulatorOptions.DataDirectory));
         services.AddSingleton<IChangeFeedProvider, InMemoryChangeFeedProvider>();
         services.AddSingleton<IDocumentStore, SurrealDbDocumentStore>();
+        services.AddSingleton<EmulatorRuntimeState>();
         services.AddSingleton<EmulatorAdminSettingsStore>();
         services.AddSingleton<IEmulatorInfoService, EmulatorInfoService>();
         services.AddSingleton<RuTracker>();
+        services.AddSingleton<ThroughputManager>();
         services.AddSingleton<IProgrammabilityEngine, JintProgrammabilityEngine>();
         services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
+        services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
         services.AddSingleton<IAuthProvider, EmulatorAuthProvider>();
+        services.AddSingleton<CosmosResponseHeaderService>();
+        services.AddHostedService<TtlCleanupService>();
 
         services
             .AddControllers()
@@ -65,9 +72,9 @@ public static class HostApplication
         app.UseMiddleware<CosmosExceptionMiddleware>();
         app.UseMiddleware<CosmosAuthMiddleware>();
 
-        app.MapMethods("/", ["GET", "HEAD"], (HttpContext context) =>
+        app.MapMethods("/", ["GET", "HEAD"], async (HttpContext context, CosmosResponseHeaderService responseHeaders, CancellationToken ct) =>
         {
-            SetCommonHeaders(context.Response);
+            await responseHeaders.ApplyAsync(context.Response, new CosmosResponseHeaderOptions(), ct);
             return Results.Json(CreateAccountResponse(context));
         });
 
@@ -125,11 +132,8 @@ public static class HostApplication
         };
     }
 
-    private static void SetCommonHeaders(HttpResponse response)
-    {
-        response.Headers[CosmosHeaders.RequestCharge] = "1";
-        response.Headers[CosmosHeaders.ActivityId] = Guid.NewGuid().ToString();
-        response.Headers[CosmosHeaders.ServiceVersion] = CosmosHeaders.CurrentServiceVersion;
-        response.Headers[CosmosHeaders.SchemaVersion] = CosmosHeaders.CurrentSchemaVersion;
-    }
+    private static ConsistencyLevel ParseConsistencyLevel(string? value) =>
+        Enum.TryParse<ConsistencyLevel>(value, ignoreCase: true, out var consistencyLevel)
+            ? consistencyLevel
+            : ConsistencyLevel.Session;
 }

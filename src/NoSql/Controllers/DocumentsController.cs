@@ -1,10 +1,10 @@
-using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
@@ -14,14 +14,15 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 /// </summary>
 [ApiController]
 [Route("dbs/{dbId}/colls/{collId}/docs")]
-public class DocumentsController : ControllerBase
+public class DocumentsController : CosmosControllerBase
 {
     private const string RequestBodyLengthItemKey = "DocumentsController.RequestBodyLength";
 
     private readonly IDocumentStore _store;
     private readonly IQueryEngine _queryEngine;
 
-    public DocumentsController(IDocumentStore store, IQueryEngine queryEngine)
+    public DocumentsController(IDocumentStore store, IQueryEngine queryEngine, CosmosResponseHeaderService responseHeaders)
+        : base(responseHeaders)
     {
         _store = store;
         _queryEngine = queryEngine;
@@ -55,7 +56,13 @@ public class DocumentsController : ControllerBase
         try
         {
             var doc = await _store.ReadDocumentAsync(dbId, collId, docId, partitionKey, ct);
-            SetCommonHeaders(RuCostCalculator.PointRead(doc.Body.ToJsonString().Length), doc);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.PointRead(doc.Body.ToJsonString().Length),
+                DatabaseId = dbId,
+                ContainerId = collId,
+                ItemLsn = doc.Lsn
+            }, ct);
             Response.Headers.ETag = doc.ETag;
             return Ok(doc.ToResponseBody());
         }
@@ -74,7 +81,15 @@ public class DocumentsController : ControllerBase
         try
         {
             var doc = await _store.ReplaceDocumentAsync(dbId, collId, docId, body, ifMatch, ct);
-            SetCommonHeaders(RuCostCalculator.Replace(body.ToJsonString().Length), doc);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.Replace(body.ToJsonString().Length),
+                DatabaseId = dbId,
+                ContainerId = collId,
+                ItemLsn = doc.Lsn,
+                IncludeSessionToken = true,
+                SessionLsn = doc.Lsn
+            }, ct);
             Response.Headers.ETag = doc.ETag;
             return Ok(doc.ToResponseBody());
         }
@@ -97,7 +112,14 @@ public class DocumentsController : ControllerBase
         try
         {
             await _store.DeleteDocumentAsync(dbId, collId, docId, partitionKey, ct);
-            SetCommonHeaders(RuCostCalculator.Delete());
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.Delete(),
+                DatabaseId = dbId,
+                ContainerId = collId,
+                IncludeSessionToken = true,
+                SessionLsn = await _store.GetGlobalLsnAsync(ct)
+            }, ct);
             return NoContent();
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -112,7 +134,15 @@ public class DocumentsController : ControllerBase
         {
             var requestBodyLength = GetRequestBodyLength(body);
             var doc = await _store.CreateDocumentAsync(dbId, collId, body, ct);
-            SetCommonHeaders(RuCostCalculator.Create(requestBodyLength), doc);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.Create(requestBodyLength),
+                DatabaseId = dbId,
+                ContainerId = collId,
+                ItemLsn = doc.Lsn,
+                IncludeSessionToken = true,
+                SessionLsn = doc.Lsn
+            }, ct);
             Response.Headers.ETag = doc.ETag;
             return StatusCode((int)HttpStatusCode.Created, doc.ToResponseBody());
         }
@@ -131,7 +161,15 @@ public class DocumentsController : ControllerBase
         try
         {
             var doc = await _store.UpsertDocumentAsync(dbId, collId, body, ct);
-            SetCommonHeaders(RuCostCalculator.Upsert(body.ToJsonString().Length), doc);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.Upsert(body.ToJsonString().Length),
+                DatabaseId = dbId,
+                ContainerId = collId,
+                ItemLsn = doc.Lsn,
+                IncludeSessionToken = true,
+                SessionLsn = doc.Lsn
+            }, ct);
             Response.Headers.ETag = doc.ETag;
             return Ok(doc.ToResponseBody());
         }
@@ -183,7 +221,12 @@ public class DocumentsController : ControllerBase
                 Request.Headers[CosmosHeaders.EnableCrossPartition].FirstOrDefault(),
                 "true",
                 StringComparison.OrdinalIgnoreCase);
-            SetCommonHeaders(RuCostCalculator.Query(result.Count, totalSize, isCrossPartition));
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.Query(result.Count, totalSize, isCrossPartition),
+                DatabaseId = dbId,
+                ContainerId = collId
+            }, ct);
             Response.Headers[CosmosHeaders.ItemCount] = result.Count.ToString();
             if (result.ContinuationToken != null)
                 Response.Headers[CosmosHeaders.Continuation] = result.ContinuationToken;
@@ -223,18 +266,6 @@ public class DocumentsController : ControllerBase
         && requestBodyLength is int length
             ? length
             : body.ToJsonString().Length;
-
-    private void SetCommonHeaders(double ru = 1.0, CosmosDocument? doc = null)
-    {
-        Response.Headers[CosmosHeaders.RequestCharge] = ru.ToString("F2", CultureInfo.InvariantCulture);
-        Response.Headers[CosmosHeaders.ActivityId] = Guid.NewGuid().ToString();
-        Response.Headers[CosmosHeaders.ServiceVersion] = CosmosHeaders.CurrentServiceVersion;
-
-        if (doc != null)
-        {
-            Response.Headers[CosmosHeaders.CosmosItemLsn] = doc.Lsn.ToString();
-        }
-    }
 
     private static PartitionKeyValue ParsePartitionKey(string? header)
     {

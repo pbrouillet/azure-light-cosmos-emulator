@@ -50,36 +50,39 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 .ToList();
         }
 
-        var matchingDocuments = new List<DocumentContext>();
+        var matchingRows = new List<QueryRow>();
         foreach (var document in documents)
         {
             ct.ThrowIfCancellationRequested();
 
             var responseBody = document.ToResponseBody();
-            if (MatchesFilters(responseBody, plan.Filters, parameters))
+            var seedRow = new QueryRow(
+                document,
+                new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [plan.FromAlias] = responseBody
+                });
+
+            foreach (var joinedRow in ApplyJoins(seedRow, plan.Joins, parameters))
             {
-                matchingDocuments.Add(new DocumentContext(document, responseBody));
+                if (plan.Where is null || EvaluateBooleanExpression(joinedRow, plan.Where, parameters))
+                {
+                    matchingRows.Add(joinedRow);
+                }
             }
         }
 
-        matchingDocuments = ApplyOrdering(matchingDocuments, plan);
-        matchingDocuments = ApplyWindowing(matchingDocuments, plan);
-
         List<JsonObject> projectedResults;
-        if (plan.ProjectionType == ProjectionType.Count)
+        if (plan.RequiresAggregation)
         {
-            projectedResults =
-            [
-                new JsonObject
-                {
-                    ["$1"] = matchingDocuments.Count
-                }
-            ];
+            projectedResults = ExecuteAggregateQuery(matchingRows, plan, parameters);
         }
         else
         {
-            projectedResults = matchingDocuments
-                .Select(context => Project(context.ResponseBody, plan.Projection))
+            var orderedRows = ApplyOrdering(matchingRows, plan, parameters);
+            var windowedRows = ApplyWindowing(orderedRows, plan.Top, plan.Offset, plan.Limit);
+            projectedResults = windowedRows
+                .Select(row => ProjectRow(row, plan, parameters))
                 .ToList();
         }
 
@@ -119,28 +122,37 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         var selectClause = trimmedQuery["SELECT".Length..fromIndex].Trim();
         var whereIndex = FindTopLevelKeyword(trimmedQuery, "WHERE", fromIndex + "FROM".Length);
+        var groupByIndex = FindTopLevelKeyword(trimmedQuery, "GROUP BY", fromIndex + "FROM".Length);
         var orderByIndex = FindTopLevelKeyword(trimmedQuery, "ORDER BY", fromIndex + "FROM".Length);
         var offsetIndex = FindTopLevelKeyword(trimmedQuery, "OFFSET", fromIndex + "FROM".Length);
 
-        var clauseIndexes = new[] { whereIndex, orderByIndex, offsetIndex }
+        var clauseIndexes = new[] { whereIndex, groupByIndex, orderByIndex, offsetIndex }
             .Where(index => index >= 0)
             .OrderBy(index => index)
             .ToArray();
+
         var fromClauseEnd = clauseIndexes.FirstOrDefault(trimmedQuery.Length);
         var fromClause = trimmedQuery[(fromIndex + "FROM".Length)..fromClauseEnd].Trim();
-        if (!string.Equals(fromClause, "c", StringComparison.OrdinalIgnoreCase))
-        {
-            throw CosmosEmulatorException.BadRequest("Only 'FROM c' queries are supported.");
-        }
+        var (fromAlias, joins) = ParseFromClause(fromClause);
 
         string? whereClause = null;
         if (whereIndex >= 0)
         {
-            var whereEnd = new[] { orderByIndex, offsetIndex }
+            var whereEnd = new[] { groupByIndex, orderByIndex, offsetIndex }
                 .Where(index => index > whereIndex)
                 .OrderBy(index => index)
                 .FirstOrDefault(trimmedQuery.Length);
             whereClause = trimmedQuery[(whereIndex + "WHERE".Length)..whereEnd].Trim();
+        }
+
+        string? groupByClause = null;
+        if (groupByIndex >= 0)
+        {
+            var groupByEnd = new[] { orderByIndex, offsetIndex }
+                .Where(index => index > groupByIndex)
+                .OrderBy(index => index)
+                .FirstOrDefault(trimmedQuery.Length);
+            groupByClause = trimmedQuery[(groupByIndex + "GROUP BY".Length)..groupByEnd].Trim();
         }
 
         string? orderByClause = null;
@@ -161,11 +173,17 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         var top = ParseTop(ref selectClause, parameters);
         var projection = ParseProjection(selectClause);
-        var filters = ParseFilters(whereClause);
+        var where = ParseWhere(whereClause);
+        var groupBy = ParseGroupBy(groupByClause);
         var orderBy = ParseOrderBy(orderByClause);
         var (offset, limit) = ParseOffsetLimit(offsetLimitClause, parameters);
 
-        return new QueryPlan(projection, filters, orderBy, top, offset, limit);
+        if (projection.Mode == ProjectionMode.All && (groupBy.Count > 0 || projection.ContainsAggregate))
+        {
+            throw CosmosEmulatorException.BadRequest("SELECT * is not supported for aggregate queries.");
+        }
+
+        return new QueryPlan(fromAlias, joins, projection, where, groupBy, orderBy, top, offset, limit);
     }
 
     private static int? ParseTop(ref string selectClause, IReadOnlyDictionary<string, object?>? parameters)
@@ -177,93 +195,60 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         selectClause = topMatch.Groups["rest"].Value.Trim();
-        return ResolveNonNegativeInteger(ParseValueExpression(topMatch.Groups["value"].Value), parameters, "TOP");
+        return ResolveNonNegativeInteger(ParseScalarExpression(topMatch.Groups["value"].Value), parameters, "TOP");
     }
 
     private static Projection ParseProjection(string selectClause)
     {
         if (string.Equals(selectClause, "*", StringComparison.Ordinal))
         {
-            return new Projection(ProjectionType.All, null, []);
-        }
-
-        if (string.Equals(selectClause, "COUNT(1)", StringComparison.OrdinalIgnoreCase))
-        {
-            return new Projection(ProjectionType.Count, null, []);
+            return new Projection(ProjectionMode.All, []);
         }
 
         if (selectClause.StartsWith("VALUE", StringComparison.OrdinalIgnoreCase))
         {
-            var valueExpression = selectClause["VALUE".Length..].Trim();
-            return new Projection(ProjectionType.Value, NormalizePath(valueExpression), []);
+            var valueExpression = ParseScalarExpression(selectClause["VALUE".Length..].Trim());
+            return new Projection(ProjectionMode.Value, [new SelectItem(valueExpression, "$1")]);
         }
 
-        var fields = SplitTopLevel(selectClause, ',')
-            .Select(NormalizePath)
+        var fieldExpressions = SplitTopLevel(selectClause, ',')
+            .Select(ParseScalarExpression)
             .ToList();
-        if (fields.Count == 0)
+        if (fieldExpressions.Count == 0)
         {
             throw CosmosEmulatorException.BadRequest("SELECT must project at least one field.");
         }
 
-        return new Projection(ProjectionType.Fields, null, fields);
+        var fields = fieldExpressions
+            .Select((expression, index) => new SelectItem(expression, GetOutputAlias(expression, index + 1)))
+            .ToList();
+
+        return new Projection(ProjectionMode.Fields, fields);
     }
 
-    private static IReadOnlyList<FilterClause> ParseFilters(string? whereClause)
+    private static BooleanExpression? ParseWhere(string? whereClause)
     {
         if (string.IsNullOrWhiteSpace(whereClause))
+        {
+            return null;
+        }
+
+        var parser = new ExpressionParser(whereClause);
+        var expression = parser.ParseBooleanExpression();
+        parser.ExpectEnd("WHERE");
+        return expression;
+    }
+
+    private static IReadOnlyList<ScalarExpression> ParseGroupBy(string? groupByClause)
+    {
+        if (string.IsNullOrWhiteSpace(groupByClause))
         {
             return [];
         }
 
-        return SplitTopLevelKeyword(whereClause, "AND")
-            .Select(ParseFilter)
+        return SplitTopLevel(groupByClause, ',')
+            .Select(ParseScalarExpression)
             .ToList();
-    }
-
-    private static FilterClause ParseFilter(string clause)
-    {
-        var containsMatch = Regex.Match(clause, @"^CONTAINS\((?<path>[^,]+),(?<value>.+)\)$", RegexOptions.IgnoreCase);
-        if (containsMatch.Success)
-        {
-            return new ContainsFilter(
-                NormalizePath(containsMatch.Groups["path"].Value),
-                ParseValueExpression(containsMatch.Groups["value"].Value));
-        }
-
-        var arrayContainsMatch = Regex.Match(clause, @"^ARRAY_CONTAINS\((?<path>[^,]+),(?<value>.+)\)$", RegexOptions.IgnoreCase);
-        if (arrayContainsMatch.Success)
-        {
-            return new ArrayContainsFilter(
-                NormalizePath(arrayContainsMatch.Groups["path"].Value),
-                ParseValueExpression(arrayContainsMatch.Groups["value"].Value));
-        }
-
-        var isDefinedMatch = Regex.Match(clause, @"^IS_DEFINED\((?<path>.+)\)$", RegexOptions.IgnoreCase);
-        if (isDefinedMatch.Success)
-        {
-            return new IsDefinedFilter(NormalizePath(isDefinedMatch.Groups["path"].Value));
-        }
-
-        var inMatch = Regex.Match(clause, @"^(?<path>c(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s+IN\s*\((?<values>.+)\)$", RegexOptions.IgnoreCase);
-        if (inMatch.Success)
-        {
-            var values = SplitTopLevel(inMatch.Groups["values"].Value, ',')
-                .Select(ParseValueExpression)
-                .ToList();
-            return new InFilter(NormalizePath(inMatch.Groups["path"].Value), values);
-        }
-
-        var comparisonMatch = Regex.Match(clause, @"^(?<path>c(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s*(?<operator>>=|<=|=|>|<)\s*(?<value>.+)$", RegexOptions.IgnoreCase);
-        if (comparisonMatch.Success)
-        {
-            return new ComparisonFilter(
-                NormalizePath(comparisonMatch.Groups["path"].Value),
-                comparisonMatch.Groups["operator"].Value,
-                ParseValueExpression(comparisonMatch.Groups["value"].Value));
-        }
-
-        throw CosmosEmulatorException.BadRequest($"Unsupported WHERE clause expression '{clause}'.");
     }
 
     private static OrderByClause? ParseOrderBy(string? orderByClause)
@@ -273,15 +258,67 @@ public sealed class CosmosQueryEngine : IQueryEngine
             return null;
         }
 
-        var match = Regex.Match(orderByClause, @"^(?<path>c(?:\.[A-Za-z_][A-Za-z0-9_]*)+)(?:\s+(?<direction>ASC|DESC))?$", RegexOptions.IgnoreCase);
-        if (!match.Success)
+        var parser = new ExpressionParser(orderByClause);
+        var expression = parser.ParseScalarExpression();
+        var descending = parser.MatchKeyword("DESC");
+        if (!descending)
         {
-            throw CosmosEmulatorException.BadRequest("Unsupported ORDER BY clause.");
+            _ = parser.MatchKeyword("ASC");
         }
 
-        return new OrderByClause(
-            NormalizePath(match.Groups["path"].Value),
-            string.Equals(match.Groups["direction"].Value, "DESC", StringComparison.OrdinalIgnoreCase));
+        parser.ExpectEnd("ORDER BY");
+        return new OrderByClause(expression, descending);
+    }
+
+    private static (string FromAlias, IReadOnlyList<JoinClause> Joins) ParseFromClause(string fromClause)
+    {
+        var remainder = fromClause.Trim();
+        var fromAlias = ReadLeadingIdentifier(remainder, out var consumedLength);
+        if (string.IsNullOrWhiteSpace(fromAlias))
+        {
+            throw CosmosEmulatorException.BadRequest("Unsupported FROM clause.");
+        }
+
+        remainder = remainder[consumedLength..].TrimStart();
+        var joins = new List<JoinClause>();
+        while (!string.IsNullOrWhiteSpace(remainder))
+        {
+            if (!remainder.StartsWith("JOIN", StringComparison.OrdinalIgnoreCase))
+            {
+                throw CosmosEmulatorException.BadRequest("Unsupported FROM clause.");
+            }
+
+            remainder = remainder["JOIN".Length..].TrimStart();
+            var joinAlias = ReadLeadingIdentifier(remainder, out consumedLength);
+            if (string.IsNullOrWhiteSpace(joinAlias))
+            {
+                throw CosmosEmulatorException.BadRequest("JOIN requires an alias.");
+            }
+
+            remainder = remainder[consumedLength..].TrimStart();
+            if (!remainder.StartsWith("IN", StringComparison.OrdinalIgnoreCase)
+                || (remainder.Length > 2 && !char.IsWhiteSpace(remainder[2])))
+            {
+                throw CosmosEmulatorException.BadRequest("JOIN must use the 'IN' syntax.");
+            }
+
+            remainder = remainder["IN".Length..].TrimStart();
+            var nextJoinIndex = FindTopLevelKeyword(remainder, "JOIN", 0);
+            var sourceExpression = nextJoinIndex >= 0
+                ? remainder[..nextJoinIndex].Trim()
+                : remainder.Trim();
+            if (string.IsNullOrWhiteSpace(sourceExpression))
+            {
+                throw CosmosEmulatorException.BadRequest("JOIN source expression is required.");
+            }
+
+            joins.Add(new JoinClause(joinAlias, ParseScalarExpression(sourceExpression)));
+            remainder = nextJoinIndex >= 0
+                ? remainder[nextJoinIndex..].TrimStart()
+                : string.Empty;
+        }
+
+        return (fromAlias, joins);
     }
 
     private static (int? offset, int? limit) ParseOffsetLimit(string? offsetLimitClause, IReadOnlyDictionary<string, object?>? parameters)
@@ -291,66 +328,130 @@ public sealed class CosmosQueryEngine : IQueryEngine
             return (null, null);
         }
 
-        var match = Regex.Match(offsetLimitClause, @"^(?<offset>.+?)\s+LIMIT\s+(?<limit>.+)$", RegexOptions.IgnoreCase);
-        if (!match.Success)
+        var limitIndex = FindTopLevelKeyword(offsetLimitClause, "LIMIT", 0);
+        if (limitIndex < 0)
         {
             throw CosmosEmulatorException.BadRequest("OFFSET queries must include LIMIT.");
         }
 
-        var offset = ResolveNonNegativeInteger(ParseValueExpression(match.Groups["offset"].Value), parameters, "OFFSET");
-        var limit = ResolveNonNegativeInteger(ParseValueExpression(match.Groups["limit"].Value), parameters, "LIMIT");
+        var offsetText = offsetLimitClause[..limitIndex].Trim();
+        var limitText = offsetLimitClause[(limitIndex + "LIMIT".Length)..].Trim();
+        var offset = ResolveNonNegativeInteger(ParseScalarExpression(offsetText), parameters, "OFFSET");
+        var limit = ResolveNonNegativeInteger(ParseScalarExpression(limitText), parameters, "LIMIT");
         return (offset, limit);
     }
 
-    private static List<DocumentContext> ApplyOrdering(List<DocumentContext> documents, QueryPlan plan)
+    private static ScalarExpression ParseScalarExpression(string expression)
     {
-        IOrderedEnumerable<DocumentContext> orderedDocuments;
+        var parser = new ExpressionParser(expression);
+        var scalar = parser.ParseScalarExpression();
+        parser.ExpectEnd("expression");
+        return scalar;
+    }
+
+    private static List<QueryRow> ApplyJoins(QueryRow seedRow, IReadOnlyList<JoinClause> joins, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        var rows = new List<QueryRow> { seedRow };
+        foreach (var join in joins)
+        {
+            var expandedRows = new List<QueryRow>();
+            foreach (var row in rows)
+            {
+                var source = EvaluateScalarExpression(row, join.SourceExpression, parameters);
+                if (source is not JsonArray array)
+                {
+                    continue;
+                }
+
+                foreach (var item in array)
+                {
+                    expandedRows.Add(row.WithAlias(join.Alias, NormalizeRuntimeValue(item)));
+                }
+            }
+
+            rows = expandedRows;
+            if (rows.Count == 0)
+            {
+                break;
+            }
+        }
+
+        return rows;
+    }
+
+    private static List<QueryRow> ApplyOrdering(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        if (rows.Count == 0)
+        {
+            return rows;
+        }
+
         if (plan.OrderBy is null)
         {
-            orderedDocuments = documents
-                .OrderBy(context => context.Document.Timestamp)
-                .ThenBy(context => context.Document.Id, StringComparer.Ordinal);
-        }
-        else
-        {
-            Func<DocumentContext, object?> keySelector = context => ResolveComparablePathValue(context.ResponseBody, plan.OrderBy.Path);
-            orderedDocuments = plan.OrderBy.Descending
-                ? documents.OrderByDescending(keySelector, QueryValueComparer.Instance)
-                : documents.OrderBy(keySelector, QueryValueComparer.Instance);
-
-            orderedDocuments = orderedDocuments
-                .ThenBy(context => context.Document.Id, StringComparer.Ordinal);
+            return rows
+                .OrderBy(row => row.Document?.Timestamp)
+                .ThenBy(row => row.Document?.Id, StringComparer.Ordinal)
+                .ToList();
         }
 
-        return orderedDocuments.ToList();
+        Func<QueryRow, object?> keySelector = row => EvaluateScalarExpression(row, plan.OrderBy.Expression, parameters);
+        var orderedRows = plan.OrderBy.Descending
+            ? rows.OrderByDescending(keySelector, QueryValueComparer.Instance)
+            : rows.OrderBy(keySelector, QueryValueComparer.Instance);
+
+        return orderedRows
+            .ThenBy(row => row.Document?.Id, StringComparer.Ordinal)
+            .ToList();
     }
 
-    private static List<DocumentContext> ApplyWindowing(List<DocumentContext> documents, QueryPlan plan)
+    private static List<JsonObject> ExecuteAggregateQuery(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
     {
-        IEnumerable<DocumentContext> window = documents;
-        if (plan.Top is int top)
-        {
-            window = window.Take(top);
-        }
+        var groups = BuildGroups(rows, plan, parameters);
+        var projected = groups
+            .Select(group => ProjectAggregateGroup(group, plan, parameters))
+            .ToList();
 
-        if (plan.Offset is int offset)
-        {
-            window = window.Skip(offset);
-        }
-
-        if (plan.Limit is int limit)
-        {
-            window = window.Take(limit);
-        }
-
-        return window.ToList();
+        projected = ApplyProjectedOrdering(projected, plan, parameters);
+        return ApplyWindowing(projected, plan.Top, plan.Offset, plan.Limit);
     }
 
-    private static bool MatchesFilters(JsonObject document, IReadOnlyList<FilterClause> filters, IReadOnlyDictionary<string, object?>? parameters)
+    private static List<QueryGroup> BuildGroups(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
     {
-        foreach (var filter in filters)
+        if (plan.GroupBy.Count == 0)
         {
-            if (!MatchesFilter(document, filter, parameters))
+            return [new QueryGroup([], rows)];
+        }
+
+        var groups = new List<QueryGroup>();
+        foreach (var row in rows)
+        {
+            var keyValues = plan.GroupBy
+                .Select(expression => EvaluateScalarExpression(row, expression, parameters))
+                .ToList();
+
+            var existingGroup = groups.FirstOrDefault(group => KeysMatch(group.KeyValues, keyValues));
+            if (existingGroup is null)
+            {
+                existingGroup = new QueryGroup(keyValues, []);
+                groups.Add(existingGroup);
+            }
+
+            existingGroup.Rows.Add(row);
+        }
+
+        return groups;
+    }
+
+    private static bool KeysMatch(IReadOnlyList<object?> left, IReadOnlyList<object?> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!AreEqual(left[index], right[index]))
             {
                 return false;
             }
@@ -359,68 +460,361 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return true;
     }
 
-    private static bool MatchesFilter(JsonObject document, FilterClause filter, IReadOnlyDictionary<string, object?>? parameters)
+    private static List<JsonObject> ApplyProjectedOrdering(List<JsonObject> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
     {
-        return filter switch
+        if (plan.OrderBy is null || rows.Count == 0)
         {
-            ComparisonFilter comparison => MatchesComparison(document, comparison, parameters),
-            InFilter inFilter => MatchesIn(document, inFilter, parameters),
-            ContainsFilter contains => MatchesContains(document, contains, parameters),
-            ArrayContainsFilter arrayContains => MatchesArrayContains(document, arrayContains, parameters),
-            IsDefinedFilter isDefined => TryResolvePath(document, isDefined.Path, out _),
-            _ => throw CosmosEmulatorException.BadRequest("Unsupported filter expression.")
+            return rows;
+        }
+
+        Func<JsonObject, object?> keySelector = row => EvaluateScalarExpression(
+            new QueryRow(
+                null,
+                new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [plan.FromAlias] = row
+                }),
+            plan.OrderBy.Expression,
+            parameters,
+            group: null);
+
+        var ordered = plan.OrderBy.Descending
+            ? rows.OrderByDescending(keySelector, QueryValueComparer.Instance)
+            : rows.OrderBy(keySelector, QueryValueComparer.Instance);
+
+        return ordered.ToList();
+    }
+
+    private static List<T> ApplyWindowing<T>(List<T> items, int? top, int? offset, int? limit)
+    {
+        IEnumerable<T> window = items;
+        if (top is int topValue)
+        {
+            window = window.Take(topValue);
+        }
+
+        if (offset is int offsetValue)
+        {
+            window = window.Skip(offsetValue);
+        }
+
+        if (limit is int limitValue)
+        {
+            window = window.Take(limitValue);
+        }
+
+        return window.ToList();
+    }
+
+    private static JsonObject ProjectRow(QueryRow row, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        return plan.Projection.Mode switch
+        {
+            ProjectionMode.All => ProjectAll(row, plan.FromAlias),
+            ProjectionMode.Fields => ProjectFields(row, plan.Projection.Items, parameters),
+            ProjectionMode.Value => ProjectValue(row, plan.Projection.Items[0].Expression, parameters),
+            _ => throw CosmosEmulatorException.BadRequest("Unsupported projection.")
         };
     }
 
-    private static bool MatchesComparison(JsonObject document, ComparisonFilter comparison, IReadOnlyDictionary<string, object?>? parameters)
+    private static JsonObject ProjectAggregateGroup(QueryGroup group, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
     {
-        var left = ResolveComparablePathValue(document, comparison.Path);
-        var right = ResolveParameterOrLiteral(comparison.Value, parameters);
+        var representativeRow = group.Rows.FirstOrDefault();
+        return plan.Projection.Mode switch
+        {
+            ProjectionMode.Fields => ProjectFields(representativeRow, plan.Projection.Items, parameters, group.Rows),
+            ProjectionMode.Value => ProjectValue(representativeRow, plan.Projection.Items[0].Expression, parameters, group.Rows),
+            _ => throw CosmosEmulatorException.BadRequest("Unsupported aggregate projection.")
+        };
+    }
+
+    private static JsonObject ProjectAll(QueryRow row, string fromAlias)
+    {
+        if (!row.Aliases.TryGetValue(fromAlias, out var source) || source is not JsonObject document)
+        {
+            return new JsonObject();
+        }
+
+        return document.DeepClone().AsObject();
+    }
+
+    private static JsonObject ProjectFields(QueryRow? row, IReadOnlyList<SelectItem> items, IReadOnlyDictionary<string, object?>? parameters, IReadOnlyList<QueryRow>? group = null)
+    {
+        var projected = new JsonObject();
+        foreach (var item in items)
+        {
+            var value = EvaluateScalarExpression(row, item.Expression, parameters, group);
+            if (ReferenceEquals(value, UndefinedValue))
+            {
+                continue;
+            }
+
+            projected[item.OutputName] = ConvertToJsonNode(value);
+        }
+
+        return projected;
+    }
+
+    private static JsonObject ProjectValue(QueryRow? row, ScalarExpression expression, IReadOnlyDictionary<string, object?>? parameters, IReadOnlyList<QueryRow>? group = null)
+    {
+        var projected = new JsonObject();
+        var value = EvaluateScalarExpression(row, expression, parameters, group);
+        projected["$1"] = ReferenceEquals(value, UndefinedValue) ? null : ConvertToJsonNode(value);
+        return projected;
+    }
+
+    private static bool EvaluateBooleanExpression(QueryRow row, BooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        return expression switch
+        {
+            BinaryBooleanExpression binary => binary.Operator switch
+            {
+                BooleanOperator.And => EvaluateBooleanExpression(row, binary.Left, parameters)
+                    && EvaluateBooleanExpression(row, binary.Right, parameters),
+                BooleanOperator.Or => EvaluateBooleanExpression(row, binary.Left, parameters)
+                    || EvaluateBooleanExpression(row, binary.Right, parameters),
+                _ => throw CosmosEmulatorException.BadRequest("Unsupported boolean operator.")
+            },
+            NotBooleanExpression unary => !EvaluateBooleanExpression(row, unary.Expression, parameters),
+            ComparisonBooleanExpression comparison => EvaluateComparison(row, comparison, parameters),
+            InBooleanExpression inExpression => EvaluateIn(row, inExpression, parameters),
+            ScalarBooleanExpression scalar => ToBoolean(EvaluateScalarExpression(row, scalar.Expression, parameters)),
+            _ => throw CosmosEmulatorException.BadRequest("Unsupported WHERE clause expression.")
+        };
+    }
+
+    private static bool EvaluateComparison(QueryRow row, ComparisonBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        var left = EvaluateScalarExpression(row, expression.Left, parameters);
+        var right = EvaluateScalarExpression(row, expression.Right, parameters);
+        if (ReferenceEquals(left, UndefinedValue) || ReferenceEquals(right, UndefinedValue))
+        {
+            return false;
+        }
+
+        return expression.Operator switch
+        {
+            ComparisonOperator.Equal => AreEqual(left, right),
+            ComparisonOperator.NotEqual => !AreEqual(left, right),
+            ComparisonOperator.GreaterThan => CompareValues(left, right) > 0,
+            ComparisonOperator.LessThan => CompareValues(left, right) < 0,
+            ComparisonOperator.GreaterThanOrEqual => CompareValues(left, right) >= 0,
+            ComparisonOperator.LessThanOrEqual => CompareValues(left, right) <= 0,
+            _ => throw CosmosEmulatorException.BadRequest("Unsupported comparison operator.")
+        };
+    }
+
+    private static bool EvaluateIn(QueryRow row, InBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        var left = EvaluateScalarExpression(row, expression.Left, parameters);
         if (ReferenceEquals(left, UndefinedValue))
         {
             return false;
         }
 
-        return comparison.Operator switch
+        var found = expression.Values.Any(value =>
         {
-            "=" => AreEqual(left, right),
-            ">" => CompareValues(left, right) > 0,
-            "<" => CompareValues(left, right) < 0,
-            ">=" => CompareValues(left, right) >= 0,
-            "<=" => CompareValues(left, right) <= 0,
-            _ => throw CosmosEmulatorException.BadRequest($"Unsupported operator '{comparison.Operator}'.")
+            var candidate = EvaluateScalarExpression(row, value, parameters);
+            return !ReferenceEquals(candidate, UndefinedValue) && AreEqual(left, candidate);
+        });
+
+        return expression.Negated ? !found : found;
+    }
+
+    private static bool ToBoolean(object? value)
+    {
+        return value is bool boolean && boolean;
+    }
+
+    private static object? EvaluateScalarExpression(
+        QueryRow? row,
+        ScalarExpression expression,
+        IReadOnlyDictionary<string, object?>? parameters,
+        IReadOnlyList<QueryRow>? group = null)
+    {
+        return expression switch
+        {
+            LiteralExpression literal => literal.Value,
+            ParameterExpression parameter => ResolveParameter(parameter.Name, parameters),
+            PathExpression path => row is null ? UndefinedValue : ResolvePathValue(row, path.Path),
+            FunctionCallExpression function => EvaluateFunction(row, function, parameters, group),
+            StarExpression => UndefinedValue,
+            _ => throw CosmosEmulatorException.BadRequest("Unsupported expression.")
         };
     }
 
-    private static bool MatchesIn(JsonObject document, InFilter filter, IReadOnlyDictionary<string, object?>? parameters)
+    private static object? EvaluateFunction(
+        QueryRow? row,
+        FunctionCallExpression function,
+        IReadOnlyDictionary<string, object?>? parameters,
+        IReadOnlyList<QueryRow>? group)
     {
-        var left = ResolveComparablePathValue(document, filter.Path);
-        if (ReferenceEquals(left, UndefinedValue))
+        if (IsAggregateFunction(function.Name))
+        {
+            if (group is null)
+            {
+                throw CosmosEmulatorException.BadRequest($"Aggregate function '{function.Name}' is not supported in this context.");
+            }
+
+            return EvaluateAggregateFunction(function, group, parameters);
+        }
+
+        var arguments = function.Arguments
+            .Select(argument => EvaluateScalarExpression(row, argument, parameters, group))
+            .ToList();
+
+        return EvaluateBuiltInFunction(function.Name, arguments);
+    }
+
+    private static bool IsAggregateFunction(string functionName)
+    {
+        return functionName.ToUpperInvariant() is "COUNT" or "SUM" or "AVG" or "MIN" or "MAX";
+    }
+
+    private static object? EvaluateAggregateFunction(
+        FunctionCallExpression function,
+        IReadOnlyList<QueryRow> group,
+        IReadOnlyDictionary<string, object?>? parameters)
+    {
+        var name = function.Name.ToUpperInvariant();
+        if (function.Arguments.Count != 1)
+        {
+            throw CosmosEmulatorException.BadRequest($"Function '{function.Name}' expects a single argument.");
+        }
+
+        var argument = function.Arguments[0];
+        if (name == "COUNT")
+        {
+            if (argument is StarExpression)
+            {
+                return group.Count;
+            }
+
+            if (argument is LiteralExpression literal
+                && literal.Value is double numericLiteral
+                && numericLiteral.Equals(1d))
+            {
+                return group.Count;
+            }
+
+            return group.Count(row =>
+            {
+                var value = EvaluateScalarExpression(row, argument, parameters);
+                return !ReferenceEquals(value, UndefinedValue) && value is not null;
+            });
+        }
+
+        var values = group
+            .Select(row => EvaluateScalarExpression(row, argument, parameters))
+            .Where(value => !ReferenceEquals(value, UndefinedValue) && value is not null)
+            .ToList();
+
+        return name switch
+        {
+            "SUM" => SumValues(values),
+            "AVG" => AverageValues(values),
+            "MIN" => MinOrMax(values, descending: false),
+            "MAX" => MinOrMax(values, descending: true),
+            _ => throw CosmosEmulatorException.BadRequest($"Unsupported aggregate function '{function.Name}'.")
+        };
+    }
+
+    private static object? SumValues(IReadOnlyList<object?> values)
+    {
+        var numericValues = values
+            .Select(value => TryConvertToDouble(value, out var number) ? number : (double?)null)
+            .Where(number => number.HasValue)
+            .Select(number => number!.Value)
+            .ToList();
+
+        return numericValues.Count == 0 ? null : numericValues.Sum();
+    }
+
+    private static object? AverageValues(IReadOnlyList<object?> values)
+    {
+        var numericValues = values
+            .Select(value => TryConvertToDouble(value, out var number) ? number : (double?)null)
+            .Where(number => number.HasValue)
+            .Select(number => number!.Value)
+            .ToList();
+
+        return numericValues.Count == 0 ? null : numericValues.Average();
+    }
+
+    private static object? MinOrMax(IReadOnlyList<object?> values, bool descending)
+    {
+        if (values.Count == 0)
+        {
+            return null;
+        }
+
+        return descending
+            ? values.MaxBy(value => value, QueryValueComparer.Instance)
+            : values.MinBy(value => value, QueryValueComparer.Instance);
+    }
+
+    private static object? EvaluateBuiltInFunction(string functionName, IReadOnlyList<object?> arguments)
+    {
+        var name = functionName.ToUpperInvariant();
+        return name switch
+        {
+            "CONTAINS" => EvaluateContains(arguments),
+            "ARRAY_CONTAINS" => EvaluateArrayContains(arguments),
+            "IS_DEFINED" => EvaluateIsDefined(arguments),
+            "STARTSWITH" => EvaluateStartsOrEndsWith(arguments, startsWith: true),
+            "ENDSWITH" => EvaluateStartsOrEndsWith(arguments, startsWith: false),
+            "UPPER" => EvaluateUnaryString(arguments, value => value.ToUpperInvariant()),
+            "LOWER" => EvaluateUnaryString(arguments, value => value.ToLowerInvariant()),
+            "SUBSTRING" => EvaluateSubstring(arguments),
+            "CONCAT" => EvaluateConcat(arguments),
+            "LENGTH" => EvaluateLength(arguments),
+            "REPLACE" => EvaluateReplace(arguments),
+            "TRIM" => EvaluateUnaryString(arguments, value => value.Trim()),
+            "LEFT" => EvaluateLeftOrRight(arguments, left: true),
+            "RIGHT" => EvaluateLeftOrRight(arguments, left: false),
+            "IS_STRING" => EvaluateTypeCheck(arguments, value => value is string),
+            "IS_NUMBER" => EvaluateTypeCheck(arguments, value => TryConvertToDouble(value, out _)),
+            "IS_BOOL" => EvaluateTypeCheck(arguments, value => value is bool),
+            "IS_NULL" => EvaluateTypeCheck(arguments, value => value is null),
+            "IS_ARRAY" => EvaluateTypeCheck(arguments, value => value is JsonArray),
+            "IS_OBJECT" => EvaluateTypeCheck(arguments, value => value is JsonObject),
+            "IS_PRIMITIVE" => EvaluateTypeCheck(arguments, value => value is null or string or bool || TryConvertToDouble(value, out _)),
+            "ABS" => EvaluateUnaryNumber(arguments, Math.Abs),
+            "CEILING" => EvaluateUnaryNumber(arguments, Math.Ceiling),
+            "FLOOR" => EvaluateUnaryNumber(arguments, Math.Floor),
+            "ROUND" => EvaluateUnaryNumber(arguments, Math.Round),
+            "POWER" => EvaluatePower(arguments),
+            "SQRT" => EvaluateSqrt(arguments),
+            _ => throw CosmosEmulatorException.BadRequest($"Unsupported function '{functionName}'.")
+        };
+    }
+
+    private static object? EvaluateContains(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2)
+        {
+            throw CosmosEmulatorException.BadRequest("CONTAINS expects two arguments.");
+        }
+
+        return arguments[0] is string input && arguments[1] is string search
+            && input.Contains(search, StringComparison.Ordinal);
+    }
+
+    private static object? EvaluateArrayContains(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2)
+        {
+            throw CosmosEmulatorException.BadRequest("ARRAY_CONTAINS expects two arguments.");
+        }
+
+        if (arguments[0] is not JsonArray array)
         {
             return false;
         }
 
-        return filter.Values.Any(value => AreEqual(left, ResolveParameterOrLiteral(value, parameters)));
-    }
-
-    private static bool MatchesContains(JsonObject document, ContainsFilter filter, IReadOnlyDictionary<string, object?>? parameters)
-    {
-        var left = ResolveComparablePathValue(document, filter.Path);
-        var right = ResolveParameterOrLiteral(filter.Value, parameters);
-        return left is string input && right is string search && input.Contains(search, StringComparison.Ordinal);
-    }
-
-    private static bool MatchesArrayContains(JsonObject document, ArrayContainsFilter filter, IReadOnlyDictionary<string, object?>? parameters)
-    {
-        if (!TryResolvePath(document, filter.Path, out var arrayNode) || arrayNode is not JsonArray array)
-        {
-            return false;
-        }
-
-        var expected = ResolveParameterOrLiteral(filter.Value, parameters);
         foreach (var item in array)
         {
-            if (AreEqual(NormalizeRuntimeValue(item), expected))
+            if (AreEqual(NormalizeRuntimeValue(item), arguments[1]))
             {
                 return true;
             }
@@ -429,100 +823,234 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return false;
     }
 
-    private static JsonObject Project(JsonObject document, Projection projection)
+    private static object? EvaluateIsDefined(IReadOnlyList<object?> arguments)
     {
-        return projection.Type switch
+        if (arguments.Count != 1)
         {
-            ProjectionType.All => document.DeepClone().AsObject(),
-            ProjectionType.Fields => ProjectFields(document, projection.Fields),
-            ProjectionType.Value => ProjectValue(document, projection.ValuePath!),
-            _ => throw CosmosEmulatorException.BadRequest("Unsupported projection.")
-        };
+            throw CosmosEmulatorException.BadRequest("IS_DEFINED expects one argument.");
+        }
+
+        return !ReferenceEquals(arguments[0], UndefinedValue);
     }
 
-    private static JsonObject ProjectFields(JsonObject document, IReadOnlyList<string> fields)
+    private static object? EvaluateStartsOrEndsWith(IReadOnlyList<object?> arguments, bool startsWith)
     {
-        var projected = new JsonObject();
-        foreach (var field in fields)
+        if (arguments.Count != 2)
         {
-            if (TryResolvePath(document, field, out var value))
+            throw CosmosEmulatorException.BadRequest(startsWith ? "STARTSWITH expects two arguments." : "ENDSWITH expects two arguments.");
+        }
+
+        if (arguments[0] is not string input || arguments[1] is not string prefixOrSuffix)
+        {
+            return false;
+        }
+
+        return startsWith
+            ? input.StartsWith(prefixOrSuffix, StringComparison.Ordinal)
+            : input.EndsWith(prefixOrSuffix, StringComparison.Ordinal);
+    }
+
+    private static object? EvaluateUnaryString(IReadOnlyList<object?> arguments, Func<string, string> transform)
+    {
+        if (arguments.Count != 1)
+        {
+            throw CosmosEmulatorException.BadRequest("Function expects one argument.");
+        }
+
+        return arguments[0] is string value ? transform(value) : null;
+    }
+
+    private static object? EvaluateSubstring(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 3)
+        {
+            throw CosmosEmulatorException.BadRequest("SUBSTRING expects three arguments.");
+        }
+
+        if (arguments[0] is not string value
+            || !TryConvertToInt32(arguments[1], out var start)
+            || !TryConvertToInt32(arguments[2], out var length)
+            || start < 0
+            || length < 0)
+        {
+            return null;
+        }
+
+        if (start >= value.Length)
+        {
+            return string.Empty;
+        }
+
+        var safeLength = Math.Min(length, value.Length - start);
+        return value.Substring(start, safeLength);
+    }
+
+    private static object? EvaluateConcat(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count < 2)
+        {
+            throw CosmosEmulatorException.BadRequest("CONCAT expects at least two arguments.");
+        }
+
+        if (arguments.Any(argument => argument is null || ReferenceEquals(argument, UndefinedValue)))
+        {
+            return null;
+        }
+
+        return string.Concat(arguments.Select(argument => Convert.ToString(argument, CultureInfo.InvariantCulture)));
+    }
+
+    private static object? EvaluateLength(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+        {
+            throw CosmosEmulatorException.BadRequest("LENGTH expects one argument.");
+        }
+
+        return arguments[0] is string value ? value.Length : null;
+    }
+
+    private static object? EvaluateReplace(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 3)
+        {
+            throw CosmosEmulatorException.BadRequest("REPLACE expects three arguments.");
+        }
+
+        return arguments[0] is string value && arguments[1] is string oldValue && arguments[2] is string newValue
+            ? value.Replace(oldValue, newValue, StringComparison.Ordinal)
+            : null;
+    }
+
+    private static object? EvaluateLeftOrRight(IReadOnlyList<object?> arguments, bool left)
+    {
+        if (arguments.Count != 2)
+        {
+            throw CosmosEmulatorException.BadRequest(left ? "LEFT expects two arguments." : "RIGHT expects two arguments.");
+        }
+
+        if (arguments[0] is not string value || !TryConvertToInt32(arguments[1], out var count) || count < 0)
+        {
+            return null;
+        }
+
+        var safeCount = Math.Min(count, value.Length);
+        return left
+            ? value[..safeCount]
+            : value[^safeCount..];
+    }
+
+    private static object? EvaluateTypeCheck(IReadOnlyList<object?> arguments, Func<object?, bool> predicate)
+    {
+        if (arguments.Count != 1)
+        {
+            throw CosmosEmulatorException.BadRequest("Type-checking functions expect one argument.");
+        }
+
+        return !ReferenceEquals(arguments[0], UndefinedValue) && predicate(arguments[0]);
+    }
+
+    private static object? EvaluateUnaryNumber(IReadOnlyList<object?> arguments, Func<double, double> transform)
+    {
+        if (arguments.Count != 1)
+        {
+            throw CosmosEmulatorException.BadRequest("Math function expects one argument.");
+        }
+
+        if (!TryConvertToDouble(arguments[0], out var value))
+        {
+            return null;
+        }
+
+        var result = transform(value);
+        return double.IsNaN(result) || double.IsInfinity(result) ? null : result;
+    }
+
+    private static object? EvaluatePower(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2)
+        {
+            throw CosmosEmulatorException.BadRequest("POWER expects two arguments.");
+        }
+
+        if (!TryConvertToDouble(arguments[0], out var value) || !TryConvertToDouble(arguments[1], out var exponent))
+        {
+            return null;
+        }
+
+        var result = Math.Pow(value, exponent);
+        return double.IsNaN(result) || double.IsInfinity(result) ? null : result;
+    }
+
+    private static object? EvaluateSqrt(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+        {
+            throw CosmosEmulatorException.BadRequest("SQRT expects one argument.");
+        }
+
+        if (!TryConvertToDouble(arguments[0], out var value))
+        {
+            return null;
+        }
+
+        var result = Math.Sqrt(value);
+        return double.IsNaN(result) || double.IsInfinity(result) ? null : result;
+    }
+
+    private static object? ResolvePathValue(QueryRow row, string path)
+    {
+        var segments = path.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (segments.Length == 0 || !row.Aliases.TryGetValue(segments[0], out var current))
+        {
+            return UndefinedValue;
+        }
+
+        if (segments.Length == 1)
+        {
+            return current;
+        }
+
+        for (var index = 1; index < segments.Length; index++)
+        {
+            var segment = segments[index];
+            switch (current)
             {
-                projected[GetPropertyAlias(field)] = CloneNode(value);
+                case JsonObject currentObject when currentObject.TryGetPropertyValue(segment, out var propertyValue):
+                    current = NormalizeRuntimeValue(propertyValue);
+                    break;
+                case JsonArray currentArray when int.TryParse(segment, NumberStyles.Integer, CultureInfo.InvariantCulture, out var arrayIndex)
+                                               && arrayIndex >= 0
+                                               && arrayIndex < currentArray.Count:
+                    current = NormalizeRuntimeValue(currentArray[arrayIndex]);
+                    break;
+                default:
+                    return UndefinedValue;
             }
         }
 
-        return projected;
+        return current;
     }
 
-    private static JsonObject ProjectValue(JsonObject document, string path)
+    private static object? ResolveParameter(string parameterName, IReadOnlyDictionary<string, object?>? parameters)
     {
-        var projected = new JsonObject();
-        projected["$1"] = TryResolvePath(document, path, out var value) ? CloneNode(value) : null;
-        return projected;
-    }
-
-    private static object? ResolveComparablePathValue(JsonObject document, string path)
-    {
-        return TryResolvePath(document, path, out var value)
-            ? NormalizeRuntimeValue(value)
-            : UndefinedValue;
-    }
-
-    private static object? ResolveParameterOrLiteral(ValueExpression expression, IReadOnlyDictionary<string, object?>? parameters)
-    {
-        if (!expression.IsParameter)
-        {
-            return expression.Value;
-        }
-
         if (parameters is null)
         {
-            throw CosmosEmulatorException.BadRequest($"Missing query parameter '{expression.ParameterName}'.");
+            throw CosmosEmulatorException.BadRequest($"Missing query parameter '{parameterName}'.");
         }
 
-        if (!parameters.TryGetValue(expression.ParameterName!, out var value)
-            && !parameters.TryGetValue(expression.ParameterName!.TrimStart('@'), out value))
+        if (!parameters.TryGetValue(parameterName, out var value)
+            && !parameters.TryGetValue(parameterName.TrimStart('@'), out value))
         {
-            throw CosmosEmulatorException.BadRequest($"Missing query parameter '{expression.ParameterName}'.");
+            throw CosmosEmulatorException.BadRequest($"Missing query parameter '{parameterName}'.");
         }
 
         return NormalizeRuntimeValue(value);
     }
 
-    private static ValueExpression ParseValueExpression(string token)
+    private static int ResolveNonNegativeInteger(ScalarExpression expression, IReadOnlyDictionary<string, object?>? parameters, string clauseName)
     {
-        var trimmedToken = token.Trim();
-        if (trimmedToken.StartsWith("@", StringComparison.Ordinal))
-        {
-            return new ValueExpression(true, trimmedToken, null);
-        }
-
-        if (trimmedToken.Length >= 2 && trimmedToken[0] == '\'' && trimmedToken[^1] == '\'')
-        {
-            return new ValueExpression(false, null, trimmedToken[1..^1].Replace("''", "'", StringComparison.Ordinal));
-        }
-
-        if (bool.TryParse(trimmedToken, out var boolValue))
-        {
-            return new ValueExpression(false, null, boolValue);
-        }
-
-        if (string.Equals(trimmedToken, "null", StringComparison.OrdinalIgnoreCase))
-        {
-            return new ValueExpression(false, null, null);
-        }
-
-        if (double.TryParse(trimmedToken, NumberStyles.Float, CultureInfo.InvariantCulture, out var numericValue))
-        {
-            return new ValueExpression(false, null, numericValue);
-        }
-
-        throw CosmosEmulatorException.BadRequest($"Unsupported query value '{trimmedToken}'.");
-    }
-
-    private static int ResolveNonNegativeInteger(ValueExpression expression, IReadOnlyDictionary<string, object?>? parameters, string clauseName)
-    {
-        var resolved = ResolveParameterOrLiteral(expression, parameters);
+        var resolved = EvaluateScalarExpression(null, expression, parameters);
         if (!TryConvertToInt32(resolved, out var value) || value < 0)
         {
             throw CosmosEmulatorException.BadRequest($"{clauseName} requires a non-negative integer value.");
@@ -546,48 +1074,6 @@ public sealed class CosmosQueryEngine : IQueryEngine
         throw CosmosEmulatorException.BadRequest("The continuation token is invalid.");
     }
 
-    private static string NormalizePath(string rawPath)
-    {
-        var trimmedPath = rawPath.Trim();
-        if (!trimmedPath.StartsWith("c.", StringComparison.OrdinalIgnoreCase))
-        {
-            throw CosmosEmulatorException.BadRequest($"Unsupported property path '{trimmedPath}'.");
-        }
-
-        var normalized = trimmedPath[2..].Trim();
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            throw CosmosEmulatorException.BadRequest($"Unsupported property path '{trimmedPath}'.");
-        }
-
-        return normalized;
-    }
-
-    private static bool TryResolvePath(JsonObject document, string path, out JsonNode? value)
-    {
-        JsonNode? current = document;
-        foreach (var segment in path.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            switch (current)
-            {
-                case JsonObject currentObject when currentObject.TryGetPropertyValue(segment, out var propertyValue):
-                    current = propertyValue;
-                    break;
-                case JsonArray currentArray when int.TryParse(segment, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index)
-                                                 && index >= 0
-                                                 && index < currentArray.Count:
-                    current = currentArray[index];
-                    break;
-                default:
-                    value = null;
-                    return false;
-            }
-        }
-
-        value = current;
-        return true;
-    }
-
     private static object? NormalizeRuntimeValue(object? value)
     {
         return value switch
@@ -600,7 +1086,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             short number => (double)number,
             ushort number => (double)number,
             int number => (double)number,
-            uint number => number,
+            uint number => (double)number,
             long number => (double)number,
             ulong number => (double)number,
             float number => (double)number,
@@ -642,6 +1128,29 @@ public sealed class CosmosQueryEngine : IQueryEngine
             JsonValueKind.Object => JsonNode.Parse(element.GetRawText())?.AsObject(),
             JsonValueKind.Array => JsonNode.Parse(element.GetRawText())?.AsArray(),
             _ => element.ToString()
+        };
+    }
+
+    private static JsonNode? ConvertToJsonNode(object? value)
+    {
+        return value switch
+        {
+            null => null,
+            JsonNode node => node.DeepClone(),
+            string stringValue => JsonValue.Create(stringValue),
+            bool boolValue => JsonValue.Create(boolValue),
+            byte byteValue => JsonValue.Create(byteValue),
+            sbyte sbyteValue => JsonValue.Create(sbyteValue),
+            short shortValue => JsonValue.Create(shortValue),
+            ushort ushortValue => JsonValue.Create(ushortValue),
+            int intValue => JsonValue.Create(intValue),
+            uint uintValue => JsonValue.Create(uintValue),
+            long longValue => JsonValue.Create(longValue),
+            ulong ulongValue => JsonValue.Create(ulongValue),
+            float floatValue => JsonValue.Create(floatValue),
+            double doubleValue => JsonValue.Create(doubleValue),
+            decimal decimalValue => JsonValue.Create(decimalValue),
+            _ => JsonSerializer.SerializeToNode(value)
         };
     }
 
@@ -778,15 +1287,37 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
     }
 
-    private static JsonNode? CloneNode(JsonNode? node)
+    private static string GetOutputAlias(ScalarExpression expression, int ordinal)
     {
-        return node?.DeepClone();
+        return expression switch
+        {
+            PathExpression path => GetPathAlias(path.Path),
+            _ => $"${ordinal}"
+        };
     }
 
-    private static string GetPropertyAlias(string path)
+    private static string GetPathAlias(string path)
     {
         var lastDot = path.LastIndexOf('.');
         return lastDot >= 0 ? path[(lastDot + 1)..] : path;
+    }
+
+    private static string ReadLeadingIdentifier(string text, out int consumedLength)
+    {
+        consumedLength = 0;
+        if (string.IsNullOrWhiteSpace(text) || (!char.IsLetter(text[0]) && text[0] != '_'))
+        {
+            return string.Empty;
+        }
+
+        var index = 1;
+        while (index < text.Length && (char.IsLetterOrDigit(text[index]) || text[index] == '_'))
+        {
+            index++;
+        }
+
+        consumedLength = index;
+        return text[..index];
     }
 
     private static int FindTopLevelKeyword(string text, string keyword, int startIndex)
@@ -918,101 +1449,507 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return parts.Where(part => !string.IsNullOrWhiteSpace(part)).ToList();
     }
 
-    private static List<string> SplitTopLevelKeyword(string input, string keyword)
+    private sealed class ExpressionParser
     {
-        var parts = new List<string>();
-        var start = 0;
-        var depth = 0;
-        var inString = false;
+        private readonly List<Token> _tokens;
+        private int _index;
 
-        for (var index = 0; index <= input.Length - keyword.Length; index++)
+        public ExpressionParser(string text)
         {
-            var current = input[index];
-            if (inString)
-            {
-                if (current == '\'')
-                {
-                    if (index + 1 < input.Length && input[index + 1] == '\'')
-                    {
-                        index++;
-                    }
-                    else
-                    {
-                        inString = false;
-                    }
-                }
+            _tokens = Tokenize(text);
+        }
 
-                continue;
+        public BooleanExpression ParseBooleanExpression()
+        {
+            return ParseOr();
+        }
+
+        public ScalarExpression ParseScalarExpression()
+        {
+            return ParseScalarPrimary();
+        }
+
+        public bool MatchKeyword(string keyword)
+        {
+            if (Current.Type == TokenType.Identifier && string.Equals(Current.Text, keyword, StringComparison.OrdinalIgnoreCase))
+            {
+                _index++;
+                return true;
             }
 
-            if (current == '\'')
-            {
-                inString = true;
-                continue;
-            }
+            return false;
+        }
 
-            if (current == '(')
+        public void ExpectEnd(string context)
+        {
+            if (Current.Type != TokenType.End)
             {
-                depth++;
-                continue;
-            }
-
-            if (current == ')')
-            {
-                depth = Math.Max(0, depth - 1);
-                continue;
-            }
-
-            if (depth == 0 && IsKeywordAt(input, index, keyword))
-            {
-                parts.Add(input[start..index].Trim());
-                start = index + keyword.Length;
-                index = start - 1;
+                throw CosmosEmulatorException.BadRequest($"Unsupported {context} clause.");
             }
         }
 
-        parts.Add(input[start..].Trim());
-        return parts.Where(part => !string.IsNullOrWhiteSpace(part)).ToList();
+        private BooleanExpression ParseOr()
+        {
+            var expression = ParseAnd();
+            while (MatchKeyword("OR"))
+            {
+                expression = new BinaryBooleanExpression(expression, BooleanOperator.Or, ParseAnd());
+            }
+
+            return expression;
+        }
+
+        private BooleanExpression ParseAnd()
+        {
+            var expression = ParseNot();
+            while (MatchKeyword("AND"))
+            {
+                expression = new BinaryBooleanExpression(expression, BooleanOperator.And, ParseNot());
+            }
+
+            return expression;
+        }
+
+        private BooleanExpression ParseNot()
+        {
+            if (MatchKeyword("NOT"))
+            {
+                return new NotBooleanExpression(ParseNot());
+            }
+
+            return ParsePredicate();
+        }
+
+        private BooleanExpression ParsePredicate()
+        {
+            if (Current.Type == TokenType.OpenParen)
+            {
+                _index++;
+                var nested = ParseBooleanExpression();
+                Expect(TokenType.CloseParen, ")");
+                return nested;
+            }
+
+            var left = ParseScalarPrimary();
+            if (MatchKeyword("NOT"))
+            {
+                if (!MatchKeyword("IN"))
+                {
+                    throw CosmosEmulatorException.BadRequest("Unsupported WHERE clause expression.");
+                }
+
+                return new InBooleanExpression(left, ParseInList(), true);
+            }
+
+            if (MatchKeyword("IN"))
+            {
+                return new InBooleanExpression(left, ParseInList(), false);
+            }
+
+            if (Current.Type == TokenType.Operator)
+            {
+                var comparison = ParseComparisonOperator();
+                var right = ParseScalarPrimary();
+                return new ComparisonBooleanExpression(left, comparison, right);
+            }
+
+            return new ScalarBooleanExpression(left);
+        }
+
+        private IReadOnlyList<ScalarExpression> ParseInList()
+        {
+            Expect(TokenType.OpenParen, "(");
+            var values = new List<ScalarExpression>();
+            if (Current.Type != TokenType.CloseParen)
+            {
+                do
+                {
+                    values.Add(ParseScalarPrimary());
+                }
+                while (TryConsume(TokenType.Comma));
+            }
+
+            Expect(TokenType.CloseParen, ")");
+            return values;
+        }
+
+        private ScalarExpression ParseScalarPrimary()
+        {
+            return Current.Type switch
+            {
+                TokenType.OpenParen => ParseParenthesizedScalar(),
+                TokenType.Parameter => ConsumeParameter(),
+                TokenType.String => ConsumeString(),
+                TokenType.Number => ConsumeNumber(),
+                TokenType.Asterisk => ConsumeStar(),
+                TokenType.Identifier => ConsumeIdentifierLike(),
+                _ => throw CosmosEmulatorException.BadRequest("Unsupported expression.")
+            };
+        }
+
+        private ScalarExpression ParseParenthesizedScalar()
+        {
+            Expect(TokenType.OpenParen, "(");
+            var expression = ParseScalarPrimary();
+            Expect(TokenType.CloseParen, ")");
+            return expression;
+        }
+
+        private ScalarExpression ConsumeParameter()
+        {
+            var token = Current;
+            _index++;
+            return new ParameterExpression(token.Text);
+        }
+
+        private ScalarExpression ConsumeString()
+        {
+            var token = Current;
+            _index++;
+            return new LiteralExpression(token.Text);
+        }
+
+        private ScalarExpression ConsumeNumber()
+        {
+            var token = Current;
+            _index++;
+            return new LiteralExpression(double.Parse(token.Text, CultureInfo.InvariantCulture));
+        }
+
+        private ScalarExpression ConsumeStar()
+        {
+            _index++;
+            return new StarExpression();
+        }
+
+        private ScalarExpression ConsumeIdentifierLike()
+        {
+            var token = Current;
+            _index++;
+
+            if (string.Equals(token.Text, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                return new LiteralExpression(true);
+            }
+
+            if (string.Equals(token.Text, "false", StringComparison.OrdinalIgnoreCase))
+            {
+                return new LiteralExpression(false);
+            }
+
+            if (string.Equals(token.Text, "null", StringComparison.OrdinalIgnoreCase))
+            {
+                return new LiteralExpression(null);
+            }
+
+            if (TryConsume(TokenType.OpenParen))
+            {
+                var arguments = new List<ScalarExpression>();
+                if (Current.Type != TokenType.CloseParen)
+                {
+                    do
+                    {
+                        arguments.Add(ParseScalarPrimary());
+                    }
+                    while (TryConsume(TokenType.Comma));
+                }
+
+                Expect(TokenType.CloseParen, ")");
+                return new FunctionCallExpression(token.Text, arguments);
+            }
+
+            return new PathExpression(token.Text);
+        }
+
+        private ComparisonOperator ParseComparisonOperator()
+        {
+            var token = Current;
+            _index++;
+            return token.Text switch
+            {
+                "=" => ComparisonOperator.Equal,
+                "!=" => ComparisonOperator.NotEqual,
+                ">" => ComparisonOperator.GreaterThan,
+                "<" => ComparisonOperator.LessThan,
+                ">=" => ComparisonOperator.GreaterThanOrEqual,
+                "<=" => ComparisonOperator.LessThanOrEqual,
+                _ => throw CosmosEmulatorException.BadRequest("Unsupported comparison operator.")
+            };
+        }
+
+        private bool TryConsume(TokenType tokenType)
+        {
+            if (Current.Type == tokenType)
+            {
+                _index++;
+                return true;
+            }
+
+            return false;
+        }
+
+        private void Expect(TokenType tokenType, string tokenText)
+        {
+            if (!TryConsume(tokenType))
+            {
+                throw CosmosEmulatorException.BadRequest($"Expected '{tokenText}'.");
+            }
+        }
+
+        private Token Current => _tokens[_index];
+
+        private static List<Token> Tokenize(string text)
+        {
+            var tokens = new List<Token>();
+            for (var index = 0; index < text.Length;)
+            {
+                var current = text[index];
+                if (char.IsWhiteSpace(current))
+                {
+                    index++;
+                    continue;
+                }
+
+                if (current == '@')
+                {
+                    var start = index++;
+                    while (index < text.Length && (char.IsLetterOrDigit(text[index]) || text[index] == '_'))
+                    {
+                        index++;
+                    }
+
+                    tokens.Add(new Token(TokenType.Parameter, text[start..index]));
+                    continue;
+                }
+
+                if (current == '\'')
+                {
+                    index++;
+                    var builder = new System.Text.StringBuilder();
+                    while (index < text.Length)
+                    {
+                        if (text[index] == '\'')
+                        {
+                            if (index + 1 < text.Length && text[index + 1] == '\'')
+                            {
+                                builder.Append('\'');
+                                index += 2;
+                                continue;
+                            }
+
+                            index++;
+                            break;
+                        }
+
+                        builder.Append(text[index]);
+                        index++;
+                    }
+
+                    tokens.Add(new Token(TokenType.String, builder.ToString()));
+                    continue;
+                }
+
+                if (current == '-' && index + 1 < text.Length && char.IsDigit(text[index + 1])
+                    || char.IsDigit(current))
+                {
+                    var start = index++;
+                    while (index < text.Length && (char.IsDigit(text[index]) || text[index] == '.'))
+                    {
+                        index++;
+                    }
+
+                    tokens.Add(new Token(TokenType.Number, text[start..index]));
+                    continue;
+                }
+
+                if (char.IsLetter(current) || current == '_')
+                {
+                    var start = index++;
+                    while (index < text.Length && (char.IsLetterOrDigit(text[index]) || text[index] is '_' or '.'))
+                    {
+                        index++;
+                    }
+
+                    tokens.Add(new Token(TokenType.Identifier, text[start..index]));
+                    continue;
+                }
+
+                switch (current)
+                {
+                    case '(':
+                        tokens.Add(new Token(TokenType.OpenParen, "("));
+                        index++;
+                        break;
+                    case ')':
+                        tokens.Add(new Token(TokenType.CloseParen, ")"));
+                        index++;
+                        break;
+                    case ',':
+                        tokens.Add(new Token(TokenType.Comma, ","));
+                        index++;
+                        break;
+                    case '*':
+                        tokens.Add(new Token(TokenType.Asterisk, "*"));
+                        index++;
+                        break;
+                    case '!' when index + 1 < text.Length && text[index + 1] == '=':
+                        tokens.Add(new Token(TokenType.Operator, "!="));
+                        index += 2;
+                        break;
+                    case '>' when index + 1 < text.Length && text[index + 1] == '=':
+                        tokens.Add(new Token(TokenType.Operator, ">="));
+                        index += 2;
+                        break;
+                    case '<' when index + 1 < text.Length && text[index + 1] == '=':
+                        tokens.Add(new Token(TokenType.Operator, "<="));
+                        index += 2;
+                        break;
+                    case '>' or '<' or '=':
+                        tokens.Add(new Token(TokenType.Operator, current.ToString()));
+                        index++;
+                        break;
+                    default:
+                        throw CosmosEmulatorException.BadRequest($"Unsupported character '{current}' in expression.");
+                }
+            }
+
+            tokens.Add(new Token(TokenType.End, string.Empty));
+            return tokens;
+        }
     }
 
-    private sealed record DocumentContext(CosmosDocument Document, JsonObject ResponseBody);
+    private sealed class QueryRow
+    {
+        public QueryRow(CosmosDocument? document, Dictionary<string, object?> aliases)
+        {
+            Document = document;
+            Aliases = aliases;
+        }
+
+        public CosmosDocument? Document { get; }
+
+        public Dictionary<string, object?> Aliases { get; }
+
+        public QueryRow WithAlias(string alias, object? value)
+        {
+            var aliases = new Dictionary<string, object?>(Aliases, StringComparer.OrdinalIgnoreCase)
+            {
+                [alias] = value
+            };
+
+            return new QueryRow(Document, aliases);
+        }
+    }
+
+    private sealed class QueryGroup
+    {
+        public QueryGroup(IReadOnlyList<object?> keyValues, IReadOnlyList<QueryRow> rows)
+        {
+            KeyValues = keyValues;
+            Rows = rows.ToList();
+        }
+
+        public IReadOnlyList<object?> KeyValues { get; }
+
+        public List<QueryRow> Rows { get; }
+    }
 
     private sealed record QueryPlan(
+        string FromAlias,
+        IReadOnlyList<JoinClause> Joins,
         Projection Projection,
-        IReadOnlyList<FilterClause> Filters,
+        BooleanExpression? Where,
+        IReadOnlyList<ScalarExpression> GroupBy,
         OrderByClause? OrderBy,
         int? Top,
         int? Offset,
         int? Limit)
     {
-        public ProjectionType ProjectionType => Projection.Type;
+        public bool RequiresAggregation => GroupBy.Count > 0 || Projection.ContainsAggregate;
     }
 
-    private sealed record Projection(ProjectionType Type, string? ValuePath, IReadOnlyList<string> Fields);
+    private sealed record JoinClause(string Alias, ScalarExpression SourceExpression);
 
-    private enum ProjectionType
+    private sealed record Projection(ProjectionMode Mode, IReadOnlyList<SelectItem> Items)
+    {
+        public bool ContainsAggregate => Items.Any(item => ContainsAggregateFunction(item.Expression));
+    }
+
+    private static bool ContainsAggregateFunction(ScalarExpression expression)
+    {
+        return expression switch
+        {
+            FunctionCallExpression function => IsAggregateFunction(function.Name) || function.Arguments.Any(ContainsAggregateFunction),
+            _ => false
+        };
+    }
+
+    private sealed record SelectItem(ScalarExpression Expression, string OutputName);
+
+    private sealed record OrderByClause(ScalarExpression Expression, bool Descending);
+
+    private enum ProjectionMode
     {
         All,
         Fields,
-        Value,
-        Count
+        Value
     }
 
-    private abstract record FilterClause(string Path);
+    private abstract record BooleanExpression;
 
-    private sealed record ComparisonFilter(string Path, string Operator, ValueExpression Value) : FilterClause(Path);
+    private sealed record BinaryBooleanExpression(BooleanExpression Left, BooleanOperator Operator, BooleanExpression Right) : BooleanExpression;
 
-    private sealed record InFilter(string Path, IReadOnlyList<ValueExpression> Values) : FilterClause(Path);
+    private sealed record NotBooleanExpression(BooleanExpression Expression) : BooleanExpression;
 
-    private sealed record ContainsFilter(string Path, ValueExpression Value) : FilterClause(Path);
+    private sealed record ComparisonBooleanExpression(ScalarExpression Left, ComparisonOperator Operator, ScalarExpression Right) : BooleanExpression;
 
-    private sealed record ArrayContainsFilter(string Path, ValueExpression Value) : FilterClause(Path);
+    private sealed record InBooleanExpression(ScalarExpression Left, IReadOnlyList<ScalarExpression> Values, bool Negated) : BooleanExpression;
 
-    private sealed record IsDefinedFilter(string Path) : FilterClause(Path);
+    private sealed record ScalarBooleanExpression(ScalarExpression Expression) : BooleanExpression;
 
-    private sealed record OrderByClause(string Path, bool Descending);
+    private enum BooleanOperator
+    {
+        And,
+        Or
+    }
 
-    private sealed record ValueExpression(bool IsParameter, string? ParameterName, object? Value);
+    private enum ComparisonOperator
+    {
+        Equal,
+        NotEqual,
+        GreaterThan,
+        LessThan,
+        GreaterThanOrEqual,
+        LessThanOrEqual
+    }
+
+    private abstract record ScalarExpression;
+
+    private sealed record LiteralExpression(object? Value) : ScalarExpression;
+
+    private sealed record ParameterExpression(string Name) : ScalarExpression;
+
+    private sealed record PathExpression(string Path) : ScalarExpression;
+
+    private sealed record FunctionCallExpression(string Name, IReadOnlyList<ScalarExpression> Arguments) : ScalarExpression;
+
+    private sealed record StarExpression : ScalarExpression;
+
+    private enum TokenType
+    {
+        End,
+        Identifier,
+        Parameter,
+        String,
+        Number,
+        OpenParen,
+        CloseParen,
+        Comma,
+        Operator,
+        Asterisk
+    }
+
+    private sealed record Token(TokenType Type, string Text);
 
     private sealed class QueryValueComparer : IComparer<object?>
     {

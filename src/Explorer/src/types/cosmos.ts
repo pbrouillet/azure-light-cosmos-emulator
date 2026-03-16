@@ -12,6 +12,7 @@ export interface CosmosDatabase {
   _ts: number
   _colls: string
   _users: string
+  maxThroughput?: number | null
 }
 
 export interface CosmosContainer {
@@ -23,6 +24,7 @@ export interface CosmosContainer {
   partitionKey: PartitionKeyDefinition
   indexingPolicy?: unknown
   defaultTtl?: number | null
+  maxThroughput?: number | null
 }
 
 export interface CosmosDocument {
@@ -77,6 +79,27 @@ export interface FeedResponse<T> {
 export interface CosmosQueryParameter {
   name: string
   value: unknown
+}
+
+export interface QueryExplainResult {
+  query: string
+  queryPlan: Record<string, unknown>
+  estimatedRuCharge: {
+    base: number
+    filterCost: number
+    joinCost: number
+    aggregateCost: number
+    orderByCost: number
+    crossPartitionMultiplier: number
+    total: number
+  }
+  indexAnalysis: {
+    usedIndexes: string[]
+    recommendations: string[]
+    indexingPolicyPaths: { included: string[]; excluded: string[] }
+  }
+  warnings: string[]
+  educationalNotes: string[]
 }
 
 export interface EmulatorInfo {

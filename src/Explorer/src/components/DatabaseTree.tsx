@@ -18,6 +18,7 @@ import {
   MessageBarBody,
   MessageBarTitle,
   Spinner,
+  Switch,
   Text,
   tokens,
   Tree,
@@ -33,6 +34,7 @@ import {
   FlashRegular,
   MathFormulaRegular,
   MoreHorizontalRegular,
+  SettingsRegular,
   TableRegular,
 } from '@fluentui/react-icons'
 import { cosmosClient } from '../api/cosmosClient'
@@ -209,6 +211,13 @@ interface TreeActionCallbacks {
   onCreateContainer: (dbId: string) => void
   onCreateDocument: (dbId: string, collId: string, partitionKeyPaths: string[]) => void
   onDelete: (type: 'database' | 'container', dbId: string, collId?: string) => void
+  onThroughputSettings: (type: 'database' | 'container', dbId: string, collId?: string) => void
+}
+
+interface ThroughputTarget {
+  type: 'database' | 'container'
+  dbId: string
+  collId?: string
 }
 
 export function DatabaseTree() {
@@ -228,6 +237,9 @@ export function DatabaseTree() {
   const [documentFieldValues, setDocumentFieldValues] = useState<Record<string, string>>({})
   const [documentDialogError, setDocumentDialogError] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
+  const [throughputTarget, setThroughputTarget] = useState<ThroughputTarget | null>(null)
+  const [throughputValue, setThroughputValue] = useState('')
+  const [throughputEnabled, setThroughputEnabled] = useState(false)
 
   const documentPartitionKeyProperties = useMemo(
     () => (createDocumentTarget ? getPartitionKeyProperties(createDocumentTarget.partitionKeyPaths) : []),
@@ -304,6 +316,33 @@ export function DatabaseTree() {
     },
   })
 
+  const throughputQuery = useQuery({
+    queryKey: ['throughput', throughputTarget?.type, throughputTarget?.dbId, throughputTarget?.collId],
+    queryFn: async () => {
+      if (!throughputTarget) return null
+      if (throughputTarget.type === 'database') {
+        return cosmosClient.getDatabaseThroughput(throughputTarget.dbId)
+      }
+      return cosmosClient.getContainerThroughput(throughputTarget.dbId, throughputTarget.collId!)
+    },
+    enabled: throughputTarget !== null,
+  })
+
+  const saveThroughputMutation = useMutation({
+    mutationFn: async () => {
+      if (!throughputTarget) return
+      const value = throughputEnabled ? (parseInt(throughputValue, 10) || null) : null
+      if (throughputTarget.type === 'database') {
+        return cosmosClient.updateDatabaseThroughput(throughputTarget.dbId, value)
+      }
+      return cosmosClient.updateContainerThroughput(throughputTarget.dbId, throughputTarget.collId!, value)
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['throughput'] })
+      setThroughputTarget(null)
+    },
+  })
+
   const callbacks: TreeActionCallbacks = {
     onContextMenu: (type, dbId, collId, x, y, partitionKeyPaths) =>
       setContextMenu({ type, dbId, collId, partitionKeyPaths, x, y }),
@@ -318,6 +357,12 @@ export function DatabaseTree() {
     onDelete: (type, dbId, collId) => {
       setContextMenu(null)
       openDeleteDialog({ type, dbId, collId })
+    },
+    onThroughputSettings: (type, dbId, collId) => {
+      setContextMenu(null)
+      setThroughputValue('')
+      setThroughputEnabled(false)
+      setThroughputTarget({ type, dbId, collId })
     },
   }
 
@@ -433,6 +478,7 @@ export function DatabaseTree() {
         </div>
 
         <Dialog
+          modalType="non-modal"
           open={isCreateDatabaseOpen}
           onOpenChange={(_, data) => {
             setIsCreateDatabaseOpen(data.open)
@@ -446,7 +492,7 @@ export function DatabaseTree() {
               DB
             </Button>
           </DialogTrigger>
-          <DialogSurface>
+          <DialogSurface backdrop={{ onClick: () => setIsCreateDatabaseOpen(false) }}>
             <DialogBody>
               <DialogTitle>Create database</DialogTitle>
               <DialogContent>
@@ -523,6 +569,9 @@ export function DatabaseTree() {
                 <button className={styles.contextMenuItem} onClick={() => callbacks.onCreateContainer(contextMenu.dbId)}>
                   <AddRegular /> New Container
                 </button>
+                <button className={styles.contextMenuItem} onClick={() => callbacks.onThroughputSettings('database', contextMenu.dbId)}>
+                  <SettingsRegular /> Throughput Settings
+                </button>
                 <button className={styles.contextMenuItem} onClick={() => callbacks.onDelete('database', contextMenu.dbId)}>
                   <DeleteRegular /> Delete Database
                 </button>
@@ -542,6 +591,9 @@ export function DatabaseTree() {
                 >
                   <AddRegular /> New Document
                 </button>
+                <button className={styles.contextMenuItem} onClick={() => callbacks.onThroughputSettings('container', contextMenu.dbId, contextMenu.collId)}>
+                  <SettingsRegular /> Throughput Settings
+                </button>
                 <button className={styles.contextMenuItem} onClick={() => callbacks.onDelete('container', contextMenu.dbId, contextMenu.collId)}>
                   <DeleteRegular /> Delete Container
                 </button>
@@ -553,6 +605,7 @@ export function DatabaseTree() {
 
       {createContainerTarget && (
         <Dialog
+          modalType="non-modal"
           open
           onOpenChange={(_, data) => {
             if (!data.open) {
@@ -560,7 +613,7 @@ export function DatabaseTree() {
             }
           }}
         >
-          <DialogSurface>
+          <DialogSurface backdrop={{ onClick: closeCreateContainerDialog }}>
             <DialogBody>
               <DialogTitle>Create container</DialogTitle>
               <DialogContent>
@@ -606,6 +659,7 @@ export function DatabaseTree() {
 
       {createDocumentTarget && (
         <Dialog
+          modalType="non-modal"
           open
           onOpenChange={(_, data) => {
             if (!data.open) {
@@ -613,7 +667,7 @@ export function DatabaseTree() {
             }
           }}
         >
-          <DialogSurface>
+          <DialogSurface backdrop={{ onClick: closeCreateDocumentDialog }}>
             <DialogBody>
               <DialogTitle>Create document</DialogTitle>
               <DialogContent>
@@ -703,6 +757,30 @@ export function DatabaseTree() {
           }}
           open
           title={deleteTarget.type === 'database' ? 'Delete database' : 'Delete container'}
+        />
+      )}
+
+      {throughputTarget && (
+        <ThroughputDialog
+          isLoading={throughputQuery.isPending}
+          currentMaxThroughput={throughputQuery.data?.maxThroughput ?? null}
+          isSaving={saveThroughputMutation.isPending}
+          error={saveThroughputMutation.error ?? throughputQuery.error}
+          target={throughputTarget}
+          throughputEnabled={throughputEnabled}
+          throughputValue={throughputValue}
+          onThroughputEnabledChange={setThroughputEnabled}
+          onThroughputValueChange={setThroughputValue}
+          onSave={() => saveThroughputMutation.mutate()}
+          onClose={() => {
+            saveThroughputMutation.reset()
+            setThroughputTarget(null)
+          }}
+          onLoaded={(maxThroughput) => {
+            const hasValue = maxThroughput !== null && maxThroughput !== undefined && maxThroughput > 0
+            setThroughputEnabled(hasValue)
+            setThroughputValue(hasValue ? String(maxThroughput) : '400')
+          }}
         />
       )}
     </aside>
@@ -936,8 +1014,8 @@ function ConfirmDialog({
   title: string
 }) {
   return (
-    <Dialog open={open} onOpenChange={(_, data) => onOpenChange(data.open)}>
-      <DialogSurface>
+    <Dialog modalType="non-modal" open={open} onOpenChange={(_, data) => onOpenChange(data.open)}>
+      <DialogSurface backdrop={{ onClick: () => onOpenChange(false) }}>
         <DialogBody>
           <DialogTitle>{title}</DialogTitle>
           <DialogContent>
@@ -1050,4 +1128,114 @@ function getPartitionKeyValue(document: CosmosDocument, partitionKeyPaths: strin
 
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Unexpected error'
+}
+
+function ThroughputDialog({
+  isLoading,
+  currentMaxThroughput,
+  isSaving,
+  error,
+  target,
+  throughputEnabled,
+  throughputValue,
+  onThroughputEnabledChange,
+  onThroughputValueChange,
+  onSave,
+  onClose,
+  onLoaded,
+}: {
+  isLoading: boolean
+  currentMaxThroughput: number | null | undefined
+  isSaving: boolean
+  error: unknown
+  target: ThroughputTarget
+  throughputEnabled: boolean
+  throughputValue: string
+  onThroughputEnabledChange: (enabled: boolean) => void
+  onThroughputValueChange: (value: string) => void
+  onSave: () => void
+  onClose: () => void
+  onLoaded: (maxThroughput: number | null | undefined) => void
+}) {
+  const styles = useStyles()
+  const label = target.type === 'database'
+    ? `Database: ${target.dbId}`
+    : `Container: ${target.dbId}/${target.collId}`
+
+  // Sync loaded value into the form once it arrives
+  const [initialized, setInitialized] = useState(false)
+  if (!isLoading && !initialized) {
+    setInitialized(true)
+    onLoaded(currentMaxThroughput)
+  }
+
+  return (
+    <Dialog
+      modalType="non-modal"
+      open
+      onOpenChange={(_, data) => {
+        if (!data.open) onClose()
+      }}
+    >
+      <DialogSurface backdrop={{ onClick: onClose }}>
+        <DialogBody>
+          <DialogTitle>Throughput Settings</DialogTitle>
+          <DialogContent>
+            <div className={styles.dialogFields}>
+              <Text block size={200} style={{ color: tokens.colorNeutralForeground3 }}>
+                {label}
+              </Text>
+              {isLoading ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: tokens.spacingHorizontalS }}>
+                  <Spinner size="tiny" />
+                  <Text size={200}>Loading current settings…</Text>
+                </div>
+              ) : (
+                <>
+                  <Field label="Enable RU/s cap">
+                    <Switch
+                      checked={throughputEnabled}
+                      label={throughputEnabled ? 'RU/s cap enabled' : 'No cap (unlimited)'}
+                      onChange={(_, data) => onThroughputEnabledChange(data.checked)}
+                    />
+                  </Field>
+                  {throughputEnabled && (
+                    <Field
+                      label="Max throughput (RU/s)"
+                      hint="Maximum request units per second. Requests exceeding this rate will receive HTTP 429."
+                    >
+                      <Input
+                        type="number"
+                        min={1}
+                        value={throughputValue}
+                        onChange={(_, data) => onThroughputValueChange(data.value)}
+                        placeholder="400"
+                      />
+                    </Field>
+                  )}
+                </>
+              )}
+              {error ? (
+                <StatusMessage intent="error" title="Error">
+                  {toErrorMessage(error)}
+                </StatusMessage>
+              ) : null}
+            </div>
+          </DialogContent>
+          <DialogActions>
+            <Button appearance="secondary" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              appearance="primary"
+              disabled={isLoading || isSaving}
+              onClick={onSave}
+            >
+              {isSaving ? 'Saving…' : 'Save'}
+            </Button>
+          </DialogActions>
+        </DialogBody>
+      </DialogSurface>
+    </Dialog>
+  )
 }

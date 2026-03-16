@@ -20,6 +20,9 @@ public class CosmosDatabase
     /// <summary>Last modified timestamp (Unix epoch seconds).</summary>
     public long Timestamp { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
+    /// <summary>Provisioned throughput in request units per second (null = unlimited).</summary>
+    public int? MaxThroughput { get; set; }
+
     /// <summary>Collections link.</summary>
     public string Colls => $"colls/";
 

@@ -191,10 +191,12 @@ public static class Program
         var app = HostProgram.BuildApplication(Array.Empty<string>(), BuildConfigurationOverrides(options));
         app.Lifetime.ApplicationStopped.Register(() => CleanupStateFiles(state));
 
-        using var registration = cancellationToken.Register(() => _ = app.StopAsync());
-
         try
         {
+            // Do not pass cancellationToken to RunAsync. The host handles Ctrl+C / SIGTERM
+            // via ConsoleLifetime. Passing System.CommandLine's token creates linked
+            // CancellationTokenSources inside BackgroundService.StartAsync that race with
+            // the host's own shutdown path, causing ObjectDisposedException on exit.
             await app.RunAsync();
             return 0;
         }

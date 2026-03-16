@@ -19,7 +19,12 @@ import {
 import { PlayRegular } from '@fluentui/react-icons'
 import { cosmosClient } from '../api/cosmosClient'
 import { useTheme } from '../theme'
-import type { CosmosDocument, CosmosQueryParameter, FeedResponse } from '../types/cosmos'
+import type {
+  CosmosDocument,
+  CosmosQueryParameter,
+  FeedResponse,
+  QueryExplainResult,
+} from '../types/cosmos'
 
 interface QueryEditorProps {
   dbId: string
@@ -77,6 +82,12 @@ const useStyles = makeStyles({
     display: 'flex',
     flexWrap: 'wrap',
     gap: tokens.spacingHorizontalS,
+  },
+  actionRow: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: tokens.spacingHorizontalS,
+    justifyContent: 'flex-end',
   },
   editorFrame: {
     borderRadius: tokens.borderRadiusMedium,
@@ -145,6 +156,56 @@ const useStyles = makeStyles({
     borderRadius: tokens.borderRadiusMedium,
     backgroundColor: tokens.colorNeutralBackground2,
   },
+  explainGrid: {
+    display: 'grid',
+    gap: tokens.spacingVerticalM,
+    '@media (min-width: 960px)': {
+      gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+    },
+  },
+  sectionCard: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: tokens.spacingVerticalS,
+    paddingBottom: tokens.spacingVerticalM,
+    paddingLeft: tokens.spacingHorizontalM,
+    paddingRight: tokens.spacingHorizontalM,
+    paddingTop: tokens.spacingVerticalM,
+  },
+  monoBlock: {
+    margin: 0,
+    paddingBottom: tokens.spacingVerticalM,
+    paddingLeft: tokens.spacingHorizontalM,
+    paddingRight: tokens.spacingHorizontalM,
+    paddingTop: tokens.spacingVerticalM,
+    borderRadius: tokens.borderRadiusMedium,
+    backgroundColor: tokens.colorNeutralBackground2,
+    border: `${tokens.strokeWidthThin} solid ${tokens.colorNeutralStroke2}`,
+    fontFamily: tokens.fontFamilyMonospace,
+    fontSize: tokens.fontSizeBase200,
+    lineHeight: tokens.lineHeightBase300,
+    overflowX: 'auto',
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+  },
+  list: {
+    margin: 0,
+    paddingLeft: '1.25rem',
+    display: 'grid',
+    gap: tokens.spacingVerticalXS,
+  },
+  infoPanel: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: tokens.spacingVerticalS,
+    paddingBottom: tokens.spacingVerticalM,
+    paddingLeft: tokens.spacingHorizontalM,
+    paddingRight: tokens.spacingHorizontalM,
+    paddingTop: tokens.spacingVerticalM,
+    borderRadius: tokens.borderRadiusMedium,
+    backgroundColor: tokens.colorBrandBackground2,
+    border: `${tokens.strokeWidthThin} solid ${tokens.colorBrandStroke1}`,
+  },
 })
 
 export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
@@ -152,6 +213,7 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
   const { isDark } = useTheme()
   const [query, setQuery] = useState('SELECT * FROM c')
   const [parametersJson, setParametersJson] = useState('[]')
+  const [isExplainOpen, setIsExplainOpen] = useState(false)
 
   const queryMutation = useMutation<FeedResponse<CosmosDocument>, Error>({
     mutationFn: async () => {
@@ -160,9 +222,18 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
     },
   })
 
+  const explainMutation = useMutation<QueryExplainResult, Error>({
+    mutationFn: async () => cosmosClient.explainQuery(dbId, collId, query),
+  })
+
   const executeQuery = useCallback(() => {
     queryMutation.mutate()
   }, [queryMutation])
+
+  const explainQuery = useCallback(() => {
+    setIsExplainOpen(true)
+    explainMutation.mutate()
+  }, [explainMutation])
 
   useImperativeHandle(
     executeRef,
@@ -177,6 +248,30 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
     return Array.from(new Set(items.flatMap((item) => Object.keys(item))))
   }, [queryMutation.data])
 
+  const explainPlanJson = useMemo(
+    () => (explainMutation.data ? JSON.stringify(explainMutation.data.queryPlan, null, 2) : ''),
+    [explainMutation.data],
+  )
+
+  const ruRows = useMemo(
+    () =>
+      explainMutation.data
+        ? [
+            ['Base', explainMutation.data.estimatedRuCharge.base],
+            ['Filter cost', explainMutation.data.estimatedRuCharge.filterCost],
+            ['Join cost', explainMutation.data.estimatedRuCharge.joinCost],
+            ['Aggregate cost', explainMutation.data.estimatedRuCharge.aggregateCost],
+            ['Order by cost', explainMutation.data.estimatedRuCharge.orderByCost],
+            ['Cross-partition multiplier', explainMutation.data.estimatedRuCharge.crossPartitionMultiplier],
+            ['Total', explainMutation.data.estimatedRuCharge.total],
+          ]
+        : [],
+    [explainMutation.data],
+  )
+
+  const hasExplainPanel =
+    isExplainOpen || explainMutation.isPending || explainMutation.isError || explainMutation.isSuccess
+
   return (
     <section className={styles.root}>
       <div className={styles.grid}>
@@ -189,9 +284,14 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
                   Run SQL queries against the selected container and inspect the returned items.
                 </Body1>
               </div>
-              <Button appearance="primary" icon={<PlayRegular />} onClick={executeQuery}>
-                {queryMutation.isPending ? 'Executing…' : 'Execute query'}
-              </Button>
+              <div className={styles.actionRow}>
+                <Button appearance="secondary" onClick={explainQuery}>
+                  {explainMutation.isPending ? 'Explaining…' : 'Explain'}
+                </Button>
+                <Button appearance="primary" icon={<PlayRegular />} onClick={executeQuery}>
+                  {queryMutation.isPending ? 'Executing…' : 'Execute query'}
+                </Button>
+              </div>
             </div>
             <div className={styles.editorFrame}>
               <Editor
@@ -210,6 +310,148 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
               />
             </div>
           </Card>
+
+          {hasExplainPanel && (
+            <Card className={styles.card}>
+              <div className={styles.cardHeader}>
+                <div>
+                  <Subtitle2>Educational explain</Subtitle2>
+                  <Body1 className={styles.subtleText}>
+                    Inspect the estimated RU breakdown, likely index usage, and query plan without executing the statement.
+                  </Body1>
+                </div>
+                <div className={styles.actionRow}>
+                  {explainMutation.data && <Badge>Total RU: {formatNumber(explainMutation.data.estimatedRuCharge.total)}</Badge>}
+                  <Button appearance="secondary" onClick={() => setIsExplainOpen((open) => !open)}>
+                    {isExplainOpen ? 'Collapse' : 'Expand'}
+                  </Button>
+                </div>
+              </div>
+
+              {isExplainOpen && explainMutation.isError && (
+                <MessageBar intent="error" layout="multiline">
+                  <MessageBarBody>
+                    <MessageBarTitle>Explain failed</MessageBarTitle>
+                    {explainMutation.error.message}
+                  </MessageBarBody>
+                </MessageBar>
+              )}
+
+              {isExplainOpen && explainMutation.isPending && (
+                <Body1 className={styles.subtleText}>Analyzing query structure and index hints…</Body1>
+              )}
+
+              {isExplainOpen && explainMutation.data && (
+                <>
+                  <div className={styles.explainGrid}>
+                    <Card className={styles.sectionCard}>
+                      <Subtitle2>Query plan</Subtitle2>
+                      <Text size={200} className={styles.subtleText}>
+                        Structured view of the parsed query shape.
+                      </Text>
+                      <pre className={styles.monoBlock}>{explainPlanJson}</pre>
+                    </Card>
+
+                    <Card className={styles.sectionCard}>
+                      <Subtitle2>Estimated RU breakdown</Subtitle2>
+                      <table className={styles.table}>
+                        <thead>
+                          <tr>
+                            <th className={styles.headCell}>
+                              <Text as="span" size={200} weight="semibold">
+                                Metric
+                              </Text>
+                            </th>
+                            <th className={styles.headCell}>
+                              <Text as="span" size={200} weight="semibold">
+                                Value
+                              </Text>
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {ruRows.map(([label, value]) => (
+                            <tr key={label}>
+                              <td className={styles.bodyCell}>{label}</td>
+                              <td className={styles.bodyCell}>{formatNumber(value)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </Card>
+                  </div>
+
+                  <div className={styles.explainGrid}>
+                    <Card className={styles.sectionCard}>
+                      <div className={styles.cardHeader}>
+                        <div>
+                          <Subtitle2>Index recommendations</Subtitle2>
+                          <Text size={200} className={styles.subtleText}>
+                            Suggested paths and patterns that would usually improve query efficiency.
+                          </Text>
+                        </div>
+                        <div className={styles.statusRow}>
+                          {explainMutation.data.indexAnalysis.usedIndexes.length > 0 ? (
+                            explainMutation.data.indexAnalysis.usedIndexes.map((indexPath) => (
+                              <Badge key={indexPath}>{indexPath}</Badge>
+                            ))
+                          ) : (
+                            <Badge>No definite index usage detected</Badge>
+                          )}
+                        </div>
+                      </div>
+                      <ul className={styles.list}>
+                        {explainMutation.data.indexAnalysis.recommendations.map((recommendation) => (
+                          <li key={recommendation}>
+                            <Text>{recommendation}</Text>
+                          </li>
+                        ))}
+                      </ul>
+                    </Card>
+
+                    <Card className={styles.sectionCard}>
+                      <Subtitle2>Indexing policy paths</Subtitle2>
+                      <Text size={200} className={styles.subtleText}>
+                        Current included and excluded paths from the selected container.
+                      </Text>
+                      <Text weight="semibold">Included</Text>
+                      <div className={styles.statusRow}>
+                        {explainMutation.data.indexAnalysis.indexingPolicyPaths.included.map((path) => (
+                          <Badge key={`included-${path}`}>{path}</Badge>
+                        ))}
+                      </div>
+                      <Text weight="semibold">Excluded</Text>
+                      <div className={styles.statusRow}>
+                        {explainMutation.data.indexAnalysis.indexingPolicyPaths.excluded.map((path) => (
+                          <Badge key={`excluded-${path}`}>{path}</Badge>
+                        ))}
+                      </div>
+                    </Card>
+                  </div>
+
+                  {explainMutation.data.warnings.map((warning) => (
+                    <MessageBar intent="warning" key={warning} layout="multiline">
+                      <MessageBarBody>
+                        <MessageBarTitle>Warning</MessageBarTitle>
+                        {warning}
+                      </MessageBarBody>
+                    </MessageBar>
+                  ))}
+
+                  <Card className={styles.infoPanel}>
+                    <Subtitle2>Educational notes</Subtitle2>
+                    <ul className={styles.list}>
+                      {explainMutation.data.educationalNotes.map((note) => (
+                        <li key={note}>
+                          <Text>{note}</Text>
+                        </li>
+                      ))}
+                    </ul>
+                  </Card>
+                </>
+              )}
+            </Card>
+          )}
 
           <Card className={styles.card}>
             <div className={styles.cardHeader}>
@@ -291,9 +533,14 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
             value={parametersJson}
           />
 
-          <Button appearance="primary" icon={<PlayRegular />} onClick={executeQuery}>
-            {queryMutation.isPending ? 'Executing…' : 'Execute query'}
-          </Button>
+          <div className={styles.actionRow}>
+            <Button appearance="secondary" onClick={explainQuery}>
+              {explainMutation.isPending ? 'Explaining…' : 'Explain'}
+            </Button>
+            <Button appearance="primary" icon={<PlayRegular />} onClick={executeQuery}>
+              {queryMutation.isPending ? 'Executing…' : 'Execute query'}
+            </Button>
+          </div>
 
           <div className={styles.metricList}>
             <MetricCard label="Database" value={dbId} />
@@ -342,6 +589,14 @@ function parseParameters(value: string): CosmosQueryParameter[] {
       value: candidate.value,
     }
   })
+}
+
+function formatNumber(value: number | string): string {
+  if (typeof value === 'string') {
+    return value
+  }
+
+  return Number.isInteger(value) ? value.toString() : value.toFixed(1)
 }
 
 function formatCellValue(value: unknown): string {

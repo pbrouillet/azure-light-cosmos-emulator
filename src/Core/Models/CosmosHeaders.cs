@@ -31,7 +31,7 @@ public static class CosmosHeaders
     public const string RetryAfterMs = "x-ms-retry-after-ms";
     public const string SchemaVersion = "x-ms-schemaversion";
     public const string ServiceVersion = "x-ms-serviceversion";
-    public const string GlobalCommittedLsn = "x-ms-global-Committed-lsn";
+    public const string GlobalCommittedLsn = "x-ms-global-committed-lsn";
     public const string NumberOfReadRegions = "x-ms-number-of-read-regions";
     public const string TransportRequestId = "x-ms-transport-request-id";
     public const string CosmosLlsn = "x-ms-cosmos-llsn";

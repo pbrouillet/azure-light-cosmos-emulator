@@ -6,6 +6,7 @@ import type {
   CosmosQueryParameter,
   CosmosTrigger,
   EmulatorInfo,
+  QueryExplainResult,
   EmulatorStats,
   FeedResponse,
   StoredProcedure,
@@ -220,6 +221,14 @@ export class CosmosClient {
     return this.toFeed<CosmosDocument>(body, 'Documents', headers)
   }
 
+  async explainQuery(dbId: string, collId: string, query: string): Promise<QueryExplainResult> {
+    const { body } = await this.request<QueryExplainResult>('/api/emulator/explain', {
+      method: 'POST',
+      body: JSON.stringify({ databaseId: dbId, containerId: collId, query }),
+    })
+    return body
+  }
+
   async listStoredProcedures(
     dbId: string,
     collId: string,
@@ -391,6 +400,52 @@ export class CosmosClient {
       `/dbs/${encodeURIComponent(dbId)}/colls/${encodeURIComponent(collId)}/udfs/${encodeURIComponent(udfId)}`,
       { method: 'DELETE' },
     )
+  }
+
+  async getDatabaseThroughput(dbId: string): Promise<{ id: string; maxThroughput: number | null }> {
+    const { body } = await this.request<{ id: string; maxThroughput: number | null }>(
+      `/api/emulator/throughput/database/${encodeURIComponent(dbId)}`,
+    )
+    return body
+  }
+
+  async updateDatabaseThroughput(
+    dbId: string,
+    maxThroughput: number | null,
+  ): Promise<{ id: string; maxThroughput: number | null }> {
+    const { body } = await this.request<{ id: string; maxThroughput: number | null }>(
+      `/api/emulator/throughput/database/${encodeURIComponent(dbId)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ maxThroughput }),
+      },
+    )
+    return body
+  }
+
+  async getContainerThroughput(
+    dbId: string,
+    collId: string,
+  ): Promise<{ id: string; databaseId: string; maxThroughput: number }> {
+    const { body } = await this.request<{ id: string; databaseId: string; maxThroughput: number }>(
+      `/api/emulator/throughput/container/${encodeURIComponent(dbId)}/${encodeURIComponent(collId)}`,
+    )
+    return body
+  }
+
+  async updateContainerThroughput(
+    dbId: string,
+    collId: string,
+    maxThroughput: number | null,
+  ): Promise<{ id: string; databaseId: string; maxThroughput: number }> {
+    const { body } = await this.request<{ id: string; databaseId: string; maxThroughput: number }>(
+      `/api/emulator/throughput/container/${encodeURIComponent(dbId)}/${encodeURIComponent(collId)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ maxThroughput }),
+      },
+    )
+    return body
   }
 
   private async request<T = undefined>(

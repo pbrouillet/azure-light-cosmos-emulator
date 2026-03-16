@@ -426,3 +426,7 @@ dist/
 .env.local
 appsettings.Development.json
 coverage/
+src/Host/wwwroot/
+test_epsilon.cs
+test_orderby_aggregate.csx
+.vite/deps/**

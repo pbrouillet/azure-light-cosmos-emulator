@@ -375,7 +375,7 @@ export function ProgrammabilityEditor({
 
         <div className={styles.actions}>
           {isStoredProcedure && (
-            <Dialog open={executeDialogOpen} onOpenChange={(_, data) => setExecuteDialogOpen(data.open)}>
+            <Dialog modalType="non-modal" open={executeDialogOpen} onOpenChange={(_, data) => setExecuteDialogOpen(data.open)}>
               <DialogTrigger>
                 <Button
                   appearance="secondary"
@@ -385,7 +385,7 @@ export function ProgrammabilityEditor({
                   Execute
                 </Button>
               </DialogTrigger>
-              <DialogSurface>
+              <DialogSurface backdrop={{ onClick: () => setExecuteDialogOpen(false) }}>
                 <DialogBody>
                   <DialogTitle>Execute stored procedure</DialogTitle>
                   <DialogContent>
@@ -452,6 +452,7 @@ export function ProgrammabilityEditor({
 
           <div className={styles.listActions}>
             <Dialog
+              modalType="non-modal"
               open={createDialogOpen}
               onOpenChange={(_, data) => {
                 setCreateDialogOpen(data.open)
@@ -466,7 +467,7 @@ export function ProgrammabilityEditor({
                   New
                 </Button>
               </DialogTrigger>
-              <DialogSurface>
+              <DialogSurface backdrop={{ onClick: () => { setCreateDialogOpen(false); setCreateDialogError(null) } }}>
                 <DialogBody>
                   <DialogTitle>Create {singularLabel} draft</DialogTitle>
                   <DialogContent>
@@ -500,7 +501,7 @@ export function ProgrammabilityEditor({
               </DialogSurface>
             </Dialog>
 
-            <Dialog open={deleteDialogOpen} onOpenChange={(_, data) => setDeleteDialogOpen(data.open)}>
+            <Dialog modalType="non-modal" open={deleteDialogOpen} onOpenChange={(_, data) => setDeleteDialogOpen(data.open)}>
               <DialogTrigger>
                 <Button
                   appearance="secondary"
@@ -510,7 +511,7 @@ export function ProgrammabilityEditor({
                   Delete
                 </Button>
               </DialogTrigger>
-              <DialogSurface>
+              <DialogSurface backdrop={{ onClick: () => setDeleteDialogOpen(false) }}>
                 <DialogBody>
                   <DialogTitle>Delete {singularLabel}</DialogTitle>
                   <DialogContent>

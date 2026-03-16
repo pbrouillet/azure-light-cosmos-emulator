@@ -32,6 +32,9 @@ public class CosmosContainer
     /// <summary>Default time to live in seconds (-1 = off, 0 = default, >0 = TTL).</summary>
     public int? DefaultTimeToLive { get; set; }
 
+    /// <summary>Provisioned throughput in request units per second.</summary>
+    public int MaxThroughput { get; set; } = 400;
+
     /// <summary>Unique key policy.</summary>
     public UniqueKeyPolicy? UniqueKeyPolicy { get; set; }
 

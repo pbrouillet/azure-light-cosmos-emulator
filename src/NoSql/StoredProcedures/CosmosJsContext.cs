@@ -14,6 +14,7 @@ namespace Azure.Cosmos.LightEmulator.NoSql.StoredProcedures;
 public sealed class CosmosJsContext
 {
     private readonly IDocumentStore _store;
+    private readonly IQueryEngine _queryEngine;
     private readonly string _databaseId;
     private readonly string _containerId;
     private readonly PartitionKeyValue _partitionKey;
@@ -27,12 +28,14 @@ public sealed class CosmosJsContext
 
     public CosmosJsContext(
         IDocumentStore store,
+        IQueryEngine queryEngine,
         string databaseId,
         string containerId,
         PartitionKeyValue partitionKey,
         CancellationToken ct = default)
     {
         _store = store;
+        _queryEngine = queryEngine;
         _databaseId = databaseId;
         _containerId = containerId;
         _partitionKey = partitionKey;
@@ -93,13 +96,20 @@ public sealed class CosmosJsContext
 
     internal IReadOnlyList<JsonObject> QueryDocuments(JsValue query)
     {
-        _ = ExtractQueryText(query);
+        var (queryText, parameters) = ExtractQueryDefinition(query);
+        var result = _queryEngine.ExecuteQueryAsync(
+            _databaseId,
+            _containerId,
+            queryText,
+            parameters,
+            new QueryOptions
+            {
+                PartitionKey = _partitionKey
+            },
+            _ct).GetAwaiter().GetResult();
 
-        var result = _store.ListDocumentsAsync(_databaseId, _containerId, _ct).GetAwaiter().GetResult();
         return result.Resources
-            .Where(doc => doc.PartitionKey.Equals(_partitionKey))
-            .OrderBy(doc => doc.Lsn)
-            .Select(doc => doc.ToResponseBody())
+            .Select(document => document.DeepClone().AsObject())
             .ToList();
     }
 
@@ -164,16 +174,58 @@ public sealed class CosmosJsContext
         return parsed;
     }
 
-    private static string ExtractQueryText(JsValue query)
+    private static (string QueryText, IReadOnlyDictionary<string, object?> Parameters) ExtractQueryDefinition(JsValue query)
     {
         var hostObject = ToHostObject(query);
         return hostObject switch
         {
-            string text when !string.IsNullOrWhiteSpace(text) => text,
-            JsonObject jsonObject when jsonObject["query"] is JsonValue jsonValue => jsonValue.GetValue<string>(),
-            IDictionary<string, object?> dictionary when dictionary.TryGetValue("query", out var value) && value is string text && !string.IsNullOrWhiteSpace(text) => text,
+            string text when !string.IsNullOrWhiteSpace(text) => (text, new Dictionary<string, object?>()),
+            JsonObject jsonObject when jsonObject["query"] is JsonValue jsonValue =>
+                (jsonValue.GetValue<string>(), ExtractQueryParameters(jsonObject["parameters"])),
+            IDictionary<string, object?> dictionary when dictionary.TryGetValue("query", out var value) && value is string text && !string.IsNullOrWhiteSpace(text) =>
+                (text, ExtractQueryParameters(dictionary.TryGetValue("parameters", out var parameters) ? parameters : null)),
             _ => throw CosmosEmulatorException.BadRequest("'query' must be a string or an object with a 'query' property.")
         };
+    }
+
+    private static IReadOnlyDictionary<string, object?> ExtractQueryParameters(object? parameters)
+    {
+        var values = new Dictionary<string, object?>();
+
+        switch (parameters)
+        {
+            case null:
+                return values;
+            case JsonArray jsonArray:
+                foreach (var entry in jsonArray)
+                {
+                    TryAddParameter(values, entry);
+                }
+                return values;
+            case IEnumerable<object?> enumerable:
+                foreach (var entry in enumerable)
+                {
+                    TryAddParameter(values, entry);
+                }
+                return values;
+            default:
+                return values;
+        }
+    }
+
+    private static void TryAddParameter(IDictionary<string, object?> parameters, object? entry)
+    {
+        switch (entry)
+        {
+            case JsonObject jsonObject when jsonObject["name"]?.GetValue<string>() is { Length: > 0 } name:
+                parameters[name] = jsonObject["value"];
+                break;
+            case IDictionary<string, object?> dictionary when dictionary.TryGetValue("name", out var nameValue)
+                && nameValue is string dictionaryName
+                && !string.IsNullOrWhiteSpace(dictionaryName):
+                parameters[dictionaryName] = dictionary.TryGetValue("value", out var value) ? value : null;
+                break;
+        }
     }
 
     private static string ExtractDocumentId(string documentLink)

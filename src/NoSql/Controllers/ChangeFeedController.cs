@@ -1,8 +1,8 @@
-using System.Globalization;
 using System.Net;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
@@ -12,11 +12,12 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 /// </summary>
 [ApiController]
 [Route("dbs/{dbId}/colls/{collId}/docs")]
-public class ChangeFeedController : ControllerBase
+public class ChangeFeedController : CosmosControllerBase
 {
     private readonly IChangeFeedProvider _changeFeed;
 
-    public ChangeFeedController(IChangeFeedProvider changeFeed)
+    public ChangeFeedController(IChangeFeedProvider changeFeed, CosmosResponseHeaderService responseHeaders)
+        : base(responseHeaders)
     {
         _changeFeed = changeFeed;
     }
@@ -45,8 +46,13 @@ public class ChangeFeedController : ControllerBase
 
         var result = await _changeFeed.ReadChangeFeedAsync(dbId, collId, options, ct);
 
-        Response.Headers[CosmosHeaders.RequestCharge] = 1.0.ToString("F2", CultureInfo.InvariantCulture);
-        Response.Headers[CosmosHeaders.ActivityId] = result.ActivityId;
+        await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+        {
+            RequestCharge = 1.0,
+            ActivityId = result.ActivityId,
+            DatabaseId = dbId,
+            ContainerId = collId
+        }, ct);
         Response.Headers[CosmosHeaders.ItemCount] = result.Count.ToString();
 
         if (result.ContinuationToken != null)
@@ -56,7 +62,7 @@ public class ChangeFeedController : ControllerBase
         }
 
         if (result.Count == 0)
-            return StatusCode(304); // Not Modified — no new changes
+            return StatusCode((int)HttpStatusCode.NotModified);
 
         return Ok(new
         {

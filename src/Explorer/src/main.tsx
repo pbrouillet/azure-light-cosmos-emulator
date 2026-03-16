@@ -1,7 +1,8 @@
-import { StrictMode, useEffect, useMemo, useState } from 'react'
+import { StrictMode, useCallback, useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   FluentProvider,
+  PortalMountNodeProvider,
   makeStyles,
   webDarkTheme,
   webLightTheme,
@@ -20,6 +21,10 @@ const useStyles = makeStyles({
 
 export function Root() {
   const styles = useStyles()
+  const [portalNode, setPortalNode] = useState<HTMLDivElement | undefined>()
+  const portalRef = useCallback((node: HTMLDivElement | null) => {
+    if (node) setPortalNode(node)
+  }, [])
   const [isDark, setIsDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches)
   const themeValue = useMemo(
     () => ({ isDark, toggle: () => setIsDark((current) => !current) }),
@@ -32,8 +37,11 @@ export function Root() {
 
   return (
     <ThemeContext.Provider value={themeValue}>
-      <FluentProvider className={styles.provider} theme={isDark ? webDarkTheme : webLightTheme}>
-        <App />
+      <FluentProvider applyStylesToPortals={false} className={styles.provider} theme={isDark ? webDarkTheme : webLightTheme}>
+        <PortalMountNodeProvider value={portalNode}>
+          <App />
+        </PortalMountNodeProvider>
+        <div ref={portalRef} />
       </FluentProvider>
     </ThemeContext.Provider>
   )

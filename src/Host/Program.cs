@@ -3,9 +3,10 @@ using Azure.Cosmos.LightEmulator.Core.Consistency;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
 using Azure.Cosmos.LightEmulator.Host.Configuration;
-using Azure.Cosmos.LightEmulator.NoSql;
 using Azure.Cosmos.LightEmulator.NoSql.Controllers;
+using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Azure.Cosmos.LightEmulator.NoSql.Middleware;
+using Azure.Cosmos.LightEmulator.NoSql.Query;
 using Azure.Cosmos.LightEmulator.Storage.ChangeFeed;
 using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
 using Microsoft.Extensions.FileProviders;
@@ -104,13 +105,18 @@ public static class Program
         });
         builder.Services.AddSingleton<IChangeFeedProvider, InMemoryChangeFeedProvider>();
         builder.Services.AddSingleton<IDocumentStore, SurrealDbDocumentStore>();
+        builder.Services.AddSingleton<EmulatorRuntimeState>();
         builder.Services.AddSingleton<EmulatorAdminSettingsStore>();
         builder.Services.AddSingleton<IEmulatorInfoService, EmulatorInfoService>();
         builder.Services.AddSingleton<RuTracker>();
-        builder.Services.AddSingleton<IQueryEngine, Azure.Cosmos.LightEmulator.NoSql.StubQueryEngine>();
+        builder.Services.AddSingleton<ThroughputManager>();
+        builder.Services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
+        builder.Services.AddSingleton<QueryExplainService>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
         builder.Services.AddSingleton<IAuthProvider, EmulatorAuthProvider>();
         builder.Services.AddSingleton<IProgrammabilityEngine, Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.JintProgrammabilityEngine>();
+        builder.Services.AddSingleton<CosmosResponseHeaderService>();
+        builder.Services.AddHostedService<TtlCleanupService>();
 
         var app = builder.Build();
         var logger = app.Logger;
@@ -118,6 +124,7 @@ public static class Program
         app.UseSerilogRequestLogging();
         app.UseMiddleware<EmulatorRequestTrackingMiddleware>();
         app.UseMiddleware<CosmosExceptionMiddleware>();
+        app.UseMiddleware<ThroughputEnforcementMiddleware>();
         app.UseMiddleware<CosmosAuthMiddleware>();
 
         if (emulatorOptions.EnableExplorer)

@@ -216,13 +216,13 @@ export function DocumentEditor({
             {saveMutation.isPending ? 'Saving…' : 'Save'}
           </Button>
 
-          <Dialog open={isDeleteOpen} onOpenChange={(_, data) => setIsDeleteOpen(data.open)}>
+          <Dialog modalType="non-modal" open={isDeleteOpen} onOpenChange={(_, data) => setIsDeleteOpen(data.open)}>
             <DialogTrigger>
               <Button appearance="secondary" icon={<DeleteRegular />}>
                 Delete
               </Button>
             </DialogTrigger>
-            <DialogSurface>
+            <DialogSurface backdrop={{ onClick: () => setIsDeleteOpen(false) }}>
               <DialogBody>
                 <DialogTitle>Delete document</DialogTitle>
                 <DialogContent>
