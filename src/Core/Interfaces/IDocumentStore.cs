@@ -31,6 +31,14 @@ public interface IDocumentStore
     Task DeleteDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, CancellationToken ct = default);
     Task<long> GetGlobalLsnAsync(CancellationToken ct = default);
 
+    // Batch operations
+    Task<IReadOnlyList<BatchOperationResponse>> ExecuteBatchAsync(
+        string databaseId,
+        string containerId,
+        PartitionKeyValue partitionKey,
+        IReadOnlyList<BatchOperationRequest> operations,
+        CancellationToken ct = default);
+
     // Bulk operations
     Task<FeedResponse<CosmosDocument>> ReadManyDocumentsAsync(string databaseId, string containerId, IEnumerable<(string id, PartitionKeyValue pk)> items, CancellationToken ct = default);
     Task<FeedResponse<CosmosDocument>> ListDocumentsAsync(string databaseId, string containerId, CancellationToken ct = default);

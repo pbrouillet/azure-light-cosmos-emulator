@@ -16,9 +16,11 @@ public static class CosmosHeaders
     public const string MaxItemCount = "x-ms-max-item-count";
     public const string IfMatch = "If-Match";
     public const string IfNoneMatch = "If-None-Match";
+    public const string EnableScan = "x-ms-documentdb-query-enable-scan";
     public const string IsUpsert = "x-ms-documentdb-is-upsert";
     public const string PreTriggerInclude = "x-ms-documentdb-pre-trigger-include";
     public const string PostTriggerInclude = "x-ms-documentdb-post-trigger-include";
+    public const string IsBatchRequest = "x-ms-cosmos-is-batch-request";
     public const string IncrementalFeed = "A-IM";
     public const string ContentType = "Content-Type";
 

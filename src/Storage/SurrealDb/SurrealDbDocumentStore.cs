@@ -566,6 +566,438 @@ public class SurrealDbDocumentStore : IDocumentStore
         };
     }
 
+    // ─── Batch operations ───────────────────────────────────────────
+
+    public async Task<IReadOnlyList<BatchOperationResponse>> ExecuteBatchAsync(
+        string databaseId,
+        string containerId,
+        PartitionKeyValue partitionKey,
+        IReadOnlyList<BatchOperationRequest> operations,
+        CancellationToken ct = default)
+    {
+        var container = await GetContainerAsync(databaseId, containerId, ct);
+
+        // Track snapshots for rollback and which keys were newly created
+        var snapshots = new Dictionary<string, DbDocumentRecord?>();
+        var createdKeys = new List<string>();
+        var results = new List<BatchOperationResponse>();
+        var changeFeedEntries = new List<(CosmosDocument doc, ChangeType type, CosmosDocument? previous)>();
+        var failedIndex = -1;
+
+        for (var i = 0; i < operations.Count; i++)
+        {
+            var op = operations[i];
+            try
+            {
+                var result = await ExecuteBatchOperationAsync(
+                    databaseId, containerId, partitionKey, container.PartitionKey,
+                    op, snapshots, createdKeys, changeFeedEntries, ct);
+                results.Add(result);
+            }
+            catch (CosmosEmulatorException ex)
+            {
+                failedIndex = i;
+                results.Add(new BatchOperationResponse
+                {
+                    StatusCode = (int)ex.StatusCode,
+                    RequestCharge = ex.RequestCharge
+                });
+                break;
+            }
+        }
+
+        if (failedIndex >= 0)
+        {
+            // Rollback all previously successful operations
+            await RollbackBatchAsync(snapshots, createdKeys, ct);
+
+            // Mark all previous results as 424 Failed Dependency
+            for (var j = 0; j < failedIndex; j++)
+            {
+                results[j] = new BatchOperationResponse
+                {
+                    StatusCode = 424,
+                    RequestCharge = 0
+                };
+            }
+
+            // Mark remaining operations as 424 Failed Dependency
+            for (var j = failedIndex + 1; j < operations.Count; j++)
+            {
+                results.Add(new BatchOperationResponse
+                {
+                    StatusCode = 424,
+                    RequestCharge = 0
+                });
+            }
+        }
+        else
+        {
+            // All operations succeeded — record change feed entries
+            foreach (var (doc, type, previous) in changeFeedEntries)
+            {
+                await _changeFeed.RecordChangeAsync(databaseId, containerId, doc, type, previous, ct);
+            }
+        }
+
+        return results;
+    }
+
+    private async Task<BatchOperationResponse> ExecuteBatchOperationAsync(
+        string databaseId,
+        string containerId,
+        PartitionKeyValue partitionKey,
+        PartitionKeyDefinition pkDef,
+        BatchOperationRequest op,
+        Dictionary<string, DbDocumentRecord?> snapshots,
+        List<string> createdKeys,
+        List<(CosmosDocument doc, ChangeType type, CosmosDocument? previous)> changeFeedEntries,
+        CancellationToken ct)
+    {
+        switch (op.OperationType)
+        {
+            case BatchOperationType.Create:
+            {
+                var body = op.ResourceBody
+                    ?? throw CosmosEmulatorException.BadRequest("Create operation requires a resourceBody.");
+                var id = body["id"]?.GetValue<string>()
+                    ?? throw CosmosEmulatorException.BadRequest("Document must have an 'id' property.");
+
+                EnforceDocumentSizeLimit(body);
+                var docPk = ExtractPartitionKey(body, pkDef);
+                var documentKey = MakeDocumentRecordKey(databaseId, containerId, id, docPk);
+
+                // Snapshot original state for rollback (only first time we touch this key)
+                if (!snapshots.ContainsKey(documentKey))
+                    snapshots[documentKey] = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct);
+
+                // Check current state in storage
+                var currentRecord = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct);
+                if (currentRecord is not null)
+                    throw CosmosEmulatorException.Conflict("Document", id);
+
+                var created = new CosmosDocument
+                {
+                    Id = id,
+                    DatabaseId = databaseId,
+                    ContainerId = containerId,
+                    PartitionKey = docPk,
+                    Body = body.DeepClone().AsObject(),
+                    TimeToLive = ExtractTimeToLive(body),
+                    Lsn = await GetNextLsnAsync(ct),
+                    Self = $"dbs/{databaseId}/colls/{containerId}/docs/{id}/"
+                };
+
+                await CreateRecordAsync(DocumentTable, documentKey, ToRecord(created), ct);
+                createdKeys.Add(documentKey);
+                changeFeedEntries.Add((created, ChangeType.Create, null));
+
+                var bodySize = body.ToJsonString().Length;
+                return new BatchOperationResponse
+                {
+                    StatusCode = 201,
+                    ResourceBody = created.ToResponseBody(),
+                    ETag = created.ETag,
+                    RequestCharge = RuCostCalculator.Create(bodySize)
+                };
+            }
+
+            case BatchOperationType.Read:
+            {
+                var id = op.Id
+                    ?? throw CosmosEmulatorException.BadRequest("Read operation requires an id.");
+                var documentKey = MakeDocumentRecordKey(databaseId, containerId, id, partitionKey);
+                var record = await GetRequiredRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, "Document", id, ct);
+                var doc = ToCosmosDocument(record);
+                var bodySize = doc.Body.ToJsonString().Length;
+                return new BatchOperationResponse
+                {
+                    StatusCode = 200,
+                    ResourceBody = doc.ToResponseBody(),
+                    ETag = doc.ETag,
+                    RequestCharge = RuCostCalculator.PointRead(bodySize)
+                };
+            }
+
+            case BatchOperationType.Replace:
+            {
+                var id = op.Id
+                    ?? throw CosmosEmulatorException.BadRequest("Replace operation requires an id.");
+                var body = op.ResourceBody
+                    ?? throw CosmosEmulatorException.BadRequest("Replace operation requires a resourceBody.");
+
+                EnforceDocumentSizeLimit(body);
+                var docPk = ExtractPartitionKey(body, pkDef);
+                var documentKey = MakeDocumentRecordKey(databaseId, containerId, id, docPk);
+
+                // Snapshot original state for rollback (only first time we touch this key)
+                if (!snapshots.ContainsKey(documentKey))
+                    snapshots[documentKey] = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct);
+
+                // Read current state from storage
+                var existingRecord = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct)
+                    ?? throw CosmosEmulatorException.NotFound("Document", id);
+                var existing = ToCosmosDocument(existingRecord);
+
+                if (op.IfMatch is not null && existing.ETag != op.IfMatch)
+                    throw CosmosEmulatorException.PreconditionFailed(
+                        $"ETag mismatch. Expected: {op.IfMatch}, Actual: {existing.ETag}");
+
+                var updated = new CosmosDocument
+                {
+                    Id = id,
+                    Rid = existing.Rid,
+                    DatabaseId = databaseId,
+                    ContainerId = containerId,
+                    PartitionKey = docPk,
+                    Body = body.DeepClone().AsObject(),
+                    TimeToLive = ExtractTimeToLive(body),
+                    Lsn = await GetNextLsnAsync(ct),
+                    Self = existing.Self,
+                    ETag = ETagGenerator.Generate(),
+                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                };
+
+                await UpsertRecordAsync(DocumentTable, documentKey, ToRecord(updated), ct);
+                changeFeedEntries.Add((updated, ChangeType.Replace, existing));
+
+                var bodySize = body.ToJsonString().Length;
+                return new BatchOperationResponse
+                {
+                    StatusCode = 200,
+                    ResourceBody = updated.ToResponseBody(),
+                    ETag = updated.ETag,
+                    RequestCharge = RuCostCalculator.Replace(bodySize)
+                };
+            }
+
+            case BatchOperationType.Upsert:
+            {
+                var body = op.ResourceBody
+                    ?? throw CosmosEmulatorException.BadRequest("Upsert operation requires a resourceBody.");
+                var id = body["id"]?.GetValue<string>()
+                    ?? throw CosmosEmulatorException.BadRequest("Document must have an 'id' property.");
+
+                EnforceDocumentSizeLimit(body);
+                var docPk = ExtractPartitionKey(body, pkDef);
+                var documentKey = MakeDocumentRecordKey(databaseId, containerId, id, docPk);
+
+                // Snapshot original state for rollback (only first time we touch this key)
+                if (!snapshots.ContainsKey(documentKey))
+                    snapshots[documentKey] = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct);
+
+                // Read current state from storage
+                var existingRecord = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct);
+                CosmosDocument? existing = existingRecord is not null ? ToCosmosDocument(existingRecord) : null;
+
+                if (existing is not null)
+                {
+                    var updated = new CosmosDocument
+                    {
+                        Id = id,
+                        Rid = existing.Rid,
+                        DatabaseId = databaseId,
+                        ContainerId = containerId,
+                        PartitionKey = docPk,
+                        Body = body.DeepClone().AsObject(),
+                        TimeToLive = ExtractTimeToLive(body),
+                        Lsn = await GetNextLsnAsync(ct),
+                        Self = existing.Self,
+                        ETag = ETagGenerator.Generate(),
+                        Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                    };
+
+                    await UpsertRecordAsync(DocumentTable, documentKey, ToRecord(updated), ct);
+                    changeFeedEntries.Add((updated, ChangeType.Replace, existing));
+
+                    var bodySize = body.ToJsonString().Length;
+                    return new BatchOperationResponse
+                    {
+                        StatusCode = 200,
+                        ResourceBody = updated.ToResponseBody(),
+                        ETag = updated.ETag,
+                        RequestCharge = RuCostCalculator.Upsert(bodySize)
+                    };
+                }
+                else
+                {
+                    var created = new CosmosDocument
+                    {
+                        Id = id,
+                        DatabaseId = databaseId,
+                        ContainerId = containerId,
+                        PartitionKey = docPk,
+                        Body = body.DeepClone().AsObject(),
+                        TimeToLive = ExtractTimeToLive(body),
+                        Lsn = await GetNextLsnAsync(ct),
+                        Self = $"dbs/{databaseId}/colls/{containerId}/docs/{id}/"
+                    };
+
+                    await CreateRecordAsync(DocumentTable, documentKey, ToRecord(created), ct);
+                    createdKeys.Add(documentKey);
+                    changeFeedEntries.Add((created, ChangeType.Create, null));
+
+                    var bodySize = body.ToJsonString().Length;
+                    return new BatchOperationResponse
+                    {
+                        StatusCode = 201,
+                        ResourceBody = created.ToResponseBody(),
+                        ETag = created.ETag,
+                        RequestCharge = RuCostCalculator.Create(bodySize)
+                    };
+                }
+            }
+
+            case BatchOperationType.Delete:
+            {
+                var id = op.Id
+                    ?? throw CosmosEmulatorException.BadRequest("Delete operation requires an id.");
+                var documentKey = MakeDocumentRecordKey(databaseId, containerId, id, partitionKey);
+
+                // Snapshot original state for rollback (only first time we touch this key)
+                if (!snapshots.ContainsKey(documentKey))
+                    snapshots[documentKey] = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct);
+
+                // Read current state from storage
+                var existingRecord = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct)
+                    ?? throw CosmosEmulatorException.NotFound("Document", id);
+                var existing = ToCosmosDocument(existingRecord);
+                existing.Lsn = await GetNextLsnAsync(ct);
+                existing.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+                await DeleteRecordAsync(DocumentTable, documentKey, "Document", id, ct);
+                changeFeedEntries.Add((existing, ChangeType.Delete, null));
+
+                return new BatchOperationResponse
+                {
+                    StatusCode = 204,
+                    RequestCharge = RuCostCalculator.Delete()
+                };
+            }
+
+            case BatchOperationType.Patch:
+            {
+                var id = op.Id
+                    ?? throw CosmosEmulatorException.BadRequest("Patch operation requires an id.");
+                var patchBody = op.ResourceBody
+                    ?? throw CosmosEmulatorException.BadRequest("Patch operation requires a resourceBody with operations.");
+                var opsArray = patchBody["operations"] as JsonArray
+                    ?? throw CosmosEmulatorException.BadRequest("Patch resourceBody must include an 'operations' array.");
+
+                var documentKey = MakeDocumentRecordKey(databaseId, containerId, id, partitionKey);
+
+                // Snapshot original state for rollback (only first time we touch this key)
+                if (!snapshots.ContainsKey(documentKey))
+                    snapshots[documentKey] = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct);
+
+                // Read current state from storage
+                var existingRecord = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct)
+                    ?? throw CosmosEmulatorException.NotFound("Document", id);
+                var existing = ToCosmosDocument(existingRecord);
+
+                if (op.IfMatch is not null && existing.ETag != op.IfMatch)
+                    throw CosmosEmulatorException.PreconditionFailed(
+                        $"ETag mismatch. Expected: {op.IfMatch}, Actual: {existing.ETag}");
+
+                var patchOps = new List<PatchOperation>();
+                foreach (var opNode in opsArray)
+                {
+                    if (opNode is not JsonObject opObj)
+                        throw CosmosEmulatorException.BadRequest("Each patch operation must be a JSON object.");
+                    var opType = opObj["op"]?.GetValue<string>();
+                    var path = opObj["path"]?.GetValue<string>();
+                    if (string.IsNullOrEmpty(opType) || string.IsNullOrEmpty(path))
+                        throw CosmosEmulatorException.BadRequest("Each patch operation must have 'op' and 'path'.");
+                    patchOps.Add(new PatchOperation
+                    {
+                        Op = opType,
+                        Path = path,
+                        Value = opObj.ContainsKey("value") ? opObj["value"] : null,
+                        From = opObj["from"]?.GetValue<string>()
+                    });
+                }
+
+                var body = existing.Body.DeepClone().AsObject();
+                ApplyPatchOperations(body, patchOps);
+                EnforceDocumentSizeLimit(body);
+
+                var updated = new CosmosDocument
+                {
+                    Id = id,
+                    Rid = existing.Rid,
+                    DatabaseId = databaseId,
+                    ContainerId = containerId,
+                    PartitionKey = partitionKey,
+                    Body = body,
+                    TimeToLive = ExtractTimeToLive(body),
+                    Lsn = await GetNextLsnAsync(ct),
+                    Self = existing.Self,
+                    ETag = ETagGenerator.Generate(),
+                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                };
+
+                await UpsertRecordAsync(DocumentTable, documentKey, ToRecord(updated), ct);
+                changeFeedEntries.Add((updated, ChangeType.Replace, existing));
+
+                var bodySize = body.ToJsonString().Length;
+                return new BatchOperationResponse
+                {
+                    StatusCode = 200,
+                    ResourceBody = updated.ToResponseBody(),
+                    ETag = updated.ETag,
+                    RequestCharge = RuCostCalculator.Replace(bodySize)
+                };
+            }
+
+            default:
+                throw CosmosEmulatorException.BadRequest($"Unsupported batch operation type: {op.OperationType}.");
+        }
+    }
+
+    private async Task RollbackBatchAsync(
+        Dictionary<string, DbDocumentRecord?> snapshots,
+        List<string> createdKeys,
+        CancellationToken ct)
+    {
+        // Delete newly created records
+        foreach (var key in createdKeys)
+        {
+            try
+            {
+                var client = await GetClientAsync(ct);
+                await client.Delete(new RecordIdOfString(DocumentTable, key), ct);
+            }
+            catch
+            {
+                // Best effort rollback
+            }
+        }
+
+        // Restore modified records to their original state
+        foreach (var (key, snapshot) in snapshots)
+        {
+            if (createdKeys.Contains(key))
+                continue; // Already handled above
+
+            try
+            {
+                if (snapshot is not null)
+                {
+                    // Restore original record
+                    await UpsertRecordAsync(DocumentTable, key, snapshot, ct);
+                }
+                // If snapshot was null and the record was deleted in the batch,
+                // we'd need to recreate it — but that case is handled by the fact
+                // that if delete succeeded and something later failed, the original
+                // snapshot was non-null.
+            }
+            catch
+            {
+                // Best effort rollback
+            }
+        }
+    }
+
     // ─── User operations ────────────────────────────────────────────
 
     public async Task<CosmosUser> CreateUserAsync(string databaseId, string userId, CancellationToken ct = default)
