@@ -598,6 +598,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             NotBooleanExpression unary => !EvaluateBooleanExpression(row, unary.Expression, parameters),
             ComparisonBooleanExpression comparison => EvaluateComparison(row, comparison, parameters),
             InBooleanExpression inExpression => EvaluateIn(row, inExpression, parameters),
+            LikeBooleanExpression likeExpr => EvaluateLike(row, likeExpr, parameters),
             ScalarBooleanExpression scalar => ToBoolean(EvaluateScalarExpression(row, scalar.Expression, parameters)),
             _ => throw CosmosEmulatorException.BadRequest("Unsupported WHERE clause expression.")
         };
@@ -639,6 +640,20 @@ public sealed class CosmosQueryEngine : IQueryEngine
         });
 
         return expression.Negated ? !found : found;
+    }
+
+    private static bool EvaluateLike(QueryRow row, LikeBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        var left = EvaluateScalarExpression(row, expression.Left, parameters);
+        var pattern = EvaluateScalarExpression(row, expression.Pattern, parameters);
+        if (left is not string str || pattern is not string pat)
+            return false;
+
+        // Convert SQL LIKE pattern to regex: % = .*, _ = ., escape others
+        var regexPattern = "^" + System.Text.RegularExpressions.Regex.Escape(pat)
+            .Replace("%", ".*")
+            .Replace("_", ".") + "$";
+        return System.Text.RegularExpressions.Regex.IsMatch(str, regexPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
     }
 
     private static bool ToBoolean(object? value)
@@ -805,6 +820,38 @@ public sealed class CosmosQueryEngine : IQueryEngine
             "ROUND" => EvaluateUnaryNumber(arguments, Math.Round),
             "POWER" => EvaluatePower(arguments),
             "SQRT" => EvaluateSqrt(arguments),
+            // Advanced math
+            "LOG" => EvaluateUnaryNumber(arguments, Math.Log),
+            "LOG10" => EvaluateUnaryNumber(arguments, Math.Log10),
+            "EXP" => EvaluateUnaryNumber(arguments, Math.Exp),
+            "SIN" => EvaluateUnaryNumber(arguments, Math.Sin),
+            "COS" => EvaluateUnaryNumber(arguments, Math.Cos),
+            "TAN" => EvaluateUnaryNumber(arguments, Math.Tan),
+            "SIGN" => EvaluateUnaryNumber(arguments, v => Math.Sign(v)),
+            "TRUNC" => EvaluateUnaryNumber(arguments, Math.Truncate),
+            "PI" => Math.PI,
+            "DEGREES" => EvaluateUnaryNumber(arguments, v => v * (180.0 / Math.PI)),
+            "RADIANS" => EvaluateUnaryNumber(arguments, v => v * (Math.PI / 180.0)),
+            // Advanced string
+            "REVERSE" => EvaluateUnaryString(arguments, v => new string(v.Reverse().ToArray())),
+            "LTRIM" => EvaluateUnaryString(arguments, v => v.TrimStart()),
+            "RTRIM" => EvaluateUnaryString(arguments, v => v.TrimEnd()),
+            "TOSTRING" => arguments.Count >= 1 ? arguments[0]?.ToString() : throw CosmosEmulatorException.BadRequest("ToString expects one argument."),
+            "REPLICATE" => EvaluateReplicate(arguments),
+            "REGEXMATCH" => EvaluateRegexMatch(arguments),
+            // Advanced array
+            "ARRAY_LENGTH" => EvaluateArrayLength(arguments),
+            "ARRAY_CONCAT" => EvaluateArrayConcat(arguments),
+            "ARRAY_SLICE" => EvaluateArraySlice(arguments),
+            // Date/time
+            "GETCURRENTDATETIME" => DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ"),
+            "GETCURRENTTIMESTAMP" => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            "GETCURRENTTICKS" => DateTimeOffset.UtcNow.Ticks,
+            "DATETIMEADD" => EvaluateDateTimeAdd(arguments),
+            "DATETIMEDIFF" => EvaluateDateTimeDiff(arguments),
+            "DATETIMEPART" => EvaluateDateTimePart(arguments),
+            "DATETIMETOTICKS" => arguments.Count >= 1 && arguments[0] is string dtStr && DateTimeOffset.TryParse(dtStr, out var dto) ? dto.Ticks : throw CosmosEmulatorException.BadRequest("DateTimeToTicks expects a valid datetime string."),
+            "TICKSTODATETIME" => arguments.Count >= 1 && TryConvertToDouble(arguments[0], out var ticks) ? new DateTimeOffset((long)ticks, TimeSpan.Zero).ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") : throw CosmosEmulatorException.BadRequest("TicksToDateTime expects a numeric ticks value."),
             _ => throw CosmosEmulatorException.BadRequest($"Unsupported function '{functionName}'.")
         };
     }
@@ -1016,6 +1063,120 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         var result = Math.Sqrt(value);
         return double.IsNaN(result) || double.IsInfinity(result) ? null : result;
+    }
+
+    private static object? EvaluateReplicate(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2) throw CosmosEmulatorException.BadRequest("REPLICATE expects two arguments.");
+        if (arguments[0] is not string s) return null;
+        if (!TryConvertToDouble(arguments[1], out var count)) return null;
+        var n = (int)count;
+        return n <= 0 ? "" : string.Concat(Enumerable.Repeat(s, n));
+    }
+
+    private static object? EvaluateRegexMatch(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count < 2) throw CosmosEmulatorException.BadRequest("RegexMatch expects at least two arguments.");
+        if (arguments[0] is not string input || arguments[1] is not string pattern) return null;
+        var options = arguments.Count >= 3 && arguments[2] is string flags && flags.Contains('i')
+            ? System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            : System.Text.RegularExpressions.RegexOptions.None;
+        return System.Text.RegularExpressions.Regex.IsMatch(input, pattern, options);
+    }
+
+    private static object? EvaluateArrayLength(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1) throw CosmosEmulatorException.BadRequest("ARRAY_LENGTH expects one argument.");
+        return arguments[0] is JsonArray arr ? arr.Count : (object?)null;
+    }
+
+    private static object? EvaluateArrayConcat(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count < 2) throw CosmosEmulatorException.BadRequest("ARRAY_CONCAT expects at least two arguments.");
+        var result = new JsonArray();
+        foreach (var arg in arguments)
+        {
+            if (arg is JsonArray arr)
+                foreach (var item in arr)
+                    result.Add(item?.DeepClone());
+        }
+        return result;
+    }
+
+    private static object? EvaluateArraySlice(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count < 2) throw CosmosEmulatorException.BadRequest("ARRAY_SLICE expects at least two arguments.");
+        if (arguments[0] is not JsonArray arr) return null;
+        if (!TryConvertToDouble(arguments[1], out var startD)) return null;
+        var start = (int)startD;
+        if (start < 0) start = Math.Max(0, arr.Count + start);
+        var length = arguments.Count >= 3 && TryConvertToDouble(arguments[2], out var lenD) ? (int)lenD : arr.Count - start;
+        var result = new JsonArray();
+        for (var i = start; i < Math.Min(start + length, arr.Count); i++)
+            result.Add(arr[i]?.DeepClone());
+        return result;
+    }
+
+    private static object? EvaluateDateTimeAdd(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 3) throw CosmosEmulatorException.BadRequest("DateTimeAdd expects three arguments.");
+        if (arguments[0] is not string part || !TryConvertToDouble(arguments[1], out var amount) || arguments[2] is not string dateStr)
+            return null;
+        if (!DateTimeOffset.TryParse(dateStr, out var dt)) return null;
+        var n = (int)amount;
+        dt = part.ToLowerInvariant() switch
+        {
+            "year" or "yy" or "yyyy" => dt.AddYears(n),
+            "month" or "mm" or "m" => dt.AddMonths(n),
+            "day" or "dd" or "d" => dt.AddDays(n),
+            "hour" or "hh" => dt.AddHours(n),
+            "minute" or "mi" or "n" => dt.AddMinutes(n),
+            "second" or "ss" or "s" => dt.AddSeconds(n),
+            "millisecond" or "ms" => dt.AddMilliseconds(n),
+            _ => throw CosmosEmulatorException.BadRequest($"Unsupported DateTimeAdd part: '{part}'.")
+        };
+        return dt.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ");
+    }
+
+    private static object? EvaluateDateTimeDiff(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 3) throw CosmosEmulatorException.BadRequest("DateTimeDiff expects three arguments.");
+        if (arguments[0] is not string part || arguments[1] is not string startStr || arguments[2] is not string endStr)
+            return null;
+        if (!DateTimeOffset.TryParse(startStr, out var start) || !DateTimeOffset.TryParse(endStr, out var end))
+            return null;
+        var diff = end - start;
+        return part.ToLowerInvariant() switch
+        {
+            "year" or "yy" or "yyyy" => end.Year - start.Year,
+            "month" or "mm" or "m" => (end.Year - start.Year) * 12 + end.Month - start.Month,
+            "day" or "dd" or "d" => (long)diff.TotalDays,
+            "hour" or "hh" => (long)diff.TotalHours,
+            "minute" or "mi" or "n" => (long)diff.TotalMinutes,
+            "second" or "ss" or "s" => (long)diff.TotalSeconds,
+            "millisecond" or "ms" => (long)diff.TotalMilliseconds,
+            _ => throw CosmosEmulatorException.BadRequest($"Unsupported DateTimeDiff part: '{part}'.")
+        };
+    }
+
+    private static object? EvaluateDateTimePart(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2) throw CosmosEmulatorException.BadRequest("DateTimePart expects two arguments.");
+        if (arguments[0] is not string part || arguments[1] is not string dateStr) return null;
+        if (!DateTimeOffset.TryParse(dateStr, out var dt)) return null;
+        return part.ToLowerInvariant() switch
+        {
+            "year" or "yy" or "yyyy" => dt.Year,
+            "month" or "mm" or "m" => dt.Month,
+            "day" or "dd" or "d" => dt.Day,
+            "hour" or "hh" => dt.Hour,
+            "minute" or "mi" or "n" => dt.Minute,
+            "second" or "ss" or "s" => dt.Second,
+            "millisecond" or "ms" => dt.Millisecond,
+            "dayofweek" or "dw" => (int)dt.DayOfWeek,
+            "dayofyear" or "dy" => dt.DayOfYear,
+            _ => throw CosmosEmulatorException.BadRequest($"Unsupported DateTimePart part: '{part}'.")
+        };
     }
 
     private static object? ResolvePathValue(QueryRow row, string path)
@@ -1566,6 +1727,24 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 return new InBooleanExpression(left, ParseInList(), false);
             }
 
+            if (MatchKeyword("BETWEEN"))
+            {
+                var low = ParseScalarPrimary();
+                if (!MatchKeyword("AND"))
+                    throw CosmosEmulatorException.BadRequest("BETWEEN requires AND keyword.");
+                var high = ParseScalarPrimary();
+                return new BinaryBooleanExpression(
+                    new ComparisonBooleanExpression(left, ComparisonOperator.GreaterThanOrEqual, low),
+                    BooleanOperator.And,
+                    new ComparisonBooleanExpression(left, ComparisonOperator.LessThanOrEqual, high));
+            }
+
+            if (MatchKeyword("LIKE"))
+            {
+                var pattern = ParseScalarPrimary();
+                return new LikeBooleanExpression(left, pattern);
+            }
+
             if (Current.Type == TokenType.Operator)
             {
                 var comparison = ParseComparisonOperator();
@@ -1925,6 +2104,8 @@ public sealed class CosmosQueryEngine : IQueryEngine
     private sealed record ComparisonBooleanExpression(ScalarExpression Left, ComparisonOperator Operator, ScalarExpression Right) : BooleanExpression;
 
     private sealed record InBooleanExpression(ScalarExpression Left, IReadOnlyList<ScalarExpression> Values, bool Negated) : BooleanExpression;
+
+    private sealed record LikeBooleanExpression(ScalarExpression Left, ScalarExpression Pattern) : BooleanExpression;
 
     private sealed record ScalarBooleanExpression(ScalarExpression Expression) : BooleanExpression;
 
