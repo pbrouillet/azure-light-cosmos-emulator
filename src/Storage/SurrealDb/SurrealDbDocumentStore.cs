@@ -103,6 +103,78 @@ internal sealed class DbMetaRecord
     public long Value { get; set; }
 }
 
+internal sealed class DbUserRecord
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("databaseId")]
+    public string DatabaseId { get; set; } = string.Empty;
+
+    [JsonPropertyName("rid")]
+    public string Rid { get; set; } = string.Empty;
+
+    [JsonPropertyName("eTag")]
+    public string ETag { get; set; } = string.Empty;
+
+    [JsonPropertyName("timestamp")]
+    public long Timestamp { get; set; }
+}
+
+internal sealed class DbPermissionRecord
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("databaseId")]
+    public string DatabaseId { get; set; } = string.Empty;
+
+    [JsonPropertyName("userId")]
+    public string UserId { get; set; } = string.Empty;
+
+    [JsonPropertyName("rid")]
+    public string Rid { get; set; } = string.Empty;
+
+    [JsonPropertyName("eTag")]
+    public string ETag { get; set; } = string.Empty;
+
+    [JsonPropertyName("timestamp")]
+    public long Timestamp { get; set; }
+
+    [JsonPropertyName("permissionMode")]
+    public int PermissionMode { get; set; }
+
+    [JsonPropertyName("resource")]
+    public string Resource { get; set; } = string.Empty;
+
+    [JsonPropertyName("token")]
+    public string? Token { get; set; }
+}
+
+internal sealed class DbOfferRecord
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("rid")]
+    public string Rid { get; set; } = string.Empty;
+
+    [JsonPropertyName("eTag")]
+    public string ETag { get; set; } = string.Empty;
+
+    [JsonPropertyName("timestamp")]
+    public long Timestamp { get; set; }
+
+    [JsonPropertyName("offerThroughput")]
+    public int OfferThroughput { get; set; }
+
+    [JsonPropertyName("resource")]
+    public string Resource { get; set; } = string.Empty;
+
+    [JsonPropertyName("offerResourceId")]
+    public string OfferResourceId { get; set; } = string.Empty;
+}
+
 /// <summary>
 /// SurrealDB-backed implementation of IDocumentStore.
 /// Uses SurrealDB embedded with RocksDB KV backend.
@@ -113,6 +185,9 @@ public class SurrealDbDocumentStore : IDocumentStore
     private const string ContainerTable = "cosmos_containers";
     private const string DocumentTable = "cosmos_documents";
     private const string MetaTable = "cosmos_meta";
+    private const string UserTable = "cosmos_users";
+    private const string PermissionTable = "cosmos_permissions";
+    private const string OfferTable = "cosmos_offers";
     private const string GlobalLsnKey = "global_lsn";
 
     private static readonly JsonSerializerOptions JsonOptions = new();
@@ -186,6 +261,7 @@ public class SurrealDbDocumentStore : IDocumentStore
         var containers = await SelectTableRecordsAsync<DbContainerRecord>(ContainerTable, ct);
         foreach (var container in containers.Where(container => string.Equals(container.DatabaseId, id, StringComparison.Ordinal)))
         {
+            await DeleteOfferForContainerAsync(container.Rid, ct);
             await DeleteRecordAsync(ContainerTable, MakeContainerRecordKey(container.DatabaseId, container.Id), "Container", container.Id, ct);
         }
 
@@ -193,6 +269,18 @@ public class SurrealDbDocumentStore : IDocumentStore
         foreach (var document in documents.Where(document => string.Equals(document.DatabaseId, id, StringComparison.Ordinal)))
         {
             await DeleteRecordAsync(DocumentTable, MakeDocumentRecordKey(document.DatabaseId, document.ContainerId, document.Id, DeserializePartitionKey(document.PartitionKeyJson)), "Document", document.Id, ct);
+        }
+
+        // Cascade delete users and their permissions
+        var users = (await SelectTableRecordsAsync<DbUserRecord>(UserTable, ct))
+            .Where(u => string.Equals(u.DatabaseId, id, StringComparison.Ordinal));
+        foreach (var user in users)
+        {
+            var permissions = (await SelectTableRecordsAsync<DbPermissionRecord>(PermissionTable, ct))
+                .Where(p => string.Equals(p.DatabaseId, id, StringComparison.Ordinal) && string.Equals(p.UserId, user.Id, StringComparison.Ordinal));
+            foreach (var p in permissions)
+                await DeleteRecordAsync(PermissionTable, MakePermissionRecordKey(id, user.Id, p.Id), "Permission", p.Id, ct);
+            await DeleteRecordAsync(UserTable, MakeUserRecordKey(id, user.Id), "User", user.Id, ct);
         }
 
         await DeleteRecordAsync(DatabaseTable, databaseKey, "Database", id, ct);
@@ -212,6 +300,7 @@ public class SurrealDbDocumentStore : IDocumentStore
         container.Self = $"dbs/{databaseId}/colls/{container.Id}/";
 
         await CreateRecordAsync(ContainerTable, containerKey, ToRecord(container), ct);
+        await CreateOfferForContainerAsync(container, ct);
         return container;
     }
 
@@ -270,7 +359,7 @@ public class SurrealDbDocumentStore : IDocumentStore
     public async Task DeleteContainerAsync(string databaseId, string containerId, CancellationToken ct = default)
     {
         var containerKey = MakeContainerRecordKey(databaseId, containerId);
-        await EnsureRecordExistsAsync<DbContainerRecord>(ContainerTable, containerKey, "Container", containerId, ct);
+        var containerRecord = await GetRequiredRecordAsync<DbContainerRecord>(ContainerTable, containerKey, "Container", containerId, ct);
 
         var documents = await SelectTableRecordsAsync<DbDocumentRecord>(DocumentTable, ct);
         foreach (var document in documents.Where(document =>
@@ -280,6 +369,7 @@ public class SurrealDbDocumentStore : IDocumentStore
             await DeleteRecordAsync(DocumentTable, MakeDocumentRecordKey(document.DatabaseId, document.ContainerId, document.Id, DeserializePartitionKey(document.PartitionKeyJson)), "Document", document.Id, ct);
         }
 
+        await DeleteOfferForContainerAsync(containerRecord.Rid, ct);
         await DeleteRecordAsync(ContainerTable, containerKey, "Container", containerId, ct);
     }
 
@@ -464,6 +554,158 @@ public class SurrealDbDocumentStore : IDocumentStore
         {
             Resources = records.Select(ToCosmosDocument).ToList()
         };
+    }
+
+    // ─── User operations ────────────────────────────────────────────
+
+    public async Task<CosmosUser> CreateUserAsync(string databaseId, string userId, CancellationToken ct = default)
+    {
+        await EnsureRecordExistsAsync<DbDatabaseRecord>(DatabaseTable, MakeDatabaseRecordKey(databaseId), "Database", databaseId, ct);
+        var key = MakeUserRecordKey(databaseId, userId);
+        if (await SelectRecordAsync<DbUserRecord>(UserTable, key, ct) is not null)
+            throw CosmosEmulatorException.Conflict("User", userId);
+
+        var user = new CosmosUser { Id = userId, DatabaseId = databaseId, Self = $"dbs/{databaseId}/users/{userId}/" };
+        await CreateRecordAsync(UserTable, key, ToRecord(user), ct);
+        return user;
+    }
+
+    public async Task<CosmosUser> GetUserAsync(string databaseId, string userId, CancellationToken ct = default)
+    {
+        var record = await GetRequiredRecordAsync<DbUserRecord>(UserTable, MakeUserRecordKey(databaseId, userId), "User", userId, ct);
+        return ToCosmosUser(record);
+    }
+
+    public async Task<FeedResponse<CosmosUser>> ListUsersAsync(string databaseId, CancellationToken ct = default)
+    {
+        await EnsureRecordExistsAsync<DbDatabaseRecord>(DatabaseTable, MakeDatabaseRecordKey(databaseId), "Database", databaseId, ct);
+        var records = (await SelectTableRecordsAsync<DbUserRecord>(UserTable, ct))
+            .Where(r => string.Equals(r.DatabaseId, databaseId, StringComparison.Ordinal))
+            .OrderBy(r => r.Id, StringComparer.Ordinal).ToList();
+        return new FeedResponse<CosmosUser> { Resources = records.Select(ToCosmosUser).ToList() };
+    }
+
+    public async Task<CosmosUser> ReplaceUserAsync(string databaseId, CosmosUser user, CancellationToken ct = default)
+    {
+        var key = MakeUserRecordKey(databaseId, user.Id);
+        var existing = await GetRequiredRecordAsync<DbUserRecord>(UserTable, key, "User", user.Id, ct);
+        var updated = new CosmosUser
+        {
+            Id = user.Id, DatabaseId = databaseId, Rid = existing.Rid,
+            Self = $"dbs/{databaseId}/users/{user.Id}/",
+            ETag = ETagGenerator.Generate(), Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        };
+        await UpsertRecordAsync(UserTable, key, ToRecord(updated), ct);
+        return updated;
+    }
+
+    public async Task DeleteUserAsync(string databaseId, string userId, CancellationToken ct = default)
+    {
+        var key = MakeUserRecordKey(databaseId, userId);
+        await EnsureRecordExistsAsync<DbUserRecord>(UserTable, key, "User", userId, ct);
+        var permissions = (await SelectTableRecordsAsync<DbPermissionRecord>(PermissionTable, ct))
+            .Where(p => string.Equals(p.DatabaseId, databaseId, StringComparison.Ordinal) && string.Equals(p.UserId, userId, StringComparison.Ordinal));
+        foreach (var p in permissions)
+            await DeleteRecordAsync(PermissionTable, MakePermissionRecordKey(databaseId, userId, p.Id), "Permission", p.Id, ct);
+        await DeleteRecordAsync(UserTable, key, "User", userId, ct);
+    }
+
+    // ─── Permission operations ──────────────────────────────────────
+
+    public async Task<CosmosPermission> CreatePermissionAsync(string databaseId, string userId, CosmosPermission permission, CancellationToken ct = default)
+    {
+        await EnsureRecordExistsAsync<DbUserRecord>(UserTable, MakeUserRecordKey(databaseId, userId), "User", userId, ct);
+        var key = MakePermissionRecordKey(databaseId, userId, permission.Id);
+        if (await SelectRecordAsync<DbPermissionRecord>(PermissionTable, key, ct) is not null)
+            throw CosmosEmulatorException.Conflict("Permission", permission.Id);
+
+        permission.DatabaseId = databaseId;
+        permission.UserId = userId;
+        permission.Self = $"dbs/{databaseId}/users/{userId}/permissions/{permission.Id}/";
+        permission.Token = GenerateResourceToken(permission);
+        await CreateRecordAsync(PermissionTable, key, ToRecord(permission), ct);
+        return permission;
+    }
+
+    public async Task<CosmosPermission> GetPermissionAsync(string databaseId, string userId, string permissionId, CancellationToken ct = default)
+    {
+        var record = await GetRequiredRecordAsync<DbPermissionRecord>(PermissionTable, MakePermissionRecordKey(databaseId, userId, permissionId), "Permission", permissionId, ct);
+        return ToCosmosPermission(record);
+    }
+
+    public async Task<FeedResponse<CosmosPermission>> ListPermissionsAsync(string databaseId, string userId, CancellationToken ct = default)
+    {
+        await EnsureRecordExistsAsync<DbUserRecord>(UserTable, MakeUserRecordKey(databaseId, userId), "User", userId, ct);
+        var records = (await SelectTableRecordsAsync<DbPermissionRecord>(PermissionTable, ct))
+            .Where(r => string.Equals(r.DatabaseId, databaseId, StringComparison.Ordinal) && string.Equals(r.UserId, userId, StringComparison.Ordinal))
+            .OrderBy(r => r.Id, StringComparer.Ordinal).ToList();
+        return new FeedResponse<CosmosPermission> { Resources = records.Select(ToCosmosPermission).ToList() };
+    }
+
+    public async Task<CosmosPermission> ReplacePermissionAsync(string databaseId, string userId, CosmosPermission permission, CancellationToken ct = default)
+    {
+        var key = MakePermissionRecordKey(databaseId, userId, permission.Id);
+        var existing = await GetRequiredRecordAsync<DbPermissionRecord>(PermissionTable, key, "Permission", permission.Id, ct);
+        var updated = new CosmosPermission
+        {
+            Id = permission.Id, DatabaseId = databaseId, UserId = userId,
+            Rid = existing.Rid, Self = $"dbs/{databaseId}/users/{userId}/permissions/{permission.Id}/",
+            ETag = ETagGenerator.Generate(), Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            PermissionMode = permission.PermissionMode, Resource = permission.Resource,
+            Token = GenerateResourceToken(permission)
+        };
+        await UpsertRecordAsync(PermissionTable, key, ToRecord(updated), ct);
+        return updated;
+    }
+
+    public async Task DeletePermissionAsync(string databaseId, string userId, string permissionId, CancellationToken ct = default)
+    {
+        await DeleteRecordAsync(PermissionTable, MakePermissionRecordKey(databaseId, userId, permissionId), "Permission", permissionId, ct);
+    }
+
+    // ─── Offer operations ───────────────────────────────────────────
+
+    public async Task<CosmosOffer> GetOfferAsync(string offerId, CancellationToken ct = default)
+    {
+        var record = await GetRequiredRecordAsync<DbOfferRecord>(OfferTable, MakeOfferRecordKey(offerId), "Offer", offerId, ct);
+        return ToCosmosOffer(record);
+    }
+
+    public async Task<FeedResponse<CosmosOffer>> ListOffersAsync(CancellationToken ct = default)
+    {
+        var records = (await SelectTableRecordsAsync<DbOfferRecord>(OfferTable, ct))
+            .OrderBy(r => r.Id, StringComparer.Ordinal).ToList();
+        return new FeedResponse<CosmosOffer> { Resources = records.Select(ToCosmosOffer).ToList() };
+    }
+
+    public async Task<CosmosOffer> ReplaceOfferAsync(CosmosOffer offer, CancellationToken ct = default)
+    {
+        var key = MakeOfferRecordKey(offer.Id);
+        var existing = await GetRequiredRecordAsync<DbOfferRecord>(OfferTable, key, "Offer", offer.Id, ct);
+        existing.OfferThroughput = offer.Content.OfferThroughput;
+        existing.ETag = ETagGenerator.Generate();
+        existing.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        await UpsertRecordAsync(OfferTable, key, existing, ct);
+        return ToCosmosOffer(existing);
+    }
+
+    internal async Task CreateOfferForContainerAsync(CosmosContainer container, CancellationToken ct)
+    {
+        var offer = new CosmosOffer
+        {
+            Content = new OfferContent { OfferThroughput = container.MaxThroughput },
+            Resource = container.Self,
+            OfferResourceId = container.Rid
+        };
+        offer.Rid = offer.Id;
+        await CreateRecordAsync(OfferTable, MakeOfferRecordKey(offer.Id), ToRecord(offer), ct);
+    }
+
+    internal async Task DeleteOfferForContainerAsync(string containerRid, CancellationToken ct)
+    {
+        var all = await SelectTableRecordsAsync<DbOfferRecord>(OfferTable, ct);
+        foreach (var o in all.Where(o => string.Equals(o.OfferResourceId, containerRid, StringComparison.Ordinal)))
+            await DeleteRecordAsync(OfferTable, MakeOfferRecordKey(o.Id), "Offer", o.Id, ct);
     }
 
     private async Task<long> GetNextLsnAsync(CancellationToken ct)
@@ -884,5 +1126,64 @@ public class SurrealDbDocumentStore : IDocumentStore
         _ when node.GetValueKind() == JsonValueKind.True => true,
         _ when node.GetValueKind() == JsonValueKind.False => false,
         _ => node.ToJsonString()
+    };
+
+    // ─── User record helpers ────────────────────────────────────────
+
+    private static string MakeUserRecordKey(string dbId, string userId) =>
+        $"{EncodeRecordKey(dbId)}:{EncodeRecordKey(userId)}";
+
+    private static DbUserRecord ToRecord(CosmosUser user) => new()
+    {
+        Id = user.Id, DatabaseId = user.DatabaseId, Rid = user.Rid, ETag = user.ETag, Timestamp = user.Timestamp
+    };
+
+    private static CosmosUser ToCosmosUser(DbUserRecord r) => new()
+    {
+        Id = r.Id, DatabaseId = r.DatabaseId, Rid = r.Rid, ETag = r.ETag, Timestamp = r.Timestamp,
+        Self = $"dbs/{r.DatabaseId}/users/{r.Id}/"
+    };
+
+    // ─── Permission record helpers ──────────────────────────────────
+
+    private static string MakePermissionRecordKey(string dbId, string userId, string permissionId) =>
+        $"{EncodeRecordKey(dbId)}:{EncodeRecordKey(userId)}:{EncodeRecordKey(permissionId)}";
+
+    private static DbPermissionRecord ToRecord(CosmosPermission p) => new()
+    {
+        Id = p.Id, DatabaseId = p.DatabaseId, UserId = p.UserId, Rid = p.Rid, ETag = p.ETag,
+        Timestamp = p.Timestamp, PermissionMode = (int)p.PermissionMode, Resource = p.Resource, Token = p.Token
+    };
+
+    private static CosmosPermission ToCosmosPermission(DbPermissionRecord r) => new()
+    {
+        Id = r.Id, DatabaseId = r.DatabaseId, UserId = r.UserId, Rid = r.Rid, ETag = r.ETag,
+        Timestamp = r.Timestamp, Self = $"dbs/{r.DatabaseId}/users/{r.UserId}/permissions/{r.Id}/",
+        PermissionMode = (PermissionMode)r.PermissionMode, Resource = r.Resource, Token = r.Token
+    };
+
+    private static string GenerateResourceToken(CosmosPermission permission)
+    {
+        var payload = $"{permission.Resource}:{permission.PermissionMode}:{permission.Id}:{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}";
+        using var hmac = new System.Security.Cryptography.HMACSHA256(Encoding.UTF8.GetBytes(permission.Rid));
+        var sig = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload)));
+        return $"type=resource&ver=1.0&sig={sig};";
+    }
+
+    // ─── Offer record helpers ───────────────────────────────────────
+
+    private static string MakeOfferRecordKey(string offerId) => EncodeRecordKey(offerId);
+
+    private static DbOfferRecord ToRecord(CosmosOffer o) => new()
+    {
+        Id = o.Id, Rid = o.Rid, ETag = o.ETag, Timestamp = o.Timestamp,
+        OfferThroughput = o.Content.OfferThroughput, Resource = o.Resource, OfferResourceId = o.OfferResourceId
+    };
+
+    private static CosmosOffer ToCosmosOffer(DbOfferRecord r) => new()
+    {
+        Id = r.Id, Rid = r.Rid, ETag = r.ETag, Timestamp = r.Timestamp,
+        Content = new OfferContent { OfferThroughput = r.OfferThroughput },
+        Resource = r.Resource, OfferResourceId = r.OfferResourceId
     };
 }

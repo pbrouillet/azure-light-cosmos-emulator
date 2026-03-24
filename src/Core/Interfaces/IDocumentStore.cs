@@ -34,4 +34,23 @@ public interface IDocumentStore
     // Bulk operations
     Task<FeedResponse<CosmosDocument>> ReadManyDocumentsAsync(string databaseId, string containerId, IEnumerable<(string id, PartitionKeyValue pk)> items, CancellationToken ct = default);
     Task<FeedResponse<CosmosDocument>> ListDocumentsAsync(string databaseId, string containerId, CancellationToken ct = default);
+
+    // User operations
+    Task<CosmosUser> CreateUserAsync(string databaseId, string userId, CancellationToken ct = default);
+    Task<CosmosUser> GetUserAsync(string databaseId, string userId, CancellationToken ct = default);
+    Task<FeedResponse<CosmosUser>> ListUsersAsync(string databaseId, CancellationToken ct = default);
+    Task<CosmosUser> ReplaceUserAsync(string databaseId, CosmosUser user, CancellationToken ct = default);
+    Task DeleteUserAsync(string databaseId, string userId, CancellationToken ct = default);
+
+    // Permission operations
+    Task<CosmosPermission> CreatePermissionAsync(string databaseId, string userId, CosmosPermission permission, CancellationToken ct = default);
+    Task<CosmosPermission> GetPermissionAsync(string databaseId, string userId, string permissionId, CancellationToken ct = default);
+    Task<FeedResponse<CosmosPermission>> ListPermissionsAsync(string databaseId, string userId, CancellationToken ct = default);
+    Task<CosmosPermission> ReplacePermissionAsync(string databaseId, string userId, CosmosPermission permission, CancellationToken ct = default);
+    Task DeletePermissionAsync(string databaseId, string userId, string permissionId, CancellationToken ct = default);
+
+    // Offer operations
+    Task<CosmosOffer> GetOfferAsync(string offerId, CancellationToken ct = default);
+    Task<FeedResponse<CosmosOffer>> ListOffersAsync(CancellationToken ct = default);
+    Task<CosmosOffer> ReplaceOfferAsync(CosmosOffer offer, CancellationToken ct = default);
 }
