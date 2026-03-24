@@ -107,7 +107,7 @@ public sealed class TestServerFixture : IAsyncDisposable
             .AddApplicationPart(typeof(DatabasesController).Assembly);
 
         builder.Services.AddSingleton(_connectionManager);
-        builder.Services.AddSingleton<IChangeFeedProvider, InMemoryChangeFeedProvider>();
+        builder.Services.AddSingleton<IChangeFeedProvider, SurrealDbChangeFeedProvider>();
         builder.Services.AddSingleton<SurrealDbDocumentStore>();
         builder.Services.AddSingleton<IDocumentStore>(sp => sp.GetRequiredService<SurrealDbDocumentStore>());
         builder.Services.AddSingleton<EmulatorRuntimeState>();

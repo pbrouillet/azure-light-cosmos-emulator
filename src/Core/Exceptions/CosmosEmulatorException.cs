@@ -56,4 +56,7 @@ public class CosmosEmulatorException : Exception
 
     public static CosmosEmulatorException InternalServerError(string message) =>
         new(HttpStatusCode.InternalServerError, "InternalServerError", message);
+
+    public static CosmosEmulatorException Gone(string message) =>
+        new(HttpStatusCode.Gone, "Gone", message);
 }

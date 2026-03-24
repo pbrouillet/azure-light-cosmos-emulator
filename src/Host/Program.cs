@@ -103,7 +103,7 @@ public static class Program
             manager.InitializeAsync().GetAwaiter().GetResult();
             return manager;
         });
-        builder.Services.AddSingleton<IChangeFeedProvider, InMemoryChangeFeedProvider>();
+        builder.Services.AddSingleton<IChangeFeedProvider, SurrealDbChangeFeedProvider>();
         builder.Services.AddSingleton<IDocumentStore, SurrealDbDocumentStore>();
         builder.Services.AddSingleton<EmulatorRuntimeState>();
         builder.Services.AddSingleton<EmulatorAdminSettingsStore>();

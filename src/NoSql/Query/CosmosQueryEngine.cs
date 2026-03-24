@@ -65,7 +65,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
             foreach (var joinedRow in ApplyJoins(seedRow, plan.Joins, parameters))
             {
-                if (plan.Where is null || EvaluateBooleanExpression(joinedRow, plan.Where, parameters))
+                if (plan.Where is null || EvaluateBooleanExpression(joinedRow, plan.Where, parameters, new SubqueryContext(databaseId, containerId)))
                 {
                     matchingRows.Add(joinedRow);
                 }
@@ -583,22 +583,24 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return projected;
     }
 
-    private static bool EvaluateBooleanExpression(QueryRow row, BooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
+    private bool EvaluateBooleanExpression(QueryRow row, BooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters, SubqueryContext? subqueryContext = null)
     {
         return expression switch
         {
             BinaryBooleanExpression binary => binary.Operator switch
             {
-                BooleanOperator.And => EvaluateBooleanExpression(row, binary.Left, parameters)
-                    && EvaluateBooleanExpression(row, binary.Right, parameters),
-                BooleanOperator.Or => EvaluateBooleanExpression(row, binary.Left, parameters)
-                    || EvaluateBooleanExpression(row, binary.Right, parameters),
+                BooleanOperator.And => EvaluateBooleanExpression(row, binary.Left, parameters, subqueryContext)
+                    && EvaluateBooleanExpression(row, binary.Right, parameters, subqueryContext),
+                BooleanOperator.Or => EvaluateBooleanExpression(row, binary.Left, parameters, subqueryContext)
+                    || EvaluateBooleanExpression(row, binary.Right, parameters, subqueryContext),
                 _ => throw CosmosEmulatorException.BadRequest("Unsupported boolean operator.")
             },
-            NotBooleanExpression unary => !EvaluateBooleanExpression(row, unary.Expression, parameters),
+            NotBooleanExpression unary => !EvaluateBooleanExpression(row, unary.Expression, parameters, subqueryContext),
             ComparisonBooleanExpression comparison => EvaluateComparison(row, comparison, parameters),
             InBooleanExpression inExpression => EvaluateIn(row, inExpression, parameters),
             LikeBooleanExpression likeExpr => EvaluateLike(row, likeExpr, parameters),
+            SubqueryInBooleanExpression subqueryIn => EvaluateSubqueryIn(row, subqueryIn, parameters, subqueryContext!),
+            ExistsBooleanExpression exists => EvaluateExists(exists, parameters, subqueryContext!),
             ScalarBooleanExpression scalar => ToBoolean(EvaluateScalarExpression(row, scalar.Expression, parameters)),
             _ => throw CosmosEmulatorException.BadRequest("Unsupported WHERE clause expression.")
         };
@@ -640,6 +642,36 @@ public sealed class CosmosQueryEngine : IQueryEngine
         });
 
         return expression.Negated ? !found : found;
+    }
+
+    private bool EvaluateSubqueryIn(QueryRow row, SubqueryInBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters, SubqueryContext context)
+    {
+        var left = EvaluateScalarExpression(row, expression.Left, parameters);
+        if (ReferenceEquals(left, UndefinedValue))
+        {
+            return false;
+        }
+
+        var result = ExecuteQueryAsync(context.DatabaseId, context.ContainerId, expression.InnerQuery, parameters)
+            .GetAwaiter().GetResult();
+
+        var found = result.Resources.Any(obj =>
+        {
+            // SELECT VALUE queries produce {"$1": value}; extract the scalar value
+            var val = obj.Count == 1 && obj.ContainsKey("$1")
+                ? NormalizeRuntimeValue(obj["$1"])
+                : (object)obj;
+            return !ReferenceEquals(val, UndefinedValue) && AreEqual(left, val);
+        });
+
+        return expression.Negated ? !found : found;
+    }
+
+    private bool EvaluateExists(ExistsBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters, SubqueryContext context)
+    {
+        var result = ExecuteQueryAsync(context.DatabaseId, context.ContainerId, expression.InnerQuery, parameters)
+            .GetAwaiter().GetResult();
+        return result.Resources.Count > 0;
     }
 
     private static bool EvaluateLike(QueryRow row, LikeBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
@@ -1703,6 +1735,14 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         private BooleanExpression ParsePredicate()
         {
+            if (MatchKeyword("EXISTS"))
+            {
+                Expect(TokenType.OpenParen, "(");
+                var innerQuery = CollectInnerQueryText();
+                Expect(TokenType.CloseParen, ")");
+                return new ExistsBooleanExpression(innerQuery);
+            }
+
             if (Current.Type == TokenType.OpenParen)
             {
                 _index++;
@@ -1719,12 +1759,12 @@ public sealed class CosmosQueryEngine : IQueryEngine
                     throw CosmosEmulatorException.BadRequest("Unsupported WHERE clause expression.");
                 }
 
-                return new InBooleanExpression(left, ParseInList(), true);
+                return ParseInOrSubqueryIn(left, true);
             }
 
             if (MatchKeyword("IN"))
             {
-                return new InBooleanExpression(left, ParseInList(), false);
+                return ParseInOrSubqueryIn(left, false);
             }
 
             if (MatchKeyword("BETWEEN"))
@@ -1755,9 +1795,18 @@ public sealed class CosmosQueryEngine : IQueryEngine
             return new ScalarBooleanExpression(left);
         }
 
-        private IReadOnlyList<ScalarExpression> ParseInList()
+        private BooleanExpression ParseInOrSubqueryIn(ScalarExpression left, bool negated)
         {
             Expect(TokenType.OpenParen, "(");
+
+            if (Current.Type == TokenType.Identifier
+                && string.Equals(Current.Text, "SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                var innerQuery = CollectInnerQueryText();
+                Expect(TokenType.CloseParen, ")");
+                return new SubqueryInBooleanExpression(left, innerQuery, negated);
+            }
+
             var values = new List<ScalarExpression>();
             if (Current.Type != TokenType.CloseParen)
             {
@@ -1769,7 +1818,38 @@ public sealed class CosmosQueryEngine : IQueryEngine
             }
 
             Expect(TokenType.CloseParen, ")");
-            return values;
+            return new InBooleanExpression(left, values, negated);
+        }
+
+        private string CollectInnerQueryText()
+        {
+            var depth = 0;
+            var parts = new List<string>();
+            while (Current.Type != TokenType.End)
+            {
+                if (Current.Type == TokenType.OpenParen)
+                {
+                    depth++;
+                }
+                else if (Current.Type == TokenType.CloseParen)
+                {
+                    if (depth == 0)
+                    {
+                        break;
+                    }
+
+                    depth--;
+                }
+
+                // Reconstruct token text, restoring quotes around string literals
+                var text = Current.Type == TokenType.String
+                    ? "'" + Current.Text.Replace("'", "''") + "'"
+                    : Current.Text;
+                parts.Add(text);
+                _index++;
+            }
+
+            return string.Join(" ", parts);
         }
 
         private ScalarExpression ParseScalarPrimary()
@@ -2108,6 +2188,12 @@ public sealed class CosmosQueryEngine : IQueryEngine
     private sealed record LikeBooleanExpression(ScalarExpression Left, ScalarExpression Pattern) : BooleanExpression;
 
     private sealed record ScalarBooleanExpression(ScalarExpression Expression) : BooleanExpression;
+
+    private sealed record SubqueryInBooleanExpression(ScalarExpression Left, string InnerQuery, bool Negated) : BooleanExpression;
+
+    private sealed record ExistsBooleanExpression(string InnerQuery) : BooleanExpression;
+
+    private sealed record SubqueryContext(string DatabaseId, string ContainerId);
 
     private enum BooleanOperator
     {
