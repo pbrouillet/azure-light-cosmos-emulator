@@ -1,6 +1,8 @@
-import { useCallback, useImperativeHandle, useMemo, useState } from 'react'
+import { useCallback, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import type { Ref } from 'react'
 import Editor from '@monaco-editor/react'
+import type { Monaco } from '@monaco-editor/react'
+import type { IDisposable } from 'monaco-editor'
 import { useMutation } from '@tanstack/react-query'
 import {
   Badge,
@@ -208,12 +210,95 @@ const useStyles = makeStyles({
   },
 })
 
+function registerCosmosSqlCompletionProvider(monaco: Monaco): IDisposable {
+  return monaco.languages.registerCompletionItemProvider('sql', {
+    triggerCharacters: ['.', ' '],
+    provideCompletionItems(model, position) {
+      const word = model.getWordUntilPosition(position)
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: word.startColumn,
+        endColumn: word.endColumn,
+      }
+
+      const lineContent = model.getLineContent(position.lineNumber)
+      const textBeforeCursor = lineContent.substring(0, position.column - 1)
+
+      // When the user types "c.", suggest system properties
+      if (/\bc\.\s*$/.test(textBeforeCursor)) {
+        const properties = ['id', '_ts', '_etag', '_rid', '_self', '_attachments']
+        return {
+          suggestions: properties.map((prop) => ({
+            label: prop,
+            kind: monaco.languages.CompletionItemKind.Property,
+            insertText: prop,
+            range,
+            detail: 'System property',
+          })),
+        }
+      }
+
+      const keywords = [
+        'SELECT', 'DISTINCT', 'VALUE', 'TOP', 'FROM', 'WHERE', 'JOIN', 'IN',
+        'AND', 'OR', 'NOT', 'BETWEEN', 'LIKE', 'ORDER BY', 'GROUP BY',
+        'OFFSET', 'LIMIT', 'ASC', 'DESC', 'AS', 'EXISTS',
+      ]
+
+      const functions = [
+        'CONTAINS', 'STARTSWITH', 'ENDSWITH', 'UPPER', 'LOWER', 'CONCAT',
+        'LENGTH', 'SUBSTRING', 'REPLACE', 'TRIM', 'LEFT', 'RIGHT', 'REVERSE',
+        'LTRIM', 'RTRIM', 'REPLICATE', 'ARRAY_CONTAINS', 'ARRAY_LENGTH',
+        'ARRAY_CONCAT', 'ARRAY_SLICE', 'IS_STRING', 'IS_NUMBER', 'IS_BOOL',
+        'IS_NULL', 'IS_ARRAY', 'IS_OBJECT', 'IS_PRIMITIVE', 'IS_DEFINED',
+        'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ABS', 'CEILING', 'FLOOR',
+        'ROUND', 'POWER', 'SQRT', 'LOG', 'LOG10', 'EXP', 'SIN', 'COS',
+        'TAN', 'PI', 'GETCURRENTDATETIME', 'GETCURRENTTIMESTAMP',
+        'DATETIMEADD', 'DATETIMEDIFF', 'REGEXMATCH',
+      ]
+
+      const suggestions = [
+        ...keywords.map((kw) => ({
+          label: kw,
+          kind: monaco.languages.CompletionItemKind.Keyword,
+          insertText: kw,
+          range,
+          detail: 'Keyword',
+        })),
+        ...functions.map((fn) => ({
+          label: fn,
+          kind: monaco.languages.CompletionItemKind.Function,
+          insertText: fn + '($0)',
+          insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          range,
+          detail: 'Built-in function',
+        })),
+        {
+          label: 'c',
+          kind: monaco.languages.CompletionItemKind.Variable,
+          insertText: 'c',
+          range,
+          detail: 'Default collection alias',
+        },
+      ]
+
+      return { suggestions }
+    },
+  })
+}
+
 export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
   const styles = useStyles()
   const { isDark } = useTheme()
   const [query, setQuery] = useState('SELECT * FROM c')
   const [parametersJson, setParametersJson] = useState('[]')
   const [isExplainOpen, setIsExplainOpen] = useState(false)
+  const completionDisposable = useRef<IDisposable | null>(null)
+
+  const handleEditorBeforeMount = useCallback((monaco: Monaco) => {
+    completionDisposable.current?.dispose()
+    completionDisposable.current = registerCosmosSqlCompletionProvider(monaco)
+  }, [])
 
   const queryMutation = useMutation<FeedResponse<CosmosDocument>, Error>({
     mutationFn: async () => {
@@ -295,6 +380,7 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
             </div>
             <div className={styles.editorFrame}>
               <Editor
+                beforeMount={handleEditorBeforeMount}
                 defaultLanguage="sql"
                 height="260px"
                 onChange={(value) => setQuery(value ?? '')}

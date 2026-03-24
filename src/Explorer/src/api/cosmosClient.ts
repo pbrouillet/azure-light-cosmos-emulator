@@ -19,6 +19,7 @@ const cosmosHeaders = {
   enableCrossPartition: 'x-ms-documentdb-query-enablecrosspartition',
   ifMatch: 'if-match',
   isQuery: 'x-ms-documentdb-isquery',
+  isUpsert: 'x-ms-documentdb-is-upsert',
   itemCount: 'x-ms-item-count',
   maxItemCount: 'x-ms-max-item-count',
   partitionKey: 'x-ms-documentdb-partitionkey',
@@ -125,6 +126,34 @@ export class CosmosClient {
     return this.executeQuery(dbId, collId, 'SELECT * FROM c')
   }
 
+  async listDocumentsPaged(
+    dbId: string,
+    collId: string,
+    maxItems: number,
+    continuationToken?: string | null,
+  ): Promise<FeedResponse<CosmosDocument>> {
+    const headers: Record<string, string> = {
+      [cosmosHeaders.enableCrossPartition]: 'true',
+      [cosmosHeaders.isQuery]: 'true',
+      [cosmosHeaders.maxItemCount]: String(maxItems),
+    }
+
+    if (continuationToken) {
+      headers[cosmosHeaders.continuation] = continuationToken
+    }
+
+    const { body, headers: responseHeaders } = await this.request<Record<string, unknown>>(
+      `/dbs/${encodeURIComponent(dbId)}/colls/${encodeURIComponent(collId)}/docs`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ query: 'SELECT * FROM c', parameters: [] }),
+      },
+    )
+
+    return this.toFeed<CosmosDocument>(body, 'Documents', responseHeaders)
+  }
+
   async getDocument(
     dbId: string,
     collId: string,
@@ -152,6 +181,25 @@ export class CosmosClient {
       `/dbs/${encodeURIComponent(dbId)}/colls/${encodeURIComponent(collId)}/docs`,
       {
         method: 'POST',
+        body: JSON.stringify(this.stripSystemProperties(doc)),
+      },
+    )
+
+    return body
+  }
+
+  async upsertDocument(
+    dbId: string,
+    collId: string,
+    doc: CosmosDocument,
+  ): Promise<CosmosDocument> {
+    const { body } = await this.request<CosmosDocument>(
+      `/dbs/${encodeURIComponent(dbId)}/colls/${encodeURIComponent(collId)}/docs`,
+      {
+        method: 'POST',
+        headers: {
+          [cosmosHeaders.isUpsert]: 'true',
+        },
         body: JSON.stringify(this.stripSystemProperties(doc)),
       },
     )
