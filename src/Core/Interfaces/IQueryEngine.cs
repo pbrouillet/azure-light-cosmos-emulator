@@ -43,4 +43,7 @@ public class QueryOptions
 
     /// <summary>Partition key for single-partition queries.</summary>
     public PartitionKeyValue? PartitionKey { get; set; }
+
+    /// <summary>Enable index scan for queries on excluded paths or IndexingMode.None.</summary>
+    public bool EnableScan { get; set; }
 }

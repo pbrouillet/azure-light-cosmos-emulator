@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
@@ -16,6 +17,12 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 [Route("dbs/{dbId}/colls")]
 public class ContainersController : CosmosControllerBase
 {
+    private static readonly JsonSerializerOptions IndexingPolicySerializerOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
+    };
+
     private readonly IDocumentStore _store;
 
     public ContainersController(IDocumentStore store, CosmosResponseHeaderService responseHeaders)
@@ -47,7 +54,7 @@ public class ContainersController : CosmosControllerBase
 
         // Parse optional properties
         if (body["indexingPolicy"] is JsonObject indexNode)
-            container.IndexingPolicy = JsonSerializer.Deserialize<IndexingPolicy>(indexNode) ?? new IndexingPolicy();
+            container.IndexingPolicy = JsonSerializer.Deserialize<IndexingPolicy>(indexNode, IndexingPolicySerializerOptions) ?? new IndexingPolicy();
 
         if (body["defaultTtl"]?.GetValue<int>() is int ttl)
             container.DefaultTimeToLive = ttl;
@@ -122,7 +129,7 @@ public class ContainersController : CosmosControllerBase
             var existing = await _store.GetContainerAsync(dbId, collId, ct);
 
             if (body["indexingPolicy"] is JsonObject indexNode)
-                existing.IndexingPolicy = JsonSerializer.Deserialize<IndexingPolicy>(indexNode) ?? existing.IndexingPolicy;
+                existing.IndexingPolicy = JsonSerializer.Deserialize<IndexingPolicy>(indexNode, IndexingPolicySerializerOptions) ?? existing.IndexingPolicy;
 
             if (body["defaultTtl"]?.GetValue<int>() is int ttl)
                 existing.DefaultTimeToLive = ttl;

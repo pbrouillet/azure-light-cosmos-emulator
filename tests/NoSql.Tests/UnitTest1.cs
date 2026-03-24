@@ -215,7 +215,7 @@ public class UnitTest1
             }
         }).GetAwaiter().GetResult();
 
-        return (store, new JintProgrammabilityEngine(store, new CosmosQueryEngine(store), connectionManager));
+        return (store, new JintProgrammabilityEngine(store, new CosmosQueryEngine(store, new IndexValidationService()), connectionManager));
     }
 
     private static IDictionary<string, object?> AsDictionary(object? value)

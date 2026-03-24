@@ -26,4 +26,7 @@ public class FeedResponse<T>
 
     /// <summary>Session token.</summary>
     public string? SessionToken { get; set; }
+
+    /// <summary>RU cost multiplier applied when a scan was required.</summary>
+    public double RuMultiplier { get; set; } = 1.0;
 }

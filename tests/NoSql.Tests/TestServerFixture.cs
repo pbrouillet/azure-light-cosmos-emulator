@@ -114,6 +114,7 @@ public sealed class TestServerFixture : IAsyncDisposable
         builder.Services.AddSingleton<IEmulatorInfoService, FakeEmulatorInfoService>();
         builder.Services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
         builder.Services.AddSingleton<QueryExplainService>();
+        builder.Services.AddSingleton<IndexValidationService>();
         builder.Services.AddSingleton<IAuthProvider>(_ => new MasterKeyAuthProvider(KnownMasterKey));
         builder.Services.AddSingleton<IProgrammabilityEngine, JintProgrammabilityEngine>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ConsistencyLevel.Session));

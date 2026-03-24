@@ -279,13 +279,15 @@ public class DocumentsController : CosmosControllerBase
         var enableCrossPartition = Request.Headers[CosmosHeaders.EnableCrossPartition].FirstOrDefault();
         var maxItemCount = Request.Headers[CosmosHeaders.MaxItemCount].FirstOrDefault();
         var continuation = Request.Headers[CosmosHeaders.Continuation].FirstOrDefault();
+        var enableScan = Request.Headers[CosmosHeaders.EnableScan].FirstOrDefault();
 
         var options = new QueryOptions
         {
             PartitionKey = !string.IsNullOrEmpty(pkHeader) ? ParsePartitionKey(pkHeader) : null,
             EnableCrossPartitionQuery = string.Equals(enableCrossPartition, "true", StringComparison.OrdinalIgnoreCase),
             MaxItemCount = int.TryParse(maxItemCount, out var mic) ? mic : null,
-            ContinuationToken = continuation
+            ContinuationToken = continuation,
+            EnableScan = string.Equals(enableScan, "true", StringComparison.OrdinalIgnoreCase)
         };
 
         try
@@ -298,7 +300,7 @@ public class DocumentsController : CosmosControllerBase
                 StringComparison.OrdinalIgnoreCase);
             await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
             {
-                RequestCharge = RuCostCalculator.Query(result.Count, totalSize, isCrossPartition),
+                RequestCharge = RuCostCalculator.Query(result.Count, totalSize, isCrossPartition, scanMultiplier: result.RuMultiplier),
                 DatabaseId = dbId,
                 ContainerId = collId
             }, ct);

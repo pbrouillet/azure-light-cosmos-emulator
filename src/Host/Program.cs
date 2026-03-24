@@ -112,6 +112,7 @@ public static class Program
         builder.Services.AddSingleton<ThroughputManager>();
         builder.Services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
         builder.Services.AddSingleton<QueryExplainService>();
+        builder.Services.AddSingleton<IndexValidationService>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
         builder.Services.AddSingleton<IAuthProvider, EmulatorAuthProvider>();
         builder.Services.AddSingleton<IProgrammabilityEngine, Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.JintProgrammabilityEngine>();

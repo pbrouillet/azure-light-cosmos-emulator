@@ -158,6 +158,6 @@ public class CosmosQueryEngineTests
             }
         }).GetAwaiter().GetResult();
 
-        return (store, new CosmosQueryEngine(store));
+        return (store, new CosmosQueryEngine(store, new IndexValidationService()));
     }
 }

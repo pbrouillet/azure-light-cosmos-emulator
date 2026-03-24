@@ -204,6 +204,6 @@ public class QueryEngineAdvancedTests
             }
         }).GetAwaiter().GetResult();
 
-        return (store, new CosmosQueryEngine(store));
+        return (store, new CosmosQueryEngine(store, new IndexValidationService()));
     }
 }

@@ -16,10 +16,12 @@ public sealed class CosmosQueryEngine : IQueryEngine
     private static readonly object UndefinedValue = new();
 
     private readonly IDocumentStore _documentStore;
+    private readonly IndexValidationService _indexValidation;
 
-    public CosmosQueryEngine(IDocumentStore documentStore)
+    public CosmosQueryEngine(IDocumentStore documentStore, IndexValidationService indexValidation)
     {
         _documentStore = documentStore;
+        _indexValidation = indexValidation;
     }
 
     public async Task<FeedResponse<JsonObject>> ExecuteQueryAsync(
@@ -38,7 +40,19 @@ public sealed class CosmosQueryEngine : IQueryEngine
         ct.ThrowIfCancellationRequested();
 
         var plan = ParseQuery(query, parameters);
-        _ = await _documentStore.GetContainerAsync(databaseId, containerId, ct);
+        var container = await _documentStore.GetContainerAsync(databaseId, containerId, ct);
+
+        var filterPaths = ExtractFilterPaths(plan.Where);
+        var orderByPaths = ExtractOrderByPaths(plan.OrderBy);
+        var scanEnabled = options?.EnableScan ?? false;
+
+        var validationResult = _indexValidation.ValidateQuery(
+            container.IndexingPolicy, filterPaths, orderByPaths, scanEnabled);
+
+        if (!validationResult.IsAllowed)
+        {
+            throw CosmosEmulatorException.BadRequest(validationResult.ErrorMessage!);
+        }
 
         var allDocuments = await _documentStore.ListDocumentsAsync(databaseId, containerId, ct);
         var documents = allDocuments.Resources;
@@ -109,8 +123,84 @@ public sealed class CosmosQueryEngine : IQueryEngine
             Resources = page,
             ContinuationToken = nextIndex < projectedResults.Count
                 ? nextIndex.ToString(CultureInfo.InvariantCulture)
-                : null
+                : null,
+            RuMultiplier = validationResult.RuMultiplier
         };
+    }
+
+    private static List<string> ExtractFilterPaths(BooleanExpression? where)
+    {
+        var paths = new List<string>();
+        if (where is not null)
+        {
+            CollectFilterPaths(where, paths);
+        }
+
+        return paths;
+    }
+
+    private static void CollectFilterPaths(BooleanExpression expression, List<string> paths)
+    {
+        switch (expression)
+        {
+            case BinaryBooleanExpression binary:
+                CollectFilterPaths(binary.Left, paths);
+                CollectFilterPaths(binary.Right, paths);
+                break;
+            case NotBooleanExpression not:
+                CollectFilterPaths(not.Expression, paths);
+                break;
+            case ComparisonBooleanExpression comparison:
+                AddPathFromScalar(comparison.Left, paths);
+                AddPathFromScalar(comparison.Right, paths);
+                break;
+            case InBooleanExpression inExpr:
+                AddPathFromScalar(inExpr.Left, paths);
+                break;
+            case LikeBooleanExpression like:
+                AddPathFromScalar(like.Left, paths);
+                break;
+            case ScalarBooleanExpression scalar:
+                AddPathFromScalar(scalar.Expression, paths);
+                break;
+        }
+    }
+
+    private static void AddPathFromScalar(ScalarExpression expression, List<string> paths)
+    {
+        if (expression is PathExpression pathExpr)
+        {
+            var indexPath = IndexValidationService.ConvertToIndexPath(pathExpr.Path);
+            if (indexPath is not null)
+            {
+                paths.Add(indexPath);
+            }
+        }
+        else if (expression is FunctionCallExpression func)
+        {
+            foreach (var arg in func.Arguments)
+            {
+                AddPathFromScalar(arg, paths);
+            }
+        }
+    }
+
+    private static List<(string path, bool descending)> ExtractOrderByPaths(IReadOnlyList<OrderByClause> orderByClauses)
+    {
+        var paths = new List<(string path, bool descending)>();
+        foreach (var clause in orderByClauses)
+        {
+            if (clause.Expression is PathExpression pathExpr)
+            {
+                var indexPath = IndexValidationService.ConvertToIndexPath(pathExpr.Path);
+                if (indexPath is not null)
+                {
+                    paths.Add((indexPath, clause.Descending));
+                }
+            }
+        }
+
+        return paths;
     }
 
     private static QueryPlan ParseQuery(string query, IReadOnlyDictionary<string, object?>? parameters)
@@ -271,23 +361,31 @@ public sealed class CosmosQueryEngine : IQueryEngine
             .ToList();
     }
 
-    private static OrderByClause? ParseOrderBy(string? orderByClause)
+    private static IReadOnlyList<OrderByClause> ParseOrderBy(string? orderByClause)
     {
         if (string.IsNullOrWhiteSpace(orderByClause))
         {
-            return null;
+            return [];
         }
 
+        var clauses = new List<OrderByClause>();
         var parser = new ExpressionParser(orderByClause);
-        var expression = parser.ParseScalarExpression();
-        var descending = parser.MatchKeyword("DESC");
-        if (!descending)
+
+        do
         {
-            _ = parser.MatchKeyword("ASC");
+            var expression = parser.ParseScalarExpression();
+            var descending = parser.MatchKeyword("DESC");
+            if (!descending)
+            {
+                _ = parser.MatchKeyword("ASC");
+            }
+
+            clauses.Add(new OrderByClause(expression, descending));
         }
+        while (parser.TryConsumeComma());
 
         parser.ExpectEnd("ORDER BY");
-        return new OrderByClause(expression, descending);
+        return clauses;
     }
 
     private static (string FromAlias, IReadOnlyList<JoinClause> Joins) ParseFromClause(string fromClause)
@@ -406,7 +504,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             return rows;
         }
 
-        if (plan.OrderBy is null)
+        if (plan.OrderBy.Count == 0)
         {
             return rows
                 .OrderBy(row => row.Document?.Timestamp)
@@ -414,10 +512,20 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 .ToList();
         }
 
-        Func<QueryRow, object?> keySelector = row => EvaluateScalarExpression(row, plan.OrderBy.Expression, parameters);
-        var orderedRows = plan.OrderBy.Descending
-            ? rows.OrderByDescending(keySelector, QueryValueComparer.Instance)
-            : rows.OrderBy(keySelector, QueryValueComparer.Instance);
+        var first = plan.OrderBy[0];
+        Func<QueryRow, object?> firstKey = row => EvaluateScalarExpression(row, first.Expression, parameters);
+        IOrderedEnumerable<QueryRow> orderedRows = first.Descending
+            ? rows.OrderByDescending(firstKey, QueryValueComparer.Instance)
+            : rows.OrderBy(firstKey, QueryValueComparer.Instance);
+
+        for (var i = 1; i < plan.OrderBy.Count; i++)
+        {
+            var clause = plan.OrderBy[i];
+            Func<QueryRow, object?> key = row => EvaluateScalarExpression(row, clause.Expression, parameters);
+            orderedRows = clause.Descending
+                ? orderedRows.ThenByDescending(key, QueryValueComparer.Instance)
+                : orderedRows.ThenBy(key, QueryValueComparer.Instance);
+        }
 
         return orderedRows
             .ThenBy(row => row.Document?.Id, StringComparer.Ordinal)
@@ -482,25 +590,32 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
     private static List<JsonObject> ApplyProjectedOrdering(List<JsonObject> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
     {
-        if (plan.OrderBy is null || rows.Count == 0)
+        if (plan.OrderBy.Count == 0 || rows.Count == 0)
         {
             return rows;
         }
 
-        Func<JsonObject, object?> keySelector = row => EvaluateScalarExpression(
-            new QueryRow(
-                null,
-                new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
-                {
-                    [plan.FromAlias] = row
-                }),
-            plan.OrderBy.Expression,
-            parameters,
-            group: null);
+        QueryRow ToQueryRow(JsonObject row) => new(
+            null,
+            new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                [plan.FromAlias] = row
+            });
 
-        var ordered = plan.OrderBy.Descending
-            ? rows.OrderByDescending(keySelector, QueryValueComparer.Instance)
-            : rows.OrderBy(keySelector, QueryValueComparer.Instance);
+        var first = plan.OrderBy[0];
+        Func<JsonObject, object?> firstKey = row => EvaluateScalarExpression(ToQueryRow(row), first.Expression, parameters, group: null);
+        IOrderedEnumerable<JsonObject> ordered = first.Descending
+            ? rows.OrderByDescending(firstKey, QueryValueComparer.Instance)
+            : rows.OrderBy(firstKey, QueryValueComparer.Instance);
+
+        for (var i = 1; i < plan.OrderBy.Count; i++)
+        {
+            var clause = plan.OrderBy[i];
+            Func<JsonObject, object?> key = row => EvaluateScalarExpression(ToQueryRow(row), clause.Expression, parameters, group: null);
+            ordered = clause.Descending
+                ? ordered.ThenByDescending(key, QueryValueComparer.Instance)
+                : ordered.ThenBy(key, QueryValueComparer.Instance);
+        }
 
         return ordered.ToList();
     }
@@ -1977,6 +2092,8 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         private Token Current => _tokens[_index];
 
+        public bool TryConsumeComma() => TryConsume(TokenType.Comma);
+
         private static List<Token> Tokenize(string text)
         {
             var tokens = new List<Token>();
@@ -2139,7 +2256,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         Projection Projection,
         BooleanExpression? Where,
         IReadOnlyList<ScalarExpression> GroupBy,
-        OrderByClause? OrderBy,
+        IReadOnlyList<OrderByClause> OrderBy,
         int? Top,
         int? Offset,
         int? Limit,

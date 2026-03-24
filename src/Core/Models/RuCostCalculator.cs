@@ -29,12 +29,12 @@ public static class RuCostCalculator
     /// Query cost: base 2.5 RU + result cost.
     /// Cross-partition queries pay a multiplier per partition scanned.
     /// </summary>
-    public static double Query(int resultCount, int totalResultSizeBytes, bool isCrossPartition, int partitionCount = 1)
+    public static double Query(int resultCount, int totalResultSizeBytes, bool isCrossPartition, int partitionCount = 1, double scanMultiplier = 1.0)
     {
         var baseCost = 2.5;
         var resultCost = resultCount * 0.5 + Math.Ceiling(Math.Max(1, totalResultSizeBytes) / 1024.0);
         var multiplier = isCrossPartition ? Math.Max(2, partitionCount) : 1;
-        return Math.Round((baseCost + resultCost) * multiplier, 2);
+        return Math.Round((baseCost + resultCost) * multiplier * scanMultiplier, 2);
     }
 
     public static double ListDatabases() => 1.0;
