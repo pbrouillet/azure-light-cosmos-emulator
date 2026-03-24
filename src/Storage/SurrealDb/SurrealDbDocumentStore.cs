@@ -289,6 +289,8 @@ public class SurrealDbDocumentStore : IDocumentStore
         var id = document["id"]?.GetValue<string>()
                  ?? throw CosmosEmulatorException.BadRequest("Document must have an 'id' property.");
 
+        EnforceDocumentSizeLimit(document);
+
         var partitionKey = ExtractPartitionKey(document, container.PartitionKey);
         var documentKey = MakeDocumentRecordKey(databaseId, containerId, id, partitionKey);
         if (await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct) is not null)
@@ -327,6 +329,8 @@ public class SurrealDbDocumentStore : IDocumentStore
 
     public async Task<CosmosDocument> ReplaceDocumentAsync(string databaseId, string containerId, string documentId, JsonObject document, string? ifMatch = null, CancellationToken ct = default)
     {
+        EnforceDocumentSizeLimit(document);
+
         var container = await GetContainerAsync(databaseId, containerId, ct);
         var partitionKey = ExtractPartitionKey(document, container.PartitionKey);
         var documentKey = MakeDocumentRecordKey(databaseId, containerId, documentId, partitionKey);
@@ -682,6 +686,18 @@ public class SurrealDbDocumentStore : IDocumentStore
         }
 
         return document["ttl"]?.GetValue<int>();
+    }
+
+    private const int MaxDocumentSizeBytes = 2 * 1024 * 1024; // 2 MB
+
+    private static void EnforceDocumentSizeLimit(JsonObject document)
+    {
+        var size = document.ToJsonString().Length;
+        if (size > MaxDocumentSizeBytes)
+        {
+            throw CosmosEmulatorException.EntityTooLarge(
+                $"The document size ({size} bytes) exceeds the maximum allowed size ({MaxDocumentSizeBytes} bytes).");
+        }
     }
 
     private static object? ConvertJsonNodeToValue(JsonNode? node) => node switch

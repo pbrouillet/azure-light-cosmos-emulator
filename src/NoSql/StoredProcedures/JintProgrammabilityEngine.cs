@@ -99,6 +99,7 @@ public class JintProgrammabilityEngine : IProgrammabilityEngine
     private const string StoredProcedureTable = "cosmos_sprocs";
     private const string TriggerTable = "cosmos_triggers";
     private const string UdfTable = "cosmos_udfs";
+    private static readonly TimeSpan SprocTimeout = TimeSpan.FromSeconds(5);
 
     private static readonly IReadOnlyDictionary<string, object?> EmptyParameters = new Dictionary<string, object?>();
 
@@ -178,7 +179,7 @@ public class JintProgrammabilityEngine : IProgrammabilityEngine
     public async Task<object?> ExecuteStoredProcedureAsync(string databaseId, string containerId, string sprocId, object?[] args, PartitionKeyValue partitionKey, CancellationToken ct = default)
     {
         var sproc = await GetStoredProcedureAsync(databaseId, containerId, sprocId, ct);
-        var engine = new Engine();
+        var engine = new Engine(options => options.TimeoutInterval(SprocTimeout));
         var context = new CosmosJsContext(_store, _queryEngine, databaseId, containerId, partitionKey, ct);
         context.Bind(engine);
 
@@ -193,6 +194,11 @@ public class JintProgrammabilityEngine : IProgrammabilityEngine
         catch (CosmosEmulatorException)
         {
             throw;
+        }
+        catch (TimeoutException)
+        {
+            throw CosmosEmulatorException.RequestTimeout(
+                $"Stored procedure '{sprocId}' execution exceeded the maximum allowed time of {SprocTimeout.TotalSeconds} seconds.");
         }
         catch (Exception ex) when (IsJintException(ex))
         {

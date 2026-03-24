@@ -211,6 +211,11 @@ public class ContainersController : CosmosControllerBase
         _self = c.Self,
         _etag = c.ETag,
         _ts = c.Timestamp,
+        _docs = "docs/",
+        _sprocs = "sprocs/",
+        _triggers = "triggers/",
+        _udfs = "udfs/",
+        _conflicts = "conflicts/",
         partitionKey = new
         {
             paths = c.PartitionKey.Paths,

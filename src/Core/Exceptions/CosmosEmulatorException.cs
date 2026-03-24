@@ -48,6 +48,12 @@ public class CosmosEmulatorException : Exception
             RequestCharge = 0
         };
 
+    public static CosmosEmulatorException RequestTimeout(string message) =>
+        new(HttpStatusCode.RequestTimeout, "RequestTimeout", message);
+
+    public static CosmosEmulatorException EntityTooLarge(string message) =>
+        new(HttpStatusCode.RequestEntityTooLarge, "RequestEntityTooLarge", message);
+
     public static CosmosEmulatorException InternalServerError(string message) =>
         new(HttpStatusCode.InternalServerError, "InternalServerError", message);
 }
