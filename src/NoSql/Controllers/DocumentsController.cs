@@ -165,7 +165,8 @@ public class DocumentsController : CosmosControllerBase
 
         try
         {
-            var doc = await _store.PatchDocumentAsync(dbId, collId, docId, partitionKey, operations, ifMatch, ct);
+            var condition = body["condition"]?.GetValue<string>();
+            var doc = await _store.PatchDocumentAsync(dbId, collId, docId, partitionKey, operations, ifMatch, condition, ct);
             await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
             {
                 RequestCharge = RuCostCalculator.Replace(doc.Body.ToJsonString().Length),

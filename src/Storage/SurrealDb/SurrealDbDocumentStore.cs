@@ -469,7 +469,7 @@ public class SurrealDbDocumentStore : IDocumentStore
         return await CreateDocumentAsync(databaseId, containerId, document, ct);
     }
 
-    public async Task<CosmosDocument> PatchDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, IReadOnlyList<PatchOperation> operations, string? ifMatch = null, CancellationToken ct = default)
+    public async Task<CosmosDocument> PatchDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, IReadOnlyList<PatchOperation> operations, string? ifMatch = null, string? condition = null, CancellationToken ct = default)
     {
         var documentKey = MakeDocumentRecordKey(databaseId, containerId, documentId, partitionKey);
         var existingRecord = await GetRequiredRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, "Document", documentId, ct);
@@ -478,6 +478,16 @@ public class SurrealDbDocumentStore : IDocumentStore
         if (ifMatch is not null && existing.ETag != ifMatch)
         {
             throw CosmosEmulatorException.PreconditionFailed($"ETag mismatch. Expected: {ifMatch}, Actual: {existing.ETag}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(condition))
+        {
+            var condBody = existing.ToResponseBody();
+            if (!EvaluatePatchCondition(condBody, condition))
+            {
+                throw CosmosEmulatorException.PreconditionFailed(
+                    $"The patch condition '{condition}' was not satisfied for document '{documentId}'.");
+            }
         }
 
         var body = existing.Body.DeepClone().AsObject();
@@ -1168,6 +1178,67 @@ public class SurrealDbDocumentStore : IDocumentStore
         using var hmac = new System.Security.Cryptography.HMACSHA256(Encoding.UTF8.GetBytes(permission.Rid));
         var sig = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload)));
         return $"type=resource&ver=1.0&sig={sig};";
+    }
+
+    private static bool EvaluatePatchCondition(JsonObject document, string condition)
+    {
+        // Condition format: "from c where c.Field = 'value'"
+        var trimmed = condition.Trim();
+        if (trimmed.StartsWith("from", StringComparison.OrdinalIgnoreCase))
+        {
+            var whereIdx = trimmed.IndexOf("where", StringComparison.OrdinalIgnoreCase);
+            if (whereIdx < 0) return true;
+            trimmed = trimmed[(whereIdx + "where".Length)..].Trim();
+        }
+
+        // Simple equality check: c.Path = 'value' or c.Path = number
+        var match = System.Text.RegularExpressions.Regex.Match(trimmed,
+            @"^(\w+)\.(\w+(?:\.\w+)*)\s*(=|!=|>|<|>=|<=)\s*(?:'([^']*)'|(\d+(?:\.\d+)?))$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!match.Success) return true; // Can't parse → allow
+
+        var propPath = match.Groups[2].Value;
+        var op = match.Groups[3].Value;
+        var strVal = match.Groups[4].Success ? match.Groups[4].Value : null;
+        var numVal = match.Groups[5].Success ? double.Parse(match.Groups[5].Value) : (double?)null;
+
+        var segments = propPath.Split('.');
+        JsonNode? current = document;
+        foreach (var seg in segments)
+        {
+            if (current is JsonObject obj) current = obj[seg];
+            else return false;
+        }
+
+        if (current is null) return op == "!=";
+
+        if (strVal is not null)
+        {
+            var actualStr = current.GetValueKind() == JsonValueKind.String ? current.GetValue<string>() : current.ToJsonString();
+            return op switch
+            {
+                "=" => string.Equals(actualStr, strVal, StringComparison.Ordinal),
+                "!=" => !string.Equals(actualStr, strVal, StringComparison.Ordinal),
+                _ => false
+            };
+        }
+
+        if (numVal is not null && current.GetValueKind() == JsonValueKind.Number)
+        {
+            var actualNum = current.GetValue<double>();
+            return op switch
+            {
+                "=" => Math.Abs(actualNum - numVal.Value) < 0.0001,
+                "!=" => Math.Abs(actualNum - numVal.Value) >= 0.0001,
+                ">" => actualNum > numVal.Value,
+                "<" => actualNum < numVal.Value,
+                ">=" => actualNum >= numVal.Value,
+                "<=" => actualNum <= numVal.Value,
+                _ => false
+            };
+        }
+
+        return false;
     }
 
     // ─── Offer record helpers ───────────────────────────────────────
