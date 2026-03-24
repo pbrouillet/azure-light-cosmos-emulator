@@ -379,6 +379,41 @@ public class SurrealDbDocumentStore : IDocumentStore
         return await CreateDocumentAsync(databaseId, containerId, document, ct);
     }
 
+    public async Task<CosmosDocument> PatchDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, IReadOnlyList<PatchOperation> operations, string? ifMatch = null, CancellationToken ct = default)
+    {
+        var documentKey = MakeDocumentRecordKey(databaseId, containerId, documentId, partitionKey);
+        var existingRecord = await GetRequiredRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, "Document", documentId, ct);
+        var existing = ToCosmosDocument(existingRecord);
+
+        if (ifMatch is not null && existing.ETag != ifMatch)
+        {
+            throw CosmosEmulatorException.PreconditionFailed($"ETag mismatch. Expected: {ifMatch}, Actual: {existing.ETag}");
+        }
+
+        var body = existing.Body.DeepClone().AsObject();
+        ApplyPatchOperations(body, operations);
+        EnforceDocumentSizeLimit(body);
+
+        var updated = new CosmosDocument
+        {
+            Id = documentId,
+            Rid = existing.Rid,
+            DatabaseId = databaseId,
+            ContainerId = containerId,
+            PartitionKey = partitionKey,
+            Body = body,
+            TimeToLive = ExtractTimeToLive(body),
+            Lsn = await GetNextLsnAsync(ct),
+            Self = existing.Self,
+            ETag = ETagGenerator.Generate(),
+            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        };
+
+        await UpsertRecordAsync(DocumentTable, documentKey, ToRecord(updated), ct);
+        await _changeFeed.RecordChangeAsync(databaseId, containerId, updated, ChangeType.Replace, existing, ct);
+        return updated;
+    }
+
     public async Task DeleteDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, CancellationToken ct = default)
     {
         var documentKey = MakeDocumentRecordKey(databaseId, containerId, documentId, partitionKey);
@@ -699,6 +734,146 @@ public class SurrealDbDocumentStore : IDocumentStore
                 $"The document size ({size} bytes) exceeds the maximum allowed size ({MaxDocumentSizeBytes} bytes).");
         }
     }
+
+    private static void ApplyPatchOperations(JsonObject document, IReadOnlyList<PatchOperation> operations)
+    {
+        foreach (var op in operations)
+        {
+            var segments = op.Path.TrimStart('/').Split('/');
+            switch (op.Op.ToLowerInvariant())
+            {
+                case "add":
+                case "set":
+                    SetNestedValue(document, segments, ConvertPatchValue(op.Value));
+                    break;
+                case "replace":
+                    if (!TryGetParentAndKey(document, segments, out var replaceParent, out var replaceKey))
+                        throw CosmosEmulatorException.BadRequest($"Path '{op.Path}' does not exist for replace operation.");
+                    if (replaceParent is JsonObject replaceObj && !replaceObj.ContainsKey(replaceKey))
+                        throw CosmosEmulatorException.BadRequest($"Path '{op.Path}' does not exist for replace operation.");
+                    SetNestedValue(document, segments, ConvertPatchValue(op.Value));
+                    break;
+                case "remove":
+                    if (TryGetParentAndKey(document, segments, out var removeParent, out var removeKey))
+                    {
+                        if (removeParent is JsonObject removeObj)
+                            removeObj.Remove(removeKey);
+                        else if (removeParent is JsonArray removeArr && int.TryParse(removeKey, out var idx))
+                            removeArr.RemoveAt(idx);
+                    }
+                    break;
+                case "incr":
+                    IncrementValue(document, segments, op.Value);
+                    break;
+                case "move":
+                    if (string.IsNullOrEmpty(op.From))
+                        throw CosmosEmulatorException.BadRequest("Move operation requires 'from' property.");
+                    var fromSegments = op.From.TrimStart('/').Split('/');
+                    var value = GetNestedValue(document, fromSegments);
+                    if (TryGetParentAndKey(document, fromSegments, out var moveFromParent, out var moveFromKey)
+                        && moveFromParent is JsonObject moveFromObj)
+                        moveFromObj.Remove(moveFromKey);
+                    SetNestedValue(document, segments, value?.DeepClone());
+                    break;
+                default:
+                    throw CosmosEmulatorException.BadRequest($"Unknown patch operation: '{op.Op}'.");
+            }
+        }
+    }
+
+    private static void SetNestedValue(JsonObject root, string[] segments, JsonNode? value)
+    {
+        JsonNode current = root;
+        for (var i = 0; i < segments.Length - 1; i++)
+        {
+            if (current is JsonObject obj)
+            {
+                if (!obj.ContainsKey(segments[i]))
+                    obj[segments[i]] = new JsonObject();
+                current = obj[segments[i]]!;
+            }
+            else if (current is JsonArray arr && int.TryParse(segments[i], out var idx))
+            {
+                current = arr[idx]!;
+            }
+        }
+
+        var lastKey = segments[^1];
+        if (current is JsonObject parentObj)
+            parentObj[lastKey] = value;
+        else if (current is JsonArray parentArr && int.TryParse(lastKey, out var arrIdx))
+            parentArr[arrIdx] = value;
+    }
+
+    private static JsonNode? GetNestedValue(JsonObject root, string[] segments)
+    {
+        JsonNode? current = root;
+        foreach (var segment in segments)
+        {
+            if (current is JsonObject obj)
+                current = obj[segment];
+            else if (current is JsonArray arr && int.TryParse(segment, out var idx))
+                current = arr[idx];
+            else
+                return null;
+        }
+        return current;
+    }
+
+    private static bool TryGetParentAndKey(JsonObject root, string[] segments, out JsonNode? parent, out string key)
+    {
+        parent = root;
+        key = segments[^1];
+        for (var i = 0; i < segments.Length - 1; i++)
+        {
+            if (parent is JsonObject obj)
+                parent = obj[segments[i]];
+            else if (parent is JsonArray arr && int.TryParse(segments[i], out var idx))
+                parent = arr[idx];
+            else
+                return false;
+        }
+        return parent is not null;
+    }
+
+    private static void IncrementValue(JsonObject root, string[] segments, object? incrementBy)
+    {
+        var current = GetNestedValue(root, segments);
+        if (current is null)
+        {
+            SetNestedValue(root, segments, ConvertPatchValue(incrementBy));
+            return;
+        }
+
+        var currentVal = current.GetValueKind() == System.Text.Json.JsonValueKind.Number
+            ? current.GetValue<double>()
+            : throw CosmosEmulatorException.BadRequest($"Cannot increment non-numeric value at '{string.Join("/", segments)}'.");
+
+        var incrVal = incrementBy switch
+        {
+            int i => (double)i,
+            long l => (double)l,
+            double d => d,
+            float f => (double)f,
+            System.Text.Json.Nodes.JsonNode node when node.GetValueKind() == System.Text.Json.JsonValueKind.Number => node.GetValue<double>(),
+            _ => throw CosmosEmulatorException.BadRequest("Increment value must be a number.")
+        };
+
+        SetNestedValue(root, segments, JsonValue.Create(currentVal + incrVal));
+    }
+
+    private static JsonNode? ConvertPatchValue(object? value) => value switch
+    {
+        null => null,
+        JsonNode node => node.DeepClone(),
+        string s => JsonValue.Create(s),
+        bool b => JsonValue.Create(b),
+        int i => JsonValue.Create(i),
+        long l => JsonValue.Create(l),
+        double d => JsonValue.Create(d),
+        float f => JsonValue.Create(f),
+        _ => JsonNode.Parse(System.Text.Json.JsonSerializer.Serialize(value))
+    };
 
     private static object? ConvertJsonNodeToValue(JsonNode? node) => node switch
     {

@@ -86,6 +86,13 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 .ToList();
         }
 
+        if (plan.Distinct)
+        {
+            projectedResults = projectedResults
+                .DistinctBy(result => result.ToJsonString())
+                .ToList();
+        }
+
         var continuationIndex = ParseContinuationToken(options?.ContinuationToken);
         var takeCount = options?.MaxItemCount is > 0 ? options.MaxItemCount.Value : projectedResults.Count;
 
@@ -172,6 +179,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         var top = ParseTop(ref selectClause, parameters);
+        var distinct = ParseDistinct(ref selectClause);
         var projection = ParseProjection(selectClause);
         var where = ParseWhere(whereClause);
         var groupBy = ParseGroupBy(groupByClause);
@@ -183,7 +191,19 @@ public sealed class CosmosQueryEngine : IQueryEngine
             throw CosmosEmulatorException.BadRequest("SELECT * is not supported for aggregate queries.");
         }
 
-        return new QueryPlan(fromAlias, joins, projection, where, groupBy, orderBy, top, offset, limit);
+        return new QueryPlan(fromAlias, joins, projection, where, groupBy, orderBy, top, offset, limit, distinct);
+    }
+
+    private static bool ParseDistinct(ref string selectClause)
+    {
+        if (selectClause.StartsWith("DISTINCT", StringComparison.OrdinalIgnoreCase)
+            && selectClause.Length > "DISTINCT".Length
+            && char.IsWhiteSpace(selectClause["DISTINCT".Length]))
+        {
+            selectClause = selectClause["DISTINCT".Length..].Trim();
+            return true;
+        }
+        return false;
     }
 
     private static int? ParseTop(ref string selectClause, IReadOnlyDictionary<string, object?>? parameters)
@@ -1863,7 +1883,8 @@ public sealed class CosmosQueryEngine : IQueryEngine
         OrderByClause? OrderBy,
         int? Top,
         int? Offset,
-        int? Limit)
+        int? Limit,
+        bool Distinct = false)
     {
         public bool RequiresAggregation => GroupBy.Count > 0 || Projection.ContainsAggregate;
     }

@@ -19,6 +19,7 @@
     <ProjectReference Include="..\Core\Azure.Cosmos.LightEmulator.Core.csproj" />
     <ProjectReference Include="..\Storage\Azure.Cosmos.LightEmulator.Storage.csproj" />
     <ProjectReference Include="..\Auth\Azure.Cosmos.LightEmulator.Auth.csproj" />
+    <ProjectReference Include="..\Triggers\Azure.Cosmos.LightEmulator.Triggers.csproj" />
   </ItemGroup>
 
 </Project>

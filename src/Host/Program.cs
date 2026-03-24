@@ -115,6 +115,7 @@ public static class Program
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
         builder.Services.AddSingleton<IAuthProvider, EmulatorAuthProvider>();
         builder.Services.AddSingleton<IProgrammabilityEngine, Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.JintProgrammabilityEngine>();
+        builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         builder.Services.AddSingleton<CosmosResponseHeaderService>();
         builder.Services.AddHostedService<TtlCleanupService>();
 

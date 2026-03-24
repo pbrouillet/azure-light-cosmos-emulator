@@ -42,6 +42,7 @@ public static class CosmosHeaders
     // Content types
     public const string JsonContentType = "application/json";
     public const string QueryJsonContentType = "application/query+json";
+    public const string PatchJsonContentType = "application/json_patch+json";
 
     // Incremental feed values
     public const string IncrementalFeedValue = "Incremental feed";

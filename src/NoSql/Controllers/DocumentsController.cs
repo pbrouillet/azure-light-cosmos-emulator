@@ -5,6 +5,7 @@ using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
 using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
+using Azure.Cosmos.LightEmulator.Triggers.Engine;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
@@ -20,12 +21,14 @@ public class DocumentsController : CosmosControllerBase
 
     private readonly IDocumentStore _store;
     private readonly IQueryEngine _queryEngine;
+    private readonly TriggerEngine _triggerEngine;
 
-    public DocumentsController(IDocumentStore store, IQueryEngine queryEngine, CosmosResponseHeaderService responseHeaders)
+    public DocumentsController(IDocumentStore store, IQueryEngine queryEngine, TriggerEngine triggerEngine, CosmosResponseHeaderService responseHeaders)
         : base(responseHeaders)
     {
         _store = store;
         _queryEngine = queryEngine;
+        _triggerEngine = triggerEngine;
     }
 
     [HttpPost]
@@ -128,12 +131,83 @@ public class DocumentsController : CosmosControllerBase
         }
     }
 
+    [HttpPatch("{docId}")]
+    public async Task<IActionResult> Patch(string dbId, string collId, string docId, CancellationToken ct)
+    {
+        var pkHeader = Request.Headers[CosmosHeaders.PartitionKey].FirstOrDefault();
+        var partitionKey = ParsePartitionKey(pkHeader);
+        var ifMatch = Request.Headers[CosmosHeaders.IfMatch].FirstOrDefault();
+
+        var body = await ReadRequestBodyAsync(ct);
+        var operationsNode = body["operations"] as JsonArray;
+        if (operationsNode is null || operationsNode.Count == 0)
+            return BadRequest(ErrorResponse("BadRequest", "PATCH request must include a non-empty 'operations' array."));
+
+        var operations = new List<PatchOperation>();
+        foreach (var opNode in operationsNode)
+        {
+            if (opNode is not JsonObject opObj)
+                return BadRequest(ErrorResponse("BadRequest", "Each operation must be a JSON object."));
+
+            var op = opObj["op"]?.GetValue<string>();
+            var path = opObj["path"]?.GetValue<string>();
+            if (string.IsNullOrEmpty(op) || string.IsNullOrEmpty(path))
+                return BadRequest(ErrorResponse("BadRequest", "Each operation must have 'op' and 'path' properties."));
+
+            operations.Add(new PatchOperation
+            {
+                Op = op,
+                Path = path,
+                Value = opObj.ContainsKey("value") ? opObj["value"] : null,
+                From = opObj["from"]?.GetValue<string>()
+            });
+        }
+
+        try
+        {
+            var doc = await _store.PatchDocumentAsync(dbId, collId, docId, partitionKey, operations, ifMatch, ct);
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.Replace(doc.Body.ToJsonString().Length),
+                DatabaseId = dbId,
+                ContainerId = collId,
+                ItemLsn = doc.Lsn,
+                IncludeSessionToken = true,
+                SessionLsn = doc.Lsn
+            }, ct);
+            Response.Headers.ETag = doc.ETag;
+            return Ok(doc.ToResponseBody());
+        }
+        catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return NotFound(ErrorResponse(ex.ErrorCode, ex.Message));
+        }
+        catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
+        {
+            return StatusCode(412, ErrorResponse(ex.ErrorCode, ex.Message));
+        }
+        catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.BadRequest)
+        {
+            return BadRequest(ErrorResponse(ex.ErrorCode, ex.Message));
+        }
+    }
+
     private async Task<IActionResult> Create(string dbId, string collId, JsonObject body, CancellationToken ct)
     {
         try
         {
+            var preTriggers = ParseTriggerHeader(CosmosHeaders.PreTriggerInclude);
+            var postTriggers = ParseTriggerHeader(CosmosHeaders.PostTriggerInclude);
+
+            if (preTriggers.Length > 0)
+                body = await _triggerEngine.ExecutePreTriggersAsync(dbId, collId, body, TriggerOperation.Create, preTriggers, ct);
+
             var requestBodyLength = GetRequestBodyLength(body);
             var doc = await _store.CreateDocumentAsync(dbId, collId, body, ct);
+
+            if (postTriggers.Length > 0)
+                await _triggerEngine.ExecutePostTriggersAsync(dbId, collId, doc, TriggerOperation.Create, postTriggers, ct);
+
             await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
             {
                 RequestCharge = RuCostCalculator.Create(requestBodyLength),
@@ -297,4 +371,12 @@ public class DocumentsController : CosmosControllerBase
     }
 
     private static object ErrorResponse(string code, string message) => new { code, message };
+
+    private string[] ParseTriggerHeader(string headerName)
+    {
+        var value = Request.Headers[headerName].FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(value))
+            return [];
+        return value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
 }

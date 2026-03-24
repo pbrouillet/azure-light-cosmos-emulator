@@ -117,6 +117,7 @@ public sealed class TestServerFixture : IAsyncDisposable
         builder.Services.AddSingleton<IAuthProvider>(_ => new MasterKeyAuthProvider(KnownMasterKey));
         builder.Services.AddSingleton<IProgrammabilityEngine, JintProgrammabilityEngine>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ConsistencyLevel.Session));
+        builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         builder.Services.AddSingleton<CosmosResponseHeaderService>();
 
         _app = builder.Build();

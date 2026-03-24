@@ -1,5 +1,9 @@
+using System.Text.Json.Nodes;
+using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
+using Jint;
+using Jint.Native;
 
 namespace Azure.Cosmos.LightEmulator.Triggers.Engine;
 
@@ -9,28 +13,41 @@ namespace Azure.Cosmos.LightEmulator.Triggers.Engine;
 /// </summary>
 public class TriggerEngine
 {
-    private readonly IDocumentStore _store;
+    private static readonly TimeSpan TriggerTimeout = TimeSpan.FromSeconds(5);
 
-    public TriggerEngine(IDocumentStore store)
+    private readonly IProgrammabilityEngine _programmability;
+
+    public TriggerEngine(IProgrammabilityEngine programmability)
     {
-        _store = store;
+        _programmability = programmability;
     }
 
     /// <summary>
     /// Executes pre-triggers before a document operation.
+    /// Pre-triggers can modify the document before it's written.
     /// </summary>
-    public async Task<System.Text.Json.Nodes.JsonObject> ExecutePreTriggersAsync(
+    public async Task<JsonObject> ExecutePreTriggersAsync(
         string databaseId,
         string containerId,
-        System.Text.Json.Nodes.JsonObject document,
+        JsonObject document,
         TriggerOperation operation,
         IEnumerable<string> triggerIds,
         CancellationToken ct = default)
     {
-        // TODO: Load trigger definitions from store, execute via Jint
-        // Pre-triggers can modify the document before it's written
-        // For now, pass through unmodified
-        return document;
+        var currentDoc = document;
+        foreach (var triggerId in triggerIds)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var trigger = await _programmability.GetTriggerAsync(databaseId, containerId, triggerId, ct);
+            if (trigger.TriggerType != TriggerType.Pre)
+                throw CosmosEmulatorException.BadRequest($"Trigger '{triggerId}' is not a pre-trigger.");
+            if (trigger.TriggerOperation != TriggerOperation.All && trigger.TriggerOperation != operation)
+                continue;
+
+            currentDoc = ExecuteTriggerBody(trigger, currentDoc, isPreTrigger: true);
+        }
+        return currentDoc;
     }
 
     /// <summary>
@@ -44,8 +61,83 @@ public class TriggerEngine
         IEnumerable<string> triggerIds,
         CancellationToken ct = default)
     {
-        // TODO: Load trigger definitions from store, execute via Jint
-        // Post-triggers can perform additional operations after the write
-        await Task.CompletedTask;
+        foreach (var triggerId in triggerIds)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var trigger = await _programmability.GetTriggerAsync(databaseId, containerId, triggerId, ct);
+            if (trigger.TriggerType != TriggerType.Post)
+                throw CosmosEmulatorException.BadRequest($"Trigger '{triggerId}' is not a post-trigger.");
+            if (trigger.TriggerOperation != TriggerOperation.All && trigger.TriggerOperation != operation)
+                continue;
+
+            ExecuteTriggerBody(trigger, document.ToResponseBody(), isPreTrigger: false);
+        }
+    }
+
+    private static JsonObject ExecuteTriggerBody(Trigger trigger, JsonObject document, bool isPreTrigger)
+    {
+        var engine = new Jint.Engine(options => options.TimeoutInterval(TriggerTimeout));
+
+        var requestBody = document.DeepClone().AsObject();
+        var responseBody = document.DeepClone().AsObject();
+
+        engine.SetValue("getContext", new Func<object>(() => new
+        {
+            getRequest = new Func<object>(() => new
+            {
+                getBody = new Func<object?>(() => JsValue.FromObject(engine, JsonNode.Parse(requestBody.ToJsonString()))),
+                setBody = new Action<JsValue>(value =>
+                {
+                    var jsonStr = value.IsString()
+                        ? value.AsString()
+                        : System.Text.Json.JsonSerializer.Serialize(value.ToObject());
+                    var json = JsonNode.Parse(jsonStr)?.AsObject();
+                    if (json is not null)
+                    {
+                        requestBody = json;
+                    }
+                })
+            }),
+            getResponse = new Func<object>(() => new
+            {
+                getBody = new Func<object?>(() => JsValue.FromObject(engine, JsonNode.Parse(responseBody.ToJsonString()))),
+                setBody = new Action<JsValue>(value =>
+                {
+                    var jsonStr = value.IsString()
+                        ? value.AsString()
+                        : System.Text.Json.JsonSerializer.Serialize(value.ToObject());
+                    var json = JsonNode.Parse(jsonStr)?.AsObject();
+                    if (json is not null)
+                    {
+                        responseBody = json;
+                    }
+                })
+            }),
+            getCollection = new Func<object>(() => new
+            {
+                getSelfLink = new Func<string>(() => $"dbs/{trigger.DatabaseId}/colls/{trigger.ContainerId}/")
+            })
+        }));
+
+        try
+        {
+            engine.Execute($"var __triggerFn = {trigger.Body}; __triggerFn();");
+        }
+        catch (TimeoutException)
+        {
+            throw CosmosEmulatorException.RequestTimeout(
+                $"Trigger '{trigger.Id}' execution exceeded the maximum allowed time.");
+        }
+        catch (CosmosEmulatorException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw CosmosEmulatorException.BadRequest($"Trigger execution failed: {ex.Message}");
+        }
+
+        return isPreTrigger ? requestBody : responseBody;
     }
 }
