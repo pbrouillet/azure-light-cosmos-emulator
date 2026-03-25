@@ -17,11 +17,14 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
     private readonly IDocumentStore _documentStore;
     private readonly IndexValidationService _indexValidation;
+    private readonly Lazy<IProgrammabilityEngine?> _programmabilityEngine;
 
-    public CosmosQueryEngine(IDocumentStore documentStore, IndexValidationService indexValidation)
+    public CosmosQueryEngine(IDocumentStore documentStore, IndexValidationService indexValidation, IServiceProvider? serviceProvider = null)
     {
         _documentStore = documentStore;
         _indexValidation = indexValidation;
+        _programmabilityEngine = new Lazy<IProgrammabilityEngine?>(() =>
+            serviceProvider?.GetService(typeof(IProgrammabilityEngine)) as IProgrammabilityEngine);
     }
 
     public async Task<FeedResponse<JsonObject>> ExecuteQueryAsync(
@@ -55,7 +58,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         var allDocuments = await _documentStore.ListDocumentsAsync(databaseId, containerId, ct);
-        var documents = allDocuments.Resources;
+        var documents = allDocuments.Resources.Where(d => d.IsIndexed).ToList();
 
         if (options?.PartitionKey is not null)
         {
@@ -65,23 +68,47 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         var matchingRows = new List<QueryRow>();
-        foreach (var document in documents)
+        if (plan.FromSubquery is not null)
         {
-            ct.ThrowIfCancellationRequested();
-
-            var responseBody = document.ToResponseBody();
-            var seedRow = new QueryRow(
-                document,
-                new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
-                {
-                    [plan.FromAlias] = responseBody
-                });
-
-            foreach (var joinedRow in ApplyJoins(seedRow, plan.Joins, parameters))
+            // FROM subquery: execute the inner query and use results as the row source
+            var subqueryResult = await ExecuteQueryAsync(databaseId, containerId, plan.FromSubquery.InnerQuery, parameters, ct: ct);
+            foreach (var subRow in subqueryResult.Resources)
             {
-                if (plan.Where is null || EvaluateBooleanExpression(joinedRow, plan.Where, parameters, new SubqueryContext(databaseId, containerId)))
+                ct.ThrowIfCancellationRequested();
+
+                var seedRow = new QueryRow(
+                    null,
+                    new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        [plan.FromAlias] = NormalizeRuntimeValue(subRow)
+                    });
+
+                if (plan.Where is null || EvaluateBooleanExpression(seedRow, plan.Where, parameters, new SubqueryContext(databaseId, containerId)))
                 {
-                    matchingRows.Add(joinedRow);
+                    matchingRows.Add(seedRow);
+                }
+            }
+        }
+        else
+        {
+            foreach (var document in documents)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var responseBody = document.ToResponseBody();
+                var seedRow = new QueryRow(
+                    document,
+                    new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        [plan.FromAlias] = responseBody
+                    });
+
+                foreach (var joinedRow in ApplyJoins(seedRow, plan.Joins, parameters, databaseId, containerId))
+                {
+                    if (plan.Where is null || EvaluateBooleanExpression(joinedRow, plan.Where, parameters, new SubqueryContext(databaseId, containerId)))
+                    {
+                        matchingRows.Add(joinedRow);
+                    }
                 }
             }
         }
@@ -89,14 +116,14 @@ public sealed class CosmosQueryEngine : IQueryEngine
         List<JsonObject> projectedResults;
         if (plan.RequiresAggregation)
         {
-            projectedResults = ExecuteAggregateQuery(matchingRows, plan, parameters);
+            projectedResults = ExecuteAggregateQuery(matchingRows, plan, parameters, databaseId, containerId);
         }
         else
         {
-            var orderedRows = ApplyOrdering(matchingRows, plan, parameters);
+            var orderedRows = ApplyOrdering(matchingRows, plan, parameters, databaseId, containerId);
             var windowedRows = ApplyWindowing(orderedRows, plan.Top, plan.Offset, plan.Limit);
             projectedResults = windowedRows
-                .Select(row => ProjectRow(row, plan, parameters))
+                .Select(row => ProjectRow(row, plan, parameters, databaseId, containerId))
                 .ToList();
         }
 
@@ -203,7 +230,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return paths;
     }
 
-    private static QueryPlan ParseQuery(string query, IReadOnlyDictionary<string, object?>? parameters)
+    private QueryPlan ParseQuery(string query, IReadOnlyDictionary<string, object?>? parameters)
     {
         var trimmedQuery = query.Trim().TrimEnd(';').Trim();
         if (!trimmedQuery.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
@@ -230,7 +257,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         var fromClauseEnd = clauseIndexes.FirstOrDefault(trimmedQuery.Length);
         var fromClause = trimmedQuery[(fromIndex + "FROM".Length)..fromClauseEnd].Trim();
-        var (fromAlias, joins) = ParseFromClause(fromClause);
+        var (fromAlias, joins, fromSubquery, arrayIterationSource) = ParseFromClause(fromClause);
 
         string? whereClause = null;
         if (whereIndex >= 0)
@@ -281,7 +308,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             throw CosmosEmulatorException.BadRequest("SELECT * is not supported for aggregate queries.");
         }
 
-        return new QueryPlan(fromAlias, joins, projection, where, groupBy, orderBy, top, offset, limit, distinct);
+        return new QueryPlan(fromAlias, joins, projection, where, groupBy, orderBy, top, offset, limit, distinct, fromSubquery, arrayIterationSource);
     }
 
     private static bool ParseDistinct(ref string selectClause)
@@ -296,7 +323,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return false;
     }
 
-    private static int? ParseTop(ref string selectClause, IReadOnlyDictionary<string, object?>? parameters)
+    private int? ParseTop(ref string selectClause, IReadOnlyDictionary<string, object?>? parameters)
     {
         var topMatch = Regex.Match(selectClause, @"^TOP\s+(?<value>@?[A-Za-z0-9_\-\.]+)\s+(?<rest>.+)$", RegexOptions.IgnoreCase);
         if (!topMatch.Success)
@@ -321,17 +348,21 @@ public sealed class CosmosQueryEngine : IQueryEngine
             return new Projection(ProjectionMode.Value, [new SelectItem(valueExpression, "$1")]);
         }
 
-        var fieldExpressions = SplitTopLevel(selectClause, ',')
-            .Select(ParseScalarExpression)
-            .ToList();
-        if (fieldExpressions.Count == 0)
+        var fieldTexts = SplitTopLevel(selectClause, ',');
+        if (fieldTexts.Count == 0)
         {
             throw CosmosEmulatorException.BadRequest("SELECT must project at least one field.");
         }
 
-        var fields = fieldExpressions
-            .Select((expression, index) => new SelectItem(expression, GetOutputAlias(expression, index + 1)))
-            .ToList();
+        var fields = new List<SelectItem>();
+        for (var i = 0; i < fieldTexts.Count; i++)
+        {
+            var parser = new ExpressionParser(fieldTexts[i]);
+            var expression = parser.ParseScalarExpression();
+            var alias = parser.TryConsumeAlias();
+            parser.ExpectEnd("expression");
+            fields.Add(new SelectItem(expression, alias ?? GetOutputAlias(expression, i + 1)));
+        }
 
         return new Projection(ProjectionMode.Fields, fields);
     }
@@ -388,9 +419,63 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return clauses;
     }
 
-    private static (string FromAlias, IReadOnlyList<JoinClause> Joins) ParseFromClause(string fromClause)
+    private static (string FromAlias, IReadOnlyList<JoinClause> Joins, SubqueryFromSource? FromSubquery, ScalarExpression? ArrayIterationSource) ParseFromClause(string fromClause)
     {
         var remainder = fromClause.Trim();
+
+        // Detect subquery source: (SELECT ...) AS alias
+        if (remainder.StartsWith('('))
+        {
+            var depth = 0;
+            var closeIndex = -1;
+            var inString = false;
+            for (var i = 0; i < remainder.Length; i++)
+            {
+                var ch = remainder[i];
+                if (inString)
+                {
+                    if (ch == '\'' && (i + 1 >= remainder.Length || remainder[i + 1] != '\''))
+                        inString = false;
+                    else if (ch == '\'' && i + 1 < remainder.Length && remainder[i + 1] == '\'')
+                        i++;
+                    continue;
+                }
+
+                if (ch == '\'') { inString = true; continue; }
+                if (ch == '(') { depth++; continue; }
+                if (ch == ')')
+                {
+                    depth--;
+                    if (depth == 0) { closeIndex = i; break; }
+                }
+            }
+
+            if (closeIndex < 0)
+                throw CosmosEmulatorException.BadRequest("Unsupported FROM clause: unmatched parenthesis.");
+
+            var innerQuery = remainder[1..closeIndex].Trim();
+            var afterParen = remainder[(closeIndex + 1)..].Trim();
+
+            // Expect optional AS keyword followed by alias
+            string alias;
+            if (afterParen.StartsWith("AS", StringComparison.OrdinalIgnoreCase)
+                && afterParen.Length > 2
+                && char.IsWhiteSpace(afterParen[2]))
+            {
+                afterParen = afterParen[2..].TrimStart();
+                alias = ReadLeadingIdentifier(afterParen, out _);
+            }
+            else
+            {
+                alias = ReadLeadingIdentifier(afterParen, out _);
+            }
+
+            if (string.IsNullOrWhiteSpace(alias))
+                throw CosmosEmulatorException.BadRequest("Subquery in FROM requires an alias.");
+
+            return (alias, [], new SubqueryFromSource(innerQuery, alias), null);
+        }
+
         var fromAlias = ReadLeadingIdentifier(remainder, out var consumedLength);
         if (string.IsNullOrWhiteSpace(fromAlias))
         {
@@ -398,6 +483,20 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         remainder = remainder[consumedLength..].TrimStart();
+
+        // Detect FROM alias IN expr (array iteration, used in correlated subqueries)
+        if (remainder.StartsWith("IN", StringComparison.OrdinalIgnoreCase)
+            && (remainder.Length <= 2 || char.IsWhiteSpace(remainder[2])))
+        {
+            var sourceText = remainder["IN".Length..].TrimStart();
+            if (string.IsNullOrWhiteSpace(sourceText))
+            {
+                throw CosmosEmulatorException.BadRequest("FROM ... IN requires a source expression.");
+            }
+
+            return (fromAlias, [], null, ParseScalarExpression(sourceText));
+        }
+
         var joins = new List<JoinClause>();
         while (!string.IsNullOrWhiteSpace(remainder))
         {
@@ -436,10 +535,10 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 : string.Empty;
         }
 
-        return (fromAlias, joins);
+        return (fromAlias, joins, null, null);
     }
 
-    private static (int? offset, int? limit) ParseOffsetLimit(string? offsetLimitClause, IReadOnlyDictionary<string, object?>? parameters)
+    private (int? offset, int? limit) ParseOffsetLimit(string? offsetLimitClause, IReadOnlyDictionary<string, object?>? parameters)
     {
         if (string.IsNullOrWhiteSpace(offsetLimitClause))
         {
@@ -467,7 +566,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return scalar;
     }
 
-    private static List<QueryRow> ApplyJoins(QueryRow seedRow, IReadOnlyList<JoinClause> joins, IReadOnlyDictionary<string, object?>? parameters)
+    private List<QueryRow> ApplyJoins(QueryRow seedRow, IReadOnlyList<JoinClause> joins, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
         var rows = new List<QueryRow> { seedRow };
         foreach (var join in joins)
@@ -475,7 +574,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             var expandedRows = new List<QueryRow>();
             foreach (var row in rows)
             {
-                var source = EvaluateScalarExpression(row, join.SourceExpression, parameters);
+                var source = EvaluateScalarExpression(row, join.SourceExpression, parameters, databaseId: databaseId, containerId: containerId);
                 if (source is not JsonArray array)
                 {
                     continue;
@@ -497,7 +596,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return rows;
     }
 
-    private static List<QueryRow> ApplyOrdering(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
+    private List<QueryRow> ApplyOrdering(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
         if (rows.Count == 0)
         {
@@ -513,7 +612,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         var first = plan.OrderBy[0];
-        Func<QueryRow, object?> firstKey = row => EvaluateScalarExpression(row, first.Expression, parameters);
+        Func<QueryRow, object?> firstKey = row => EvaluateScalarExpression(row, first.Expression, parameters, databaseId: databaseId, containerId: containerId);
         IOrderedEnumerable<QueryRow> orderedRows = first.Descending
             ? rows.OrderByDescending(firstKey, QueryValueComparer.Instance)
             : rows.OrderBy(firstKey, QueryValueComparer.Instance);
@@ -521,7 +620,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         for (var i = 1; i < plan.OrderBy.Count; i++)
         {
             var clause = plan.OrderBy[i];
-            Func<QueryRow, object?> key = row => EvaluateScalarExpression(row, clause.Expression, parameters);
+            Func<QueryRow, object?> key = row => EvaluateScalarExpression(row, clause.Expression, parameters, databaseId: databaseId, containerId: containerId);
             orderedRows = clause.Descending
                 ? orderedRows.ThenByDescending(key, QueryValueComparer.Instance)
                 : orderedRows.ThenBy(key, QueryValueComparer.Instance);
@@ -532,18 +631,18 @@ public sealed class CosmosQueryEngine : IQueryEngine
             .ToList();
     }
 
-    private static List<JsonObject> ExecuteAggregateQuery(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
+    private List<JsonObject> ExecuteAggregateQuery(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
-        var groups = BuildGroups(rows, plan, parameters);
+        var groups = BuildGroups(rows, plan, parameters, databaseId, containerId);
         var projected = groups
-            .Select(group => ProjectAggregateGroup(group, plan, parameters))
+            .Select(group => ProjectAggregateGroup(group, plan, parameters, databaseId, containerId))
             .ToList();
 
-        projected = ApplyProjectedOrdering(projected, plan, parameters);
+        projected = ApplyProjectedOrdering(projected, plan, parameters, databaseId, containerId);
         return ApplyWindowing(projected, plan.Top, plan.Offset, plan.Limit);
     }
 
-    private static List<QueryGroup> BuildGroups(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
+    private List<QueryGroup> BuildGroups(List<QueryRow> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
         if (plan.GroupBy.Count == 0)
         {
@@ -554,7 +653,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         foreach (var row in rows)
         {
             var keyValues = plan.GroupBy
-                .Select(expression => EvaluateScalarExpression(row, expression, parameters))
+                .Select(expression => EvaluateScalarExpression(row, expression, parameters, databaseId: databaseId, containerId: containerId))
                 .ToList();
 
             var existingGroup = groups.FirstOrDefault(group => KeysMatch(group.KeyValues, keyValues));
@@ -588,7 +687,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return true;
     }
 
-    private static List<JsonObject> ApplyProjectedOrdering(List<JsonObject> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
+    private List<JsonObject> ApplyProjectedOrdering(List<JsonObject> rows, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
         if (plan.OrderBy.Count == 0 || rows.Count == 0)
         {
@@ -603,7 +702,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             });
 
         var first = plan.OrderBy[0];
-        Func<JsonObject, object?> firstKey = row => EvaluateScalarExpression(ToQueryRow(row), first.Expression, parameters, group: null);
+        Func<JsonObject, object?> firstKey = row => EvaluateScalarExpression(ToQueryRow(row), first.Expression, parameters, group: null, databaseId: databaseId, containerId: containerId);
         IOrderedEnumerable<JsonObject> ordered = first.Descending
             ? rows.OrderByDescending(firstKey, QueryValueComparer.Instance)
             : rows.OrderBy(firstKey, QueryValueComparer.Instance);
@@ -611,7 +710,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         for (var i = 1; i < plan.OrderBy.Count; i++)
         {
             var clause = plan.OrderBy[i];
-            Func<JsonObject, object?> key = row => EvaluateScalarExpression(ToQueryRow(row), clause.Expression, parameters, group: null);
+            Func<JsonObject, object?> key = row => EvaluateScalarExpression(ToQueryRow(row), clause.Expression, parameters, group: null, databaseId: databaseId, containerId: containerId);
             ordered = clause.Descending
                 ? ordered.ThenByDescending(key, QueryValueComparer.Instance)
                 : ordered.ThenBy(key, QueryValueComparer.Instance);
@@ -641,24 +740,24 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return window.ToList();
     }
 
-    private static JsonObject ProjectRow(QueryRow row, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
+    private JsonObject ProjectRow(QueryRow row, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
         return plan.Projection.Mode switch
         {
             ProjectionMode.All => ProjectAll(row, plan.FromAlias),
-            ProjectionMode.Fields => ProjectFields(row, plan.Projection.Items, parameters),
-            ProjectionMode.Value => ProjectValue(row, plan.Projection.Items[0].Expression, parameters),
+            ProjectionMode.Fields => ProjectFields(row, plan.Projection.Items, parameters, databaseId: databaseId, containerId: containerId),
+            ProjectionMode.Value => ProjectValue(row, plan.Projection.Items[0].Expression, parameters, databaseId: databaseId, containerId: containerId),
             _ => throw CosmosEmulatorException.BadRequest("Unsupported projection.")
         };
     }
 
-    private static JsonObject ProjectAggregateGroup(QueryGroup group, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters)
+    private JsonObject ProjectAggregateGroup(QueryGroup group, QueryPlan plan, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
         var representativeRow = group.Rows.FirstOrDefault();
         return plan.Projection.Mode switch
         {
-            ProjectionMode.Fields => ProjectFields(representativeRow, plan.Projection.Items, parameters, group.Rows),
-            ProjectionMode.Value => ProjectValue(representativeRow, plan.Projection.Items[0].Expression, parameters, group.Rows),
+            ProjectionMode.Fields => ProjectFields(representativeRow, plan.Projection.Items, parameters, group.Rows, databaseId, containerId),
+            ProjectionMode.Value => ProjectValue(representativeRow, plan.Projection.Items[0].Expression, parameters, group.Rows, databaseId, containerId),
             _ => throw CosmosEmulatorException.BadRequest("Unsupported aggregate projection.")
         };
     }
@@ -673,12 +772,12 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return document.DeepClone().AsObject();
     }
 
-    private static JsonObject ProjectFields(QueryRow? row, IReadOnlyList<SelectItem> items, IReadOnlyDictionary<string, object?>? parameters, IReadOnlyList<QueryRow>? group = null)
+    private JsonObject ProjectFields(QueryRow? row, IReadOnlyList<SelectItem> items, IReadOnlyDictionary<string, object?>? parameters, IReadOnlyList<QueryRow>? group = null, string? databaseId = null, string? containerId = null)
     {
         var projected = new JsonObject();
         foreach (var item in items)
         {
-            var value = EvaluateScalarExpression(row, item.Expression, parameters, group);
+            var value = EvaluateScalarExpression(row, item.Expression, parameters, group, databaseId, containerId);
             if (ReferenceEquals(value, UndefinedValue))
             {
                 continue;
@@ -690,10 +789,10 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return projected;
     }
 
-    private static JsonObject ProjectValue(QueryRow? row, ScalarExpression expression, IReadOnlyDictionary<string, object?>? parameters, IReadOnlyList<QueryRow>? group = null)
+    private JsonObject ProjectValue(QueryRow? row, ScalarExpression expression, IReadOnlyDictionary<string, object?>? parameters, IReadOnlyList<QueryRow>? group = null, string? databaseId = null, string? containerId = null)
     {
         var projected = new JsonObject();
-        var value = EvaluateScalarExpression(row, expression, parameters, group);
+        var value = EvaluateScalarExpression(row, expression, parameters, group, databaseId, containerId);
         projected["$1"] = ReferenceEquals(value, UndefinedValue) ? null : ConvertToJsonNode(value);
         return projected;
     }
@@ -711,20 +810,20 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 _ => throw CosmosEmulatorException.BadRequest("Unsupported boolean operator.")
             },
             NotBooleanExpression unary => !EvaluateBooleanExpression(row, unary.Expression, parameters, subqueryContext),
-            ComparisonBooleanExpression comparison => EvaluateComparison(row, comparison, parameters),
-            InBooleanExpression inExpression => EvaluateIn(row, inExpression, parameters),
-            LikeBooleanExpression likeExpr => EvaluateLike(row, likeExpr, parameters),
+            ComparisonBooleanExpression comparison => EvaluateComparison(row, comparison, parameters, subqueryContext?.DatabaseId, subqueryContext?.ContainerId),
+            InBooleanExpression inExpression => EvaluateIn(row, inExpression, parameters, subqueryContext?.DatabaseId, subqueryContext?.ContainerId),
+            LikeBooleanExpression likeExpr => EvaluateLike(row, likeExpr, parameters, subqueryContext?.DatabaseId, subqueryContext?.ContainerId),
             SubqueryInBooleanExpression subqueryIn => EvaluateSubqueryIn(row, subqueryIn, parameters, subqueryContext!),
             ExistsBooleanExpression exists => EvaluateExists(exists, parameters, subqueryContext!),
-            ScalarBooleanExpression scalar => ToBoolean(EvaluateScalarExpression(row, scalar.Expression, parameters)),
+            ScalarBooleanExpression scalar => ToBoolean(EvaluateScalarExpression(row, scalar.Expression, parameters, databaseId: subqueryContext?.DatabaseId, containerId: subqueryContext?.ContainerId)),
             _ => throw CosmosEmulatorException.BadRequest("Unsupported WHERE clause expression.")
         };
     }
 
-    private static bool EvaluateComparison(QueryRow row, ComparisonBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
+    private bool EvaluateComparison(QueryRow row, ComparisonBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
-        var left = EvaluateScalarExpression(row, expression.Left, parameters);
-        var right = EvaluateScalarExpression(row, expression.Right, parameters);
+        var left = EvaluateScalarExpression(row, expression.Left, parameters, databaseId: databaseId, containerId: containerId);
+        var right = EvaluateScalarExpression(row, expression.Right, parameters, databaseId: databaseId, containerId: containerId);
         if (ReferenceEquals(left, UndefinedValue) || ReferenceEquals(right, UndefinedValue))
         {
             return false;
@@ -742,9 +841,9 @@ public sealed class CosmosQueryEngine : IQueryEngine
         };
     }
 
-    private static bool EvaluateIn(QueryRow row, InBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
+    private bool EvaluateIn(QueryRow row, InBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
     {
-        var left = EvaluateScalarExpression(row, expression.Left, parameters);
+        var left = EvaluateScalarExpression(row, expression.Left, parameters, databaseId: databaseId, containerId: containerId);
         if (ReferenceEquals(left, UndefinedValue))
         {
             return false;
@@ -752,7 +851,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         var found = expression.Values.Any(value =>
         {
-            var candidate = EvaluateScalarExpression(row, value, parameters);
+            var candidate = EvaluateScalarExpression(row, value, parameters, databaseId: databaseId, containerId: containerId);
             return !ReferenceEquals(candidate, UndefinedValue) && AreEqual(left, candidate);
         });
 
@@ -789,10 +888,150 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return result.Resources.Count > 0;
     }
 
-    private static bool EvaluateLike(QueryRow row, LikeBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters)
+    private object? EvaluateArrayLiteral(
+        QueryRow? row,
+        ArrayLiteralExpression arrayLit,
+        IReadOnlyDictionary<string, object?>? parameters,
+        IReadOnlyList<QueryRow>? group = null,
+        string? databaseId = null,
+        string? containerId = null)
     {
-        var left = EvaluateScalarExpression(row, expression.Left, parameters);
-        var pattern = EvaluateScalarExpression(row, expression.Pattern, parameters);
+        var array = new JsonArray();
+        foreach (var element in arrayLit.Elements)
+        {
+            var value = EvaluateScalarExpression(row, element, parameters, group, databaseId, containerId);
+            if (!ReferenceEquals(value, UndefinedValue))
+            {
+                array.Add(ConvertToJsonNode(value));
+            }
+        }
+
+        return array;
+    }
+
+    private object? EvaluateScalarSubquery(ScalarSubqueryExpression subquery, QueryRow? outerRow, IReadOnlyDictionary<string, object?>? parameters, string? databaseId, string? containerId)
+    {
+        if (databaseId is null || containerId is null)
+        {
+            throw CosmosEmulatorException.BadRequest("Scalar subqueries require a database and container context.");
+        }
+
+        // Parse the inner query to check for correlated FROM ... IN ... pattern
+        var innerPlan = ParseQuery(subquery.InnerQuery, parameters);
+
+        if (innerPlan.ArrayIterationSource is not null && outerRow is not null)
+        {
+            return EvaluateCorrelatedSubquery(innerPlan, outerRow, parameters, databaseId, containerId);
+        }
+
+        // Independent subquery — execute recursively
+        var result = ExecuteQueryAsync(databaseId, containerId, subquery.InnerQuery, parameters)
+            .GetAwaiter().GetResult();
+
+        if (result.Resources.Count == 0)
+        {
+            return UndefinedValue;
+        }
+
+        if (result.Resources.Count > 1)
+        {
+            throw CosmosEmulatorException.BadRequest("Scalar subquery must return at most one row.");
+        }
+
+        var row = result.Resources[0];
+
+        // SELECT VALUE queries produce {"$1": value}; unwrap the scalar
+        if (row.Count == 1 && row.ContainsKey("$1"))
+        {
+            return NormalizeRuntimeValue(row["$1"]);
+        }
+
+        return NormalizeRuntimeValue(row);
+    }
+
+    private object? EvaluateCorrelatedSubquery(QueryPlan plan, QueryRow outerRow, IReadOnlyDictionary<string, object?>? parameters, string databaseId, string containerId)
+    {
+        // Resolve the array source against the outer row
+        var sourceValue = EvaluateScalarExpression(outerRow, plan.ArrayIterationSource!, parameters, databaseId: databaseId, containerId: containerId);
+        if (sourceValue is not JsonArray array)
+        {
+            return UndefinedValue;
+        }
+
+        // Build rows from array elements, carrying forward outer aliases
+        var rows = new List<QueryRow>();
+        foreach (var item in array)
+        {
+            var aliases = new Dictionary<string, object?>(outerRow.Aliases, StringComparer.OrdinalIgnoreCase)
+            {
+                [plan.FromAlias] = NormalizeRuntimeValue(item)
+            };
+            rows.Add(new QueryRow(null, aliases));
+        }
+
+        // Apply JOINs if any
+        if (plan.Joins.Count > 0)
+        {
+            var joinedRows = new List<QueryRow>();
+            foreach (var row in rows)
+            {
+                joinedRows.AddRange(ApplyJoins(row, plan.Joins, parameters, databaseId, containerId));
+            }
+            rows = joinedRows;
+        }
+
+        // Apply WHERE filter
+        if (plan.Where is not null)
+        {
+            rows = rows.Where(r => EvaluateBooleanExpression(r, plan.Where, parameters, new SubqueryContext(databaseId, containerId))).ToList();
+        }
+
+        // Handle aggregation
+        if (plan.RequiresAggregation)
+        {
+            var results = ExecuteAggregateQuery(rows, plan, parameters, databaseId, containerId);
+            if (results.Count == 0)
+            {
+                return UndefinedValue;
+            }
+
+            var aggRow = results[0];
+            if (aggRow.Count == 1 && aggRow.ContainsKey("$1"))
+            {
+                return NormalizeRuntimeValue(aggRow["$1"]);
+            }
+
+            return NormalizeRuntimeValue(aggRow);
+        }
+
+        // Non-aggregate projection
+        if (rows.Count == 0)
+        {
+            return UndefinedValue;
+        }
+
+        var projectedResults = rows
+            .Select(row => ProjectRow(row, plan, parameters, databaseId, containerId))
+            .ToList();
+
+        if (projectedResults.Count > 1)
+        {
+            throw CosmosEmulatorException.BadRequest("Scalar subquery must return at most one row.");
+        }
+
+        var result = projectedResults[0];
+        if (result.Count == 1 && result.ContainsKey("$1"))
+        {
+            return NormalizeRuntimeValue(result["$1"]);
+        }
+
+        return NormalizeRuntimeValue(result);
+    }
+
+    private bool EvaluateLike(QueryRow row, LikeBooleanExpression expression, IReadOnlyDictionary<string, object?>? parameters, string? databaseId = null, string? containerId = null)
+    {
+        var left = EvaluateScalarExpression(row, expression.Left, parameters, databaseId: databaseId, containerId: containerId);
+        var pattern = EvaluateScalarExpression(row, expression.Pattern, parameters, databaseId: databaseId, containerId: containerId);
         if (left is not string str || pattern is not string pat)
             return false;
 
@@ -808,28 +1047,34 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return value is bool boolean && boolean;
     }
 
-    private static object? EvaluateScalarExpression(
+    private object? EvaluateScalarExpression(
         QueryRow? row,
         ScalarExpression expression,
         IReadOnlyDictionary<string, object?>? parameters,
-        IReadOnlyList<QueryRow>? group = null)
+        IReadOnlyList<QueryRow>? group = null,
+        string? databaseId = null,
+        string? containerId = null)
     {
         return expression switch
         {
             LiteralExpression literal => literal.Value,
             ParameterExpression parameter => ResolveParameter(parameter.Name, parameters),
             PathExpression path => row is null ? UndefinedValue : ResolvePathValue(row, path.Path),
-            FunctionCallExpression function => EvaluateFunction(row, function, parameters, group),
+            FunctionCallExpression function => EvaluateFunction(row, function, parameters, group, databaseId, containerId),
+            ScalarSubqueryExpression subquery => EvaluateScalarSubquery(subquery, row, parameters, databaseId, containerId),
+            ArrayLiteralExpression arrayLit => EvaluateArrayLiteral(row, arrayLit, parameters, group, databaseId, containerId),
             StarExpression => UndefinedValue,
             _ => throw CosmosEmulatorException.BadRequest("Unsupported expression.")
         };
     }
 
-    private static object? EvaluateFunction(
+    private object? EvaluateFunction(
         QueryRow? row,
         FunctionCallExpression function,
         IReadOnlyDictionary<string, object?>? parameters,
-        IReadOnlyList<QueryRow>? group)
+        IReadOnlyList<QueryRow>? group,
+        string? databaseId = null,
+        string? containerId = null)
     {
         if (IsAggregateFunction(function.Name))
         {
@@ -838,14 +1083,166 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 throw CosmosEmulatorException.BadRequest($"Aggregate function '{function.Name}' is not supported in this context.");
             }
 
-            return EvaluateAggregateFunction(function, group, parameters);
+            return EvaluateAggregateFunction(function, group, parameters, databaseId, containerId);
         }
 
         var arguments = function.Arguments
-            .Select(argument => EvaluateScalarExpression(row, argument, parameters, group))
+            .Select(argument => EvaluateScalarExpression(row, argument, parameters, group, databaseId, containerId))
             .ToList();
 
+        if (function.Name.StartsWith("udf.", StringComparison.OrdinalIgnoreCase))
+        {
+            return EvaluateUdf(function.Name[4..], arguments, databaseId, containerId);
+        }
+
+        if (string.Equals(function.Name, "VECTORDISTANCE", StringComparison.OrdinalIgnoreCase))
+        {
+            return EvaluateVectorDistance(arguments, databaseId, containerId);
+        }
+
         return EvaluateBuiltInFunction(function.Name, arguments);
+    }
+
+    private object? EvaluateUdf(string udfName, IReadOnlyList<object?> arguments, string? databaseId, string? containerId)
+    {
+        if (_programmabilityEngine.Value is null || databaseId is null || containerId is null)
+        {
+            throw CosmosEmulatorException.BadRequest($"Cannot execute UDF '{udfName}': programmability engine or context not available.");
+        }
+
+        var udf = _programmabilityEngine.Value.GetUdfAsync(databaseId, containerId, udfName)
+            .GetAwaiter().GetResult();
+
+        var engine = new Jint.Engine();
+        engine.Execute(udf.Body);
+
+        var jsArguments = arguments.Select(a => Jint.Native.JsValue.FromObject(engine, a)).ToArray();
+        var result = engine.Invoke(udf.Id, jsArguments);
+
+        return result.Type switch
+        {
+            Jint.Runtime.Types.Undefined => UndefinedValue,
+            Jint.Runtime.Types.Null => null,
+            _ => NormalizeRuntimeValue(result.ToObject())
+        };
+    }
+
+    private object? EvaluateVectorDistance(IReadOnlyList<object?> arguments, string? databaseId, string? containerId)
+    {
+        if (arguments.Count < 2)
+        {
+            throw CosmosEmulatorException.BadRequest("VectorDistance requires at least two arguments.");
+        }
+
+        var vec1 = ExtractVector(arguments[0]);
+        var vec2 = ExtractVector(arguments[1]);
+        if (vec1 is null || vec2 is null)
+        {
+            return UndefinedValue;
+        }
+
+        if (vec1.Length != vec2.Length)
+        {
+            throw CosmosEmulatorException.BadRequest("VectorDistance vectors must have the same number of dimensions.");
+        }
+
+        // Determine distance function: default is cosine
+        var distanceFunction = "cosine";
+
+        // 4th argument: options object with distanceFunction override
+        if (arguments.Count >= 4 && arguments[3] is JsonObject options)
+        {
+            if (options["distanceFunction"]?.GetValue<string>() is string df)
+            {
+                distanceFunction = df;
+            }
+        }
+
+        // If no override, try looking up the container's vector embedding policy
+        if (arguments.Count < 4 && databaseId is not null && containerId is not null)
+        {
+            var container = _documentStore.GetContainerAsync(databaseId, containerId)
+                .GetAwaiter().GetResult();
+            if (container.VectorEmbeddingPolicy?.VectorEmbeddings is { Count: > 0 } embeddings)
+            {
+                distanceFunction = embeddings[0].DistanceFunction;
+            }
+        }
+
+        return distanceFunction.ToLowerInvariant() switch
+        {
+            "cosine" => ComputeCosineSimilarity(vec1, vec2),
+            "dotproduct" or "dot product" => ComputeDotProduct(vec1, vec2),
+            "euclidean" => ComputeEuclideanDistance(vec1, vec2),
+            _ => throw CosmosEmulatorException.BadRequest($"Unsupported distance function '{distanceFunction}'.")
+        };
+    }
+
+    private static double[]? ExtractVector(object? value)
+    {
+        if (value is JsonArray array)
+        {
+            var vector = new double[array.Count];
+            for (var i = 0; i < array.Count; i++)
+            {
+                if (array[i] is null)
+                {
+                    return null;
+                }
+
+                if (TryConvertToDouble(NormalizeRuntimeValue(array[i]), out var d))
+                {
+                    vector[i] = d;
+                }
+                else
+                {
+                    return null;
+                }
+            }
+
+            return vector;
+        }
+
+        return null;
+    }
+
+    private static double ComputeCosineSimilarity(double[] a, double[] b)
+    {
+        var dot = 0.0;
+        var magA = 0.0;
+        var magB = 0.0;
+        for (var i = 0; i < a.Length; i++)
+        {
+            dot += a[i] * b[i];
+            magA += a[i] * a[i];
+            magB += b[i] * b[i];
+        }
+
+        var magnitude = Math.Sqrt(magA) * Math.Sqrt(magB);
+        return magnitude == 0 ? 0 : dot / magnitude;
+    }
+
+    private static double ComputeDotProduct(double[] a, double[] b)
+    {
+        var dot = 0.0;
+        for (var i = 0; i < a.Length; i++)
+        {
+            dot += a[i] * b[i];
+        }
+
+        return dot;
+    }
+
+    private static double ComputeEuclideanDistance(double[] a, double[] b)
+    {
+        var sum = 0.0;
+        for (var i = 0; i < a.Length; i++)
+        {
+            var diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+
+        return Math.Sqrt(sum);
     }
 
     private static bool IsAggregateFunction(string functionName)
@@ -853,10 +1250,12 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return functionName.ToUpperInvariant() is "COUNT" or "SUM" or "AVG" or "MIN" or "MAX";
     }
 
-    private static object? EvaluateAggregateFunction(
+    private object? EvaluateAggregateFunction(
         FunctionCallExpression function,
         IReadOnlyList<QueryRow> group,
-        IReadOnlyDictionary<string, object?>? parameters)
+        IReadOnlyDictionary<string, object?>? parameters,
+        string? databaseId = null,
+        string? containerId = null)
     {
         var name = function.Name.ToUpperInvariant();
         if (function.Arguments.Count != 1)
@@ -881,13 +1280,13 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
             return group.Count(row =>
             {
-                var value = EvaluateScalarExpression(row, argument, parameters);
+                var value = EvaluateScalarExpression(row, argument, parameters, databaseId: databaseId, containerId: containerId);
                 return !ReferenceEquals(value, UndefinedValue) && value is not null;
             });
         }
 
         var values = group
-            .Select(row => EvaluateScalarExpression(row, argument, parameters))
+            .Select(row => EvaluateScalarExpression(row, argument, parameters, databaseId: databaseId, containerId: containerId))
             .Where(value => !ReferenceEquals(value, UndefinedValue) && value is not null)
             .ToList();
 
@@ -961,6 +1360,9 @@ public sealed class CosmosQueryEngine : IQueryEngine
             "IS_ARRAY" => EvaluateTypeCheck(arguments, value => value is JsonArray),
             "IS_OBJECT" => EvaluateTypeCheck(arguments, value => value is JsonObject),
             "IS_PRIMITIVE" => EvaluateTypeCheck(arguments, value => value is null or string or bool || TryConvertToDouble(value, out _)),
+            "IS_INTEGER" => EvaluateTypeCheck(arguments, value => TryConvertToDouble(value, out var d) && Math.Abs(d % 1) < double.Epsilon),
+            "IS_FINITE" => EvaluateTypeCheck(arguments, value => TryConvertToDouble(value, out var d) && double.IsFinite(d)),
+            "IS_NAN" => EvaluateTypeCheck(arguments, value => value is double d && double.IsNaN(d)),
             "ABS" => EvaluateUnaryNumber(arguments, Math.Abs),
             "CEILING" => EvaluateUnaryNumber(arguments, Math.Ceiling),
             "FLOOR" => EvaluateUnaryNumber(arguments, Math.Floor),
@@ -974,11 +1376,31 @@ public sealed class CosmosQueryEngine : IQueryEngine
             "SIN" => EvaluateUnaryNumber(arguments, Math.Sin),
             "COS" => EvaluateUnaryNumber(arguments, Math.Cos),
             "TAN" => EvaluateUnaryNumber(arguments, Math.Tan),
+            "ACOS" => EvaluateUnaryNumber(arguments, Math.Acos),
+            "ASIN" => EvaluateUnaryNumber(arguments, Math.Asin),
+            "ATAN" => EvaluateUnaryNumber(arguments, Math.Atan),
+            "ATN2" => EvaluateBinaryNumber(arguments, Math.Atan2),
+            "COT" => EvaluateUnaryNumber(arguments, v => 1.0 / Math.Tan(v)),
+            "SQUARE" => EvaluateUnaryNumber(arguments, v => v * v),
+            "RAND" => Random.Shared.NextDouble(),
+            "NUMBERBIN" => EvaluateNumberBin(arguments),
             "SIGN" => EvaluateUnaryNumber(arguments, v => Math.Sign(v)),
             "TRUNC" => EvaluateUnaryNumber(arguments, Math.Truncate),
             "PI" => Math.PI,
             "DEGREES" => EvaluateUnaryNumber(arguments, v => v * (180.0 / Math.PI)),
             "RADIANS" => EvaluateUnaryNumber(arguments, v => v * (Math.PI / 180.0)),
+            // Integer math
+            "INTADD" => EvaluateIntBinaryOp(arguments, (a, b) => checked(a + b)),
+            "INTSUB" => EvaluateIntBinaryOp(arguments, (a, b) => checked(a - b)),
+            "INTMUL" => EvaluateIntBinaryOp(arguments, (a, b) => checked(a * b)),
+            "INTDIV" => EvaluateIntBinaryOp(arguments, (a, b) => b == 0 ? throw new OverflowException() : checked(a / b)),
+            "INTMOD" => EvaluateIntBinaryOp(arguments, (a, b) => b == 0 ? throw new OverflowException() : a % b),
+            "INTBITAND" => EvaluateIntBinaryOp(arguments, (a, b) => a & b),
+            "INTBITOR" => EvaluateIntBinaryOp(arguments, (a, b) => a | b),
+            "INTBITXOR" => EvaluateIntBinaryOp(arguments, (a, b) => a ^ b),
+            "INTBITNOT" => EvaluateIntUnaryOp(arguments, a => ~a),
+            "INTBITLEFTSHIFT" => EvaluateIntBinaryOp(arguments, (a, b) => a << (int)b),
+            "INTBITRIGHTSHIFT" => EvaluateIntBinaryOp(arguments, (a, b) => a >> (int)b),
             // Advanced string
             "REVERSE" => EvaluateUnaryString(arguments, v => new string(v.Reverse().ToArray())),
             "LTRIM" => EvaluateUnaryString(arguments, v => v.TrimStart()),
@@ -986,10 +1408,15 @@ public sealed class CosmosQueryEngine : IQueryEngine
             "TOSTRING" => arguments.Count >= 1 ? arguments[0]?.ToString() : throw CosmosEmulatorException.BadRequest("ToString expects one argument."),
             "REPLICATE" => EvaluateReplicate(arguments),
             "REGEXMATCH" => EvaluateRegexMatch(arguments),
+            "INDEX_OF" => EvaluateIndexOf(arguments),
+            "STRINGEQUALS" => EvaluateStringEquals(arguments),
+            "STRINGTOARRAY" => EvaluateStringToArray(arguments),
             // Advanced array
             "ARRAY_LENGTH" => EvaluateArrayLength(arguments),
             "ARRAY_CONCAT" => EvaluateArrayConcat(arguments),
             "ARRAY_SLICE" => EvaluateArraySlice(arguments),
+            "SETINTERSECT" => EvaluateSetOperation(arguments, intersect: true),
+            "SETUNION" => EvaluateSetOperation(arguments, intersect: false),
             // Date/time
             "GETCURRENTDATETIME" => DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ"),
             "GETCURRENTTIMESTAMP" => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
@@ -999,6 +1426,17 @@ public sealed class CosmosQueryEngine : IQueryEngine
             "DATETIMEPART" => EvaluateDateTimePart(arguments),
             "DATETIMETOTICKS" => arguments.Count >= 1 && arguments[0] is string dtStr && DateTimeOffset.TryParse(dtStr, out var dto) ? dto.Ticks : throw CosmosEmulatorException.BadRequest("DateTimeToTicks expects a valid datetime string."),
             "TICKSTODATETIME" => arguments.Count >= 1 && TryConvertToDouble(arguments[0], out var ticks) ? new DateTimeOffset((long)ticks, TimeSpan.Zero).ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") : throw CosmosEmulatorException.BadRequest("TicksToDateTime expects a numeric ticks value."),
+            "DATETIMEBIN" => EvaluateDateTimeBin(arguments),
+            "DATETIMEFROMPARTS" => EvaluateDateTimeFromParts(arguments),
+            "DATETIMETOTIMESTAMP" => EvaluateDateTimeToTimestamp(arguments),
+            "TIMESTAMPTODATETIME" => EvaluateTimestampToDateTime(arguments),
+            // Spatial functions
+            "ST_DISTANCE" => EvaluateStDistance(arguments),
+            "ST_WITHIN" => EvaluateStWithin(arguments),
+            "ST_INTERSECTS" => EvaluateStIntersects(arguments),
+            "ST_ISVALID" => EvaluateStIsValid(arguments),
+            "ST_ISVALIDDETAILED" => EvaluateStIsValidDetailed(arguments),
+            "ST_AREA" => EvaluateStArea(arguments),
             _ => throw CosmosEmulatorException.BadRequest($"Unsupported function '{functionName}'.")
         };
     }
@@ -1326,6 +1764,237 @@ public sealed class CosmosQueryEngine : IQueryEngine
         };
     }
 
+    private static object? EvaluateBinaryNumber(IReadOnlyList<object?> arguments, Func<double, double, double> transform)
+    {
+        if (arguments.Count != 2)
+            throw CosmosEmulatorException.BadRequest("Math function expects two arguments.");
+        if (!TryConvertToDouble(arguments[0], out var a) || !TryConvertToDouble(arguments[1], out var b))
+            return null;
+        var result = transform(a, b);
+        return double.IsNaN(result) || double.IsInfinity(result) ? null : result;
+    }
+
+    private static object? EvaluateNumberBin(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2)
+            throw CosmosEmulatorException.BadRequest("NumberBin expects two arguments.");
+        if (!TryConvertToDouble(arguments[0], out var value) || !TryConvertToDouble(arguments[1], out var binSize))
+            return null;
+        if (binSize == 0) return null;
+        return Math.Floor(value / binSize) * binSize;
+    }
+
+    private static bool TryConvertToInt64(object? value, out long result)
+    {
+        switch (value)
+        {
+            case byte b: result = b; return true;
+            case sbyte sb: result = sb; return true;
+            case short s: result = s; return true;
+            case ushort us: result = us; return true;
+            case int i: result = i; return true;
+            case uint ui: result = ui; return true;
+            case long l: result = l; return true;
+            case float f when Math.Abs(f % 1) < float.Epsilon && f is >= long.MinValue and <= long.MaxValue:
+                result = (long)f; return true;
+            case double d when Math.Abs(d % 1) < double.Epsilon && d is >= long.MinValue and <= long.MaxValue:
+                result = (long)d; return true;
+            case decimal m when m == decimal.Truncate(m) && m is >= long.MinValue and <= long.MaxValue:
+                result = (long)m; return true;
+            default:
+                result = default; return false;
+        }
+    }
+
+    private static object? EvaluateIntBinaryOp(IReadOnlyList<object?> arguments, Func<long, long, long> op)
+    {
+        if (arguments.Count != 2)
+            throw CosmosEmulatorException.BadRequest("Integer math function expects two arguments.");
+        if (!TryConvertToInt64(arguments[0], out var a) || !TryConvertToInt64(arguments[1], out var b))
+            return UndefinedValue;
+        try { return op(a, b); }
+        catch (OverflowException) { return UndefinedValue; }
+    }
+
+    private static object? EvaluateIntUnaryOp(IReadOnlyList<object?> arguments, Func<long, long> op)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("Integer math function expects one argument.");
+        if (!TryConvertToInt64(arguments[0], out var a))
+            return UndefinedValue;
+        try { return op(a); }
+        catch (OverflowException) { return UndefinedValue; }
+    }
+
+    private static object? EvaluateIndexOf(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count is < 2 or > 3)
+            throw CosmosEmulatorException.BadRequest("INDEX_OF expects two or three arguments.");
+        if (arguments[0] is not string input || arguments[1] is not string search)
+            return null;
+        var startIndex = 0;
+        if (arguments.Count == 3)
+        {
+            if (!TryConvertToInt32(arguments[2], out startIndex) || startIndex < 0)
+                return null;
+            if (startIndex >= input.Length)
+                return -1;
+        }
+        return input.IndexOf(search, startIndex, StringComparison.Ordinal);
+    }
+
+    private static object? EvaluateStringEquals(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count is < 2 or > 3)
+            throw CosmosEmulatorException.BadRequest("StringEquals expects two or three arguments.");
+        if (arguments[0] is not string str1 || arguments[1] is not string str2)
+            return null;
+        var ignoreCase = arguments.Count == 3 && arguments[2] is true;
+        var comparison = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        return str1.Equals(str2, comparison);
+    }
+
+    private static object? EvaluateStringToArray(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count is < 1 or > 2)
+            throw CosmosEmulatorException.BadRequest("StringToArray expects one or two arguments.");
+        if (arguments[0] is not string input)
+            return null;
+        var result = new JsonArray();
+        if (arguments.Count == 2 && arguments[1] is string separator)
+        {
+            if (string.IsNullOrEmpty(separator))
+            {
+                result.Add(JsonValue.Create(input));
+                return result;
+            }
+            foreach (var part in input.Split(separator))
+                result.Add(JsonValue.Create(part));
+        }
+        else
+        {
+            foreach (var ch in input)
+                result.Add(JsonValue.Create(ch.ToString()));
+        }
+        return result;
+    }
+
+    private static object? EvaluateSetOperation(IReadOnlyList<object?> arguments, bool intersect)
+    {
+        if (arguments.Count != 2)
+            throw CosmosEmulatorException.BadRequest(intersect ? "SetIntersect expects two arguments." : "SetUnion expects two arguments.");
+        if (arguments[0] is not JsonArray arr1 || arguments[1] is not JsonArray arr2)
+            return UndefinedValue;
+
+        var result = new JsonArray();
+        if (intersect)
+        {
+            foreach (var item in arr1)
+            {
+                var normalized = NormalizeRuntimeValue(item);
+                var existsInArr2 = arr2.Any(b => AreEqual(normalized, NormalizeRuntimeValue(b)));
+                var alreadyInResult = result.Any(r => AreEqual(normalized, NormalizeRuntimeValue(r)));
+                if (existsInArr2 && !alreadyInResult)
+                    result.Add(item?.DeepClone());
+            }
+        }
+        else
+        {
+            foreach (var item in arr1)
+            {
+                var normalized = NormalizeRuntimeValue(item);
+                if (!result.Any(r => AreEqual(normalized, NormalizeRuntimeValue(r))))
+                    result.Add(item?.DeepClone());
+            }
+            foreach (var item in arr2)
+            {
+                var normalized = NormalizeRuntimeValue(item);
+                if (!result.Any(r => AreEqual(normalized, NormalizeRuntimeValue(r))))
+                    result.Add(item?.DeepClone());
+            }
+        }
+        return result;
+    }
+
+    private static object? EvaluateDateTimeBin(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count is < 3 or > 4)
+            throw CosmosEmulatorException.BadRequest("DateTimeBin expects three or four arguments.");
+        if (arguments[0] is not string dateStr || arguments[1] is not string part || !TryConvertToDouble(arguments[2], out var binSizeD))
+            return null;
+        if (!DateTimeOffset.TryParse(dateStr, out var dt))
+            return null;
+        var binSize = (long)binSizeD;
+        if (binSize <= 0)
+            throw CosmosEmulatorException.BadRequest("DateTimeBin bin size must be positive.");
+
+        var origin = arguments.Count == 4 && arguments[3] is string originStr && DateTimeOffset.TryParse(originStr, out var o)
+            ? o
+            : new DateTimeOffset(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+        var ticksPerUnit = part.ToLowerInvariant() switch
+        {
+            "year" or "yy" or "yyyy" => TimeSpan.TicksPerDay * 365,
+            "month" or "mm" or "m" => TimeSpan.TicksPerDay * 30,
+            "week" or "wk" or "ww" => TimeSpan.TicksPerDay * 7,
+            "day" or "dd" or "d" => TimeSpan.TicksPerDay,
+            "hour" or "hh" => TimeSpan.TicksPerHour,
+            "minute" or "mi" or "n" => TimeSpan.TicksPerMinute,
+            "second" or "ss" or "s" => TimeSpan.TicksPerSecond,
+            "millisecond" or "ms" => TimeSpan.TicksPerMillisecond,
+            _ => throw CosmosEmulatorException.BadRequest($"Unsupported DateTimeBin part: '{part}'.")
+        };
+
+        var totalBinTicks = ticksPerUnit * binSize;
+        var offsetTicks = dt.Ticks - origin.Ticks;
+        var binNumber = (long)Math.Floor((double)offsetTicks / totalBinTicks);
+        var resultTicks = origin.Ticks + binNumber * totalBinTicks;
+        var result = new DateTimeOffset(resultTicks, TimeSpan.Zero);
+        return result.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ");
+    }
+
+    private static object? EvaluateDateTimeFromParts(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 7)
+            throw CosmosEmulatorException.BadRequest("DateTimeFromParts expects seven arguments (year, month, day, hour, minute, second, millisecond).");
+        if (!TryConvertToInt32(arguments[0], out var year) ||
+            !TryConvertToInt32(arguments[1], out var month) ||
+            !TryConvertToInt32(arguments[2], out var day) ||
+            !TryConvertToInt32(arguments[3], out var hour) ||
+            !TryConvertToInt32(arguments[4], out var minute) ||
+            !TryConvertToInt32(arguments[5], out var second) ||
+            !TryConvertToInt32(arguments[6], out var millisecond))
+            return null;
+        try
+        {
+            var dt = new DateTimeOffset(year, month, day, hour, minute, second, millisecond, TimeSpan.Zero);
+            return dt.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ");
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
+    private static object? EvaluateDateTimeToTimestamp(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("DateTimeToTimestamp expects one argument.");
+        if (arguments[0] is not string dateStr || !DateTimeOffset.TryParse(dateStr, out var dt))
+            return null;
+        return dt.ToUnixTimeMilliseconds();
+    }
+
+    private static object? EvaluateTimestampToDateTime(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("TimestampToDateTime expects one argument.");
+        if (!TryConvertToDouble(arguments[0], out var ms))
+            return null;
+        var dt = DateTimeOffset.FromUnixTimeMilliseconds((long)ms);
+        return dt.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ");
+    }
+
     private static object? ResolvePathValue(QueryRow row, string path)
     {
         var segments = path.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -1376,7 +2045,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return NormalizeRuntimeValue(value);
     }
 
-    private static int ResolveNonNegativeInteger(ScalarExpression expression, IReadOnlyDictionary<string, object?>? parameters, string clauseName)
+    private int ResolveNonNegativeInteger(ScalarExpression expression, IReadOnlyDictionary<string, object?>? parameters, string clauseName)
     {
         var resolved = EvaluateScalarExpression(null, expression, parameters);
         if (!TryConvertToInt32(resolved, out var value) || value < 0)
@@ -1679,13 +2348,13 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 continue;
             }
 
-            if (current == '(')
+            if (current is '(' or '[')
             {
                 depth++;
                 continue;
             }
 
-            if (current == ')')
+            if (current is ')' or ']')
             {
                 depth = Math.Max(0, depth - 1);
                 continue;
@@ -1756,10 +2425,10 @@ public sealed class CosmosQueryEngine : IQueryEngine
                 case '\'':
                     inString = true;
                     break;
-                case '(':
+                case '(' or '[':
                     depth++;
                     break;
-                case ')':
+                case ')' or ']':
                     depth = Math.Max(0, depth - 1);
                     break;
                 default:
@@ -1860,6 +2529,23 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
             if (Current.Type == TokenType.OpenParen)
             {
+                // Peek ahead: if the next token is SELECT, treat as scalar subquery
+                if (_index + 1 < _tokens.Count
+                    && _tokens[_index + 1].Type == TokenType.Identifier
+                    && string.Equals(_tokens[_index + 1].Text, "SELECT", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Parse as scalar subquery, then continue to comparison
+                    var subqueryScalar = ParseScalarPrimary();
+                    if (Current.Type == TokenType.Operator)
+                    {
+                        var comparison = ParseComparisonOperator();
+                        var right = ParseScalarPrimary();
+                        return new ComparisonBooleanExpression(subqueryScalar, comparison, right);
+                    }
+
+                    return new ScalarBooleanExpression(subqueryScalar);
+                }
+
                 _index++;
                 var nested = ParseBooleanExpression();
                 Expect(TokenType.CloseParen, ")");
@@ -1972,6 +2658,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             return Current.Type switch
             {
                 TokenType.OpenParen => ParseParenthesizedScalar(),
+                TokenType.OpenBracket => ParseArrayLiteral(),
                 TokenType.Parameter => ConsumeParameter(),
                 TokenType.String => ConsumeString(),
                 TokenType.Number => ConsumeNumber(),
@@ -1981,9 +2668,40 @@ public sealed class CosmosQueryEngine : IQueryEngine
             };
         }
 
+        private ScalarExpression ParseArrayLiteral()
+        {
+            _index++; // consume [
+            var elements = new List<ScalarExpression>();
+            if (Current.Type != TokenType.CloseBracket)
+            {
+                do
+                {
+                    elements.Add(ParseScalarPrimary());
+                }
+                while (TryConsume(TokenType.Comma));
+            }
+
+            if (Current.Type != TokenType.CloseBracket)
+            {
+                throw CosmosEmulatorException.BadRequest("Expected ']'.");
+            }
+
+            _index++; // consume ]
+            return new ArrayLiteralExpression(elements);
+        }
+
         private ScalarExpression ParseParenthesizedScalar()
         {
             Expect(TokenType.OpenParen, "(");
+
+            if (Current.Type == TokenType.Identifier
+                && string.Equals(Current.Text, "SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                var innerQuery = CollectInnerQueryText();
+                Expect(TokenType.CloseParen, ")");
+                return new ScalarSubqueryExpression(innerQuery);
+            }
+
             var expression = ParseScalarPrimary();
             Expect(TokenType.CloseParen, ")");
             return expression;
@@ -2094,6 +2812,23 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         public bool TryConsumeComma() => TryConsume(TokenType.Comma);
 
+        public string? TryConsumeAlias()
+        {
+            if (!MatchKeyword("AS"))
+            {
+                return null;
+            }
+
+            if (Current.Type != TokenType.Identifier)
+            {
+                throw CosmosEmulatorException.BadRequest("AS requires an alias name.");
+            }
+
+            var alias = Current.Text;
+            _index++;
+            return alias;
+        }
+
         private static List<Token> Tokenize(string text)
         {
             var tokens = new List<Token>();
@@ -2184,6 +2919,14 @@ public sealed class CosmosQueryEngine : IQueryEngine
                         tokens.Add(new Token(TokenType.Comma, ","));
                         index++;
                         break;
+                    case '[':
+                        tokens.Add(new Token(TokenType.OpenBracket, "["));
+                        index++;
+                        break;
+                    case ']':
+                        tokens.Add(new Token(TokenType.CloseBracket, "]"));
+                        index++;
+                        break;
                     case '*':
                         tokens.Add(new Token(TokenType.Asterisk, "*"));
                         index++;
@@ -2260,10 +3003,14 @@ public sealed class CosmosQueryEngine : IQueryEngine
         int? Top,
         int? Offset,
         int? Limit,
-        bool Distinct = false)
+        bool Distinct = false,
+        SubqueryFromSource? FromSubquery = null,
+        ScalarExpression? ArrayIterationSource = null)
     {
         public bool RequiresAggregation => GroupBy.Count > 0 || Projection.ContainsAggregate;
     }
+
+    private sealed record SubqueryFromSource(string InnerQuery, string Alias);
 
     private sealed record JoinClause(string Alias, ScalarExpression SourceExpression);
 
@@ -2340,6 +3087,10 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
     private sealed record StarExpression : ScalarExpression;
 
+    private sealed record ScalarSubqueryExpression(string InnerQuery) : ScalarExpression;
+
+    private sealed record ArrayLiteralExpression(IReadOnlyList<ScalarExpression> Elements) : ScalarExpression;
+
     private enum TokenType
     {
         End,
@@ -2349,6 +3100,8 @@ public sealed class CosmosQueryEngine : IQueryEngine
         Number,
         OpenParen,
         CloseParen,
+        OpenBracket,
+        CloseBracket,
         Comma,
         Operator,
         Asterisk
@@ -2405,4 +3158,83 @@ public sealed class CosmosQueryEngine : IQueryEngine
             return string.Compare(Convert.ToString(x, CultureInfo.InvariantCulture), Convert.ToString(y, CultureInfo.InvariantCulture), StringComparison.Ordinal);
         }
     }
+
+    #region Spatial Functions
+
+    private static object? EvaluateStDistance(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2)
+            throw CosmosEmulatorException.BadRequest("ST_DISTANCE expects two arguments.");
+
+        var g1 = SpatialHelper.TryParseGeoJson(arguments[0]);
+        var g2 = SpatialHelper.TryParseGeoJson(arguments[1]);
+        if (g1 is null || g2 is null)
+            return UndefinedValue;
+
+        return SpatialHelper.GeodesicDistanceMeters(g1, g2);
+    }
+
+    private static object? EvaluateStWithin(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2)
+            throw CosmosEmulatorException.BadRequest("ST_WITHIN expects two arguments.");
+
+        var g1 = SpatialHelper.TryParseGeoJson(arguments[0]);
+        var g2 = SpatialHelper.TryParseGeoJson(arguments[1]);
+        if (g1 is null || g2 is null)
+            return UndefinedValue;
+
+        return g1.Within(g2);
+    }
+
+    private static object? EvaluateStIntersects(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2)
+            throw CosmosEmulatorException.BadRequest("ST_INTERSECTS expects two arguments.");
+
+        var g1 = SpatialHelper.TryParseGeoJson(arguments[0]);
+        var g2 = SpatialHelper.TryParseGeoJson(arguments[1]);
+        if (g1 is null || g2 is null)
+            return UndefinedValue;
+
+        return g1.Intersects(g2);
+    }
+
+    private static object? EvaluateStIsValid(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("ST_ISVALID expects one argument.");
+
+        var (isValid, _) = SpatialHelper.ValidateGeoJson(arguments[0]);
+        return isValid;
+    }
+
+    private static object? EvaluateStIsValidDetailed(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("ST_ISVALIDDETAILED expects one argument.");
+
+        var (isValid, reason) = SpatialHelper.ValidateGeoJson(arguments[0]);
+
+        var result = new JsonObject
+        {
+            ["valid"] = isValid,
+            ["reason"] = reason
+        };
+        return result;
+    }
+
+    private static object? EvaluateStArea(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("ST_AREA expects one argument.");
+
+        var geometry = SpatialHelper.TryParseGeoJson(arguments[0]);
+        if (geometry is null)
+            return UndefinedValue;
+
+        return SpatialHelper.GeodesicAreaSquareMeters(geometry);
+    }
+
+    #endregion
 }

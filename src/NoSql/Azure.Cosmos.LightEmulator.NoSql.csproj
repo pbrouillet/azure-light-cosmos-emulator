@@ -13,6 +13,7 @@
   <ItemGroup>
     <PackageReference Include="Jint" />
     <PackageReference Include="Antlr4.Runtime.Standard" />
+    <PackageReference Include="NetTopologySuite" />
   </ItemGroup>
 
   <ItemGroup>

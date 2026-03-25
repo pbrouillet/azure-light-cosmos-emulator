@@ -71,10 +71,21 @@
 | x-ms-item-count | ✅ |
 | ETag / If-Match | ✅ |
 
+### Spatial Functions
+| Function | Status | Notes |
+|---|---|---|
+| ST_DISTANCE | ✅ | Returns distance in meters (Haversine/WGS84) |
+| ST_WITHIN | ✅ | Point/LineString/Polygon within geometry |
+| ST_INTERSECTS | ✅ | Geometry intersection check |
+| ST_ISVALID | ✅ | GeoJSON validation with coordinate range checks |
+| ST_ISVALIDDETAILED | ✅ | Returns { valid, reason } object |
+| ST_AREA | ✅ | Returns area in square meters (spherical) |
+
 ## Known Limitations
 
 - **Request Units**: Always returns a fixed charge (not metered)
 - **Stored Procedure Context**: Limited `__` context object API
-- **Spatial Indexes**: Not yet implemented
+- **Spatial Indexes**: Spatial index metadata is stored but not used for query optimization (spatial functions work via full scan)
+- **Vector Search**: VectorDistance (brute-force), vector embedding policy, vector indexes (flat/quantizedFlat/diskANN)
 - **Cross-region replication**: Not applicable (single-node)
 - **Conflict resolution**: Simplified (single-node has no conflicts)

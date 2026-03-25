@@ -47,6 +47,10 @@ The Cosmos SQL query engine supports:
 - Built-in functions (ARRAY_CONTAINS, CONTAINS, etc.)
 - Parameterized queries (@param)
 - Cross-partition queries
+- Subqueries: EXISTS, IN (SELECT ...), scalar subqueries in SELECT/WHERE/FROM
+- AS aliases in SELECT projections
+- Vector search: VectorDistance (cosine, dotproduct, euclidean), vector embedding policy, vector indexes
+- Spatial functions: ST_DISTANCE, ST_WITHIN, ST_INTERSECTS, ST_ISVALID, ST_ISVALIDDETAILED, ST_AREA (GeoJSON Point, Polygon, MultiPolygon, LineString)
 
 ## Change Feed
 
