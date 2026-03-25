@@ -154,6 +154,14 @@ Fluent UI v9 components that render portals (dropdowns, comboboxes, dialogs) nee
 - **Unit tests** directly instantiate the class under test (no DI container)
 - **SDK parity tests** (`tests/Parity/`) clone the official Azure Cosmos .NET SDK test suite via MSBuild target (`CloneSdkTests.targets`) and run tests against the emulator. Skip with `-p:SkipCloneSdkTests=true`
 
+### Three DI registration surfaces — keep in sync
+
+There are **three independent** service registration paths. Any new service or controller added to one must be added to the others or you'll get 500 `Unable to resolve service` errors or 404s:
+
+1. **`src/Host/Program.cs`** — production startup (Serilog, explorer static files, throughput enforcement)
+2. **`src/Host/HostApplication.cs`** — CLI / test startup (InMemoryChangeFeedProvider, no throughput middleware, Swagger in dev)
+3. **`tests/NoSql.Tests/TestServerFixture.cs`** — test fixture (minimal DI, test-specific fakes)
+
 ### Adding a new integration test
 
 ```csharp
@@ -173,3 +181,51 @@ public class MyTests : IAsyncLifetime
     }
 }
 ```
+
+## Query Engine — Adding New SQL Functions
+
+The query engine (`src/NoSql/Query/CosmosQueryEngine.cs`) is a hand-rolled SQL parser/evaluator. Target API version: `2024-11-30`.
+
+### Parser limitation: no inline JSON object literals
+
+The expression parser supports array literals (`[1, 2, 3]`), path references (`c.field`), and parameters (`@param`) — but **not** inline JSON object literals (`{"type": "Point", ...}`). Tests for functions that take GeoJSON or complex objects must pass them via document fields or `@parameters`:
+
+```csharp
+// ✅ Correct — use document fields
+await SeedDocumentsAsync(store, CreateDocument("doc-1", "t1", d =>
+{
+    d["location"] = MakePoint(-122.12, 47.67);
+    d["boundary"] = MakePolygon((-122.15, 47.65), ...);
+}));
+var result = await engine.ExecuteQueryAsync("db", "coll",
+    "SELECT ST_DISTANCE(c.location, c.boundary) AS dist FROM c");
+
+// ✅ Also correct — use parameters
+var parameters = new Dictionary<string, object?> { ["@target"] = MakePoint(-122.11, 47.67) };
+var result = await engine.ExecuteQueryAsync("db", "coll",
+    "SELECT ST_DISTANCE(c.location, @target) AS dist FROM c", parameters);
+
+// ❌ Wrong — parser will throw "Unsupported character '{'"
+var result = await engine.ExecuteQueryAsync("db", "coll",
+    """SELECT ST_DISTANCE(c.location, {"type":"Point","coordinates":[-122.11,47.67]}) FROM c""");
+```
+
+### Steps to add a new built-in function
+
+1. Add a case to the `EvaluateBuiltInFunction` switch (around line 1340) — or to `EvaluateFunction` if the function needs container metadata (like `VectorDistance`)
+2. Implement a `private static object? EvaluateMyFunction(IReadOnlyList<object?> arguments)` method
+3. Return `UndefinedValue` for invalid/missing inputs (not `null` — `null` is a valid Cosmos DB value)
+4. Write tests using document fields or parameters (not inline JSON objects)
+5. Update `docs/api-compatibility.md` and `docs/architecture.md`
+
+### Known intentional limitations
+
+- **Request Units**: Formula-based estimation, not real metering (`RuCostCalculator.cs`)
+- **Indexing**: Metadata is stored and round-tripped but not used for query optimization — all queries scan all documents
+- **Consistency levels**: All five accepted; only Session tokens actually enforced (single-node emulator)
+- **Spatial indexes**: Stored on containers but not used for query acceleration
+- **Stored procedure context**: Limited `getContext()` API via Jint (no `collection.createDocument()`, etc.)
+
+## Explorer (React) — Defensive Coding
+
+All Explorer React components must use optional chaining (`?.`) and nullish coalescing (`?? defaultValue`) when accessing API response fields. Backend responses may omit fields or return `null`, and mapping over arrays with missing numeric fields (e.g., `.toFixed()`, `.toUpperCase()`) has caused `TypeError` crashes in multiple sessions.
