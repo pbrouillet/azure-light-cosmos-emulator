@@ -35,6 +35,13 @@ public sealed class TestServerFixture : IAsyncDisposable
 
     public HttpClient Client { get; private set; } = null!;
 
+    public T GetService<T>() where T : notnull
+    {
+        if (_app is null)
+            throw new InvalidOperationException("The test server has not been initialized.");
+        return _app.Services.GetRequiredService<T>();
+    }
+
     public static async Task<TestServerFixture> CreateAsync()
     {
         var fixture = new TestServerFixture();
@@ -104,6 +111,10 @@ public sealed class TestServerFixture : IAsyncDisposable
         builder.WebHost.UseTestServer();
         builder.Services
             .AddControllers()
+            .AddJsonOptions(options =>
+            {
+                options.JsonSerializerOptions.TypeInfoResolverChain.Add(new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver());
+            })
             .AddApplicationPart(typeof(DatabasesController).Assembly);
 
         builder.Services.AddSingleton(_connectionManager);
@@ -120,10 +131,12 @@ public sealed class TestServerFixture : IAsyncDisposable
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ConsistencyLevel.Session));
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         builder.Services.AddSingleton<CosmosResponseHeaderService>();
+        builder.Services.AddSingleton<IQueryTelemetryStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbQueryTelemetryStore>();
 
         _app = builder.Build();
         _app.UseMiddleware<CosmosExceptionMiddleware>();
         _app.UseMiddleware<CosmosAuthMiddleware>();
+        _app.UseMiddleware<ConsistencyMiddleware>();
         _app.MapControllers();
 
         await _app.StartAsync();

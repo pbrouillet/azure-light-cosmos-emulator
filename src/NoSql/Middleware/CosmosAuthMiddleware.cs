@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
@@ -11,6 +12,7 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Middleware;
 /// </summary>
 public class CosmosAuthMiddleware
 {
+    private static readonly JsonSerializerOptions s_jsonOptions = new() { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
     private readonly Microsoft.AspNetCore.Http.RequestDelegate _next;
     private readonly IAuthProvider _authProvider;
 
@@ -51,7 +53,7 @@ public class CosmosAuthMiddleware
             {
                 code = "Unauthorized",
                 message = "Missing Authorization header."
-            });
+            }, s_jsonOptions);
             var missingAuthBytes = System.Text.Encoding.UTF8.GetBytes(missingAuthPayload);
             await context.Response.Body.WriteAsync(missingAuthBytes);
             return;
@@ -72,7 +74,7 @@ public class CosmosAuthMiddleware
             {
                 code = "Unauthorized",
                 message = result.ErrorMessage
-            });
+            }, s_jsonOptions);
             var invalidAuthBytes = System.Text.Encoding.UTF8.GetBytes(invalidAuthPayload);
             await context.Response.Body.WriteAsync(invalidAuthBytes);
             return;

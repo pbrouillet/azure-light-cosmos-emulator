@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization.Metadata;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
@@ -18,6 +19,7 @@ public sealed class CosmosJsContext
     private readonly string _databaseId;
     private readonly string _containerId;
     private readonly PartitionKeyValue _partitionKey;
+    private static readonly JsonSerializerOptions s_jsonOptions = new() { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
     private readonly CancellationToken _ct;
     private readonly CollectionObject _collection;
     private readonly ResponseObject _response;
@@ -72,7 +74,7 @@ public sealed class CosmosJsContext
     internal CosmosDocument CreateDocument(JsValue document)
     {
         var doc = ToJsonObject(document, "doc");
-        return _store.CreateDocumentAsync(_databaseId, _containerId, doc, _ct).GetAwaiter().GetResult();
+        return _store.CreateDocumentAsync(_databaseId, _containerId, doc, ct: _ct).GetAwaiter().GetResult();
     }
 
     internal CosmosDocument ReadDocument(string documentLink)
@@ -164,7 +166,7 @@ public sealed class CosmosJsContext
             throw CosmosEmulatorException.BadRequest($"'{argumentName}' must be a JSON object.");
         }
 
-        var serialized = JsonSerializer.Serialize(hostObject);
+        var serialized = JsonSerializer.Serialize(hostObject, s_jsonOptions);
         var parsed = JsonNode.Parse(serialized) as JsonObject;
         if (parsed is null)
         {
@@ -381,7 +383,7 @@ public sealed class CosmosJsContext
         {
             null => string.Empty,
             string text => text,
-            _ => JsonSerializer.Serialize(value)
+            _ => JsonSerializer.Serialize(value, s_jsonOptions)
         };
     }
 

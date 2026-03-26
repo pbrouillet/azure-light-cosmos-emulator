@@ -62,6 +62,9 @@ internal sealed class DbContainerRecord
 
     [JsonPropertyName("conflictResolutionPolicyJson")]
     public string? ConflictResolutionPolicyJson { get; set; }
+
+    [JsonPropertyName("vectorEmbeddingPolicyJson")]
+    public string? VectorEmbeddingPolicyJson { get; set; }
 }
 
 internal sealed class DbDocumentRecord
@@ -95,6 +98,9 @@ internal sealed class DbDocumentRecord
 
     [JsonPropertyName("timeToLive")]
     public int? TimeToLive { get; set; }
+
+    [JsonPropertyName("isIndexed")]
+    public bool IsIndexed { get; set; } = true;
 }
 
 internal sealed class DbMetaRecord
@@ -190,7 +196,7 @@ public class SurrealDbDocumentStore : IDocumentStore
     private const string OfferTable = "cosmos_offers";
     private const string GlobalLsnKey = "global_lsn";
 
-    private static readonly JsonSerializerOptions JsonOptions = new();
+    private static readonly JsonSerializerOptions JsonOptions = new() { TypeInfoResolverChain = { StorageJsonContext.Default, new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver() } };
     private static readonly IReadOnlyDictionary<string, object?> EmptyParameters = new Dictionary<string, object?>();
 
     private readonly SurrealDbConnectionManager _connectionManager;
@@ -373,7 +379,7 @@ public class SurrealDbDocumentStore : IDocumentStore
         await DeleteRecordAsync(ContainerTable, containerKey, "Container", containerId, ct);
     }
 
-    public async Task<CosmosDocument> CreateDocumentAsync(string databaseId, string containerId, JsonObject document, CancellationToken ct = default)
+    public async Task<CosmosDocument> CreateDocumentAsync(string databaseId, string containerId, JsonObject document, bool? isIndexed = null, CancellationToken ct = default)
     {
         var container = await GetContainerAsync(databaseId, containerId, ct);
         var id = document["id"]?.GetValue<string>()
@@ -388,6 +394,8 @@ public class SurrealDbDocumentStore : IDocumentStore
             throw CosmosEmulatorException.Conflict("Document", id);
         }
 
+        await EnforceUniqueKeyPolicyAsync(container, databaseId, containerId, partitionKey, document, null, ct);
+
         var created = new CosmosDocument
         {
             Id = id,
@@ -397,7 +405,8 @@ public class SurrealDbDocumentStore : IDocumentStore
             Body = document.DeepClone().AsObject(),
             TimeToLive = ExtractTimeToLive(document),
             Lsn = await GetNextLsnAsync(ct),
-            Self = $"dbs/{databaseId}/colls/{containerId}/docs/{id}/"
+            Self = $"dbs/{databaseId}/colls/{containerId}/docs/{id}/",
+            IsIndexed = isIndexed ?? true
         };
 
         await CreateRecordAsync(DocumentTable, documentKey, ToRecord(created), ct);
@@ -417,7 +426,7 @@ public class SurrealDbDocumentStore : IDocumentStore
         return ToCosmosDocument(record);
     }
 
-    public async Task<CosmosDocument> ReplaceDocumentAsync(string databaseId, string containerId, string documentId, JsonObject document, string? ifMatch = null, CancellationToken ct = default)
+    public async Task<CosmosDocument> ReplaceDocumentAsync(string databaseId, string containerId, string documentId, JsonObject document, string? ifMatch = null, bool? isIndexed = null, CancellationToken ct = default)
     {
         EnforceDocumentSizeLimit(document);
 
@@ -432,6 +441,8 @@ public class SurrealDbDocumentStore : IDocumentStore
             throw CosmosEmulatorException.PreconditionFailed($"ETag mismatch. Expected: {ifMatch}, Actual: {existing.ETag}");
         }
 
+        await EnforceUniqueKeyPolicyAsync(container, databaseId, containerId, partitionKey, document, documentId, ct);
+
         var updated = new CosmosDocument
         {
             Id = documentId,
@@ -444,7 +455,8 @@ public class SurrealDbDocumentStore : IDocumentStore
             Lsn = await GetNextLsnAsync(ct),
             Self = existing.Self,
             ETag = ETagGenerator.Generate(),
-            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            IsIndexed = isIndexed ?? existing.IsIndexed
         };
 
         await UpsertRecordAsync(DocumentTable, documentKey, ToRecord(updated), ct);
@@ -452,7 +464,7 @@ public class SurrealDbDocumentStore : IDocumentStore
         return updated;
     }
 
-    public async Task<CosmosDocument> UpsertDocumentAsync(string databaseId, string containerId, JsonObject document, CancellationToken ct = default)
+    public async Task<CosmosDocument> UpsertDocumentAsync(string databaseId, string containerId, JsonObject document, bool? isIndexed = null, CancellationToken ct = default)
     {
         var container = await GetContainerAsync(databaseId, containerId, ct);
         var id = document["id"]?.GetValue<string>()
@@ -463,10 +475,10 @@ public class SurrealDbDocumentStore : IDocumentStore
 
         if (await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct) is not null)
         {
-            return await ReplaceDocumentAsync(databaseId, containerId, id, document, ct: ct);
+            return await ReplaceDocumentAsync(databaseId, containerId, id, document, isIndexed: isIndexed, ct: ct);
         }
 
-        return await CreateDocumentAsync(databaseId, containerId, document, ct);
+        return await CreateDocumentAsync(databaseId, containerId, document, isIndexed, ct);
     }
 
     public async Task<CosmosDocument> PatchDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, IReadOnlyList<PatchOperation> operations, string? ifMatch = null, string? condition = null, CancellationToken ct = default)
@@ -590,7 +602,7 @@ public class SurrealDbDocumentStore : IDocumentStore
             try
             {
                 var result = await ExecuteBatchOperationAsync(
-                    databaseId, containerId, partitionKey, container.PartitionKey,
+                    databaseId, containerId, partitionKey, container,
                     op, snapshots, createdKeys, changeFeedEntries, ct);
                 results.Add(result);
             }
@@ -647,13 +659,14 @@ public class SurrealDbDocumentStore : IDocumentStore
         string databaseId,
         string containerId,
         PartitionKeyValue partitionKey,
-        PartitionKeyDefinition pkDef,
+        CosmosContainer container,
         BatchOperationRequest op,
         Dictionary<string, DbDocumentRecord?> snapshots,
         List<string> createdKeys,
         List<(CosmosDocument doc, ChangeType type, CosmosDocument? previous)> changeFeedEntries,
         CancellationToken ct)
     {
+        var pkDef = container.PartitionKey;
         switch (op.OperationType)
         {
             case BatchOperationType.Create:
@@ -789,6 +802,8 @@ public class SurrealDbDocumentStore : IDocumentStore
                 // Read current state from storage
                 var existingRecord = await SelectRecordAsync<DbDocumentRecord>(DocumentTable, documentKey, ct);
                 CosmosDocument? existing = existingRecord is not null ? ToCosmosDocument(existingRecord) : null;
+
+                await EnforceUniqueKeyPolicyAsync(container, databaseId, containerId, docPk, body, existing is not null ? id : null, ct);
 
                 if (existing is not null)
                 {
@@ -1286,7 +1301,8 @@ public class SurrealDbDocumentStore : IDocumentStore
         DefaultTimeToLive = container.DefaultTimeToLive,
         MaxThroughput = container.MaxThroughput,
         UniqueKeyPolicyJson = SerializeNullable(container.UniqueKeyPolicy),
-        ConflictResolutionPolicyJson = SerializeNullable(container.ConflictResolutionPolicy)
+        ConflictResolutionPolicyJson = SerializeNullable(container.ConflictResolutionPolicy),
+        VectorEmbeddingPolicyJson = SerializeNullable(container.VectorEmbeddingPolicy)
     };
 
     private static CosmosContainer ToCosmosContainer(DbContainerRecord record) => new()
@@ -1304,7 +1320,8 @@ public class SurrealDbDocumentStore : IDocumentStore
         DefaultTimeToLive = record.DefaultTimeToLive,
         MaxThroughput = record.MaxThroughput ?? 400,
         UniqueKeyPolicy = DeserializeNullable<UniqueKeyPolicy>(record.UniqueKeyPolicyJson),
-        ConflictResolutionPolicy = DeserializeNullable<ConflictResolutionPolicy>(record.ConflictResolutionPolicyJson)
+        ConflictResolutionPolicy = DeserializeNullable<ConflictResolutionPolicy>(record.ConflictResolutionPolicyJson),
+        VectorEmbeddingPolicy = DeserializeNullable<VectorEmbeddingPolicy>(record.VectorEmbeddingPolicyJson)
     };
 
     private static DbDocumentRecord ToRecord(CosmosDocument document) => new()
@@ -1318,7 +1335,8 @@ public class SurrealDbDocumentStore : IDocumentStore
         PartitionKeyJson = SerializePartitionKey(document.PartitionKey),
         BodyJson = document.Body.ToJsonString(),
         Lsn = document.Lsn,
-        TimeToLive = document.TimeToLive
+        TimeToLive = document.TimeToLive,
+        IsIndexed = document.IsIndexed
     };
 
     private static CosmosDocument ToCosmosDocument(DbDocumentRecord record) => new()
@@ -1333,7 +1351,8 @@ public class SurrealDbDocumentStore : IDocumentStore
         PartitionKey = DeserializePartitionKey(record.PartitionKeyJson),
         Body = DeserializeJsonObject(record.BodyJson),
         Lsn = record.Lsn,
-        TimeToLive = record.TimeToLive
+        TimeToLive = record.TimeToLive,
+        IsIndexed = record.IsIndexed
     };
 
     private static string? SerializeNullable<T>(T? value)
@@ -1417,6 +1436,66 @@ public class SurrealDbDocumentStore : IDocumentStore
             throw CosmosEmulatorException.EntityTooLarge(
                 $"The document size ({size} bytes) exceeds the maximum allowed size ({MaxDocumentSizeBytes} bytes).");
         }
+    }
+
+    private async Task EnforceUniqueKeyPolicyAsync(
+        CosmosContainer container,
+        string databaseId,
+        string containerId,
+        PartitionKeyValue partitionKey,
+        JsonObject document,
+        string? excludeDocumentId,
+        CancellationToken ct)
+    {
+        if (container.UniqueKeyPolicy?.UniqueKeys is not { Count: > 0 })
+            return;
+
+        var allDocs = await ListDocumentsAsync(databaseId, containerId, ct);
+        var partitionDocs = allDocs.Resources
+            .Where(d => d.PartitionKey.Equals(partitionKey))
+            .Where(d => excludeDocumentId is null || !string.Equals(d.Id, excludeDocumentId, StringComparison.Ordinal));
+
+        foreach (var uniqueKey in container.UniqueKeyPolicy.UniqueKeys)
+        {
+            var newValues = uniqueKey.Paths.Select(path => ExtractValueAtPath(document, path)).ToList();
+
+            foreach (var existing in partitionDocs)
+            {
+                var existingValues = uniqueKey.Paths.Select(path => ExtractValueAtPath(existing.Body, path)).ToList();
+                if (UniqueKeyValuesMatch(newValues, existingValues))
+                {
+                    var pathsStr = string.Join(", ", uniqueKey.Paths);
+                    throw CosmosEmulatorException.Conflict("Document",
+                        $"Unique key constraint violation for paths: {pathsStr}");
+                }
+            }
+        }
+    }
+
+    private static string? ExtractValueAtPath(JsonObject doc, string path)
+    {
+        var segments = path.TrimStart('/').Split('/');
+        JsonNode? current = doc;
+        foreach (var segment in segments)
+        {
+            if (current is JsonObject obj && obj.TryGetPropertyValue(segment, out var next))
+                current = next;
+            else
+                return null;
+        }
+
+        return current?.ToJsonString();
+    }
+
+    private static bool UniqueKeyValuesMatch(List<string?> a, List<string?> b)
+    {
+        if (a.Count != b.Count) return false;
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!string.Equals(a[i], b[i], StringComparison.Ordinal))
+                return false;
+        }
+        return true;
     }
 
     private static void ApplyPatchOperations(JsonObject document, IReadOnlyList<PatchOperation> operations)
@@ -1556,7 +1635,7 @@ public class SurrealDbDocumentStore : IDocumentStore
         long l => JsonValue.Create(l),
         double d => JsonValue.Create(d),
         float f => JsonValue.Create(f),
-        _ => JsonNode.Parse(System.Text.Json.JsonSerializer.Serialize(value))
+        _ => JsonNode.Parse(System.Text.Json.JsonSerializer.Serialize(value, value.GetType(), JsonOptions))
     };
 
     private static object? ConvertJsonNodeToValue(JsonNode? node) => node switch

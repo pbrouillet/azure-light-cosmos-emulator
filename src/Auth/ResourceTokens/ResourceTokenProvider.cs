@@ -150,7 +150,8 @@ public static class ResourceTokenGenerator
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver()
     };
 
     public static string GenerateToken(string masterKey, string resourceLink, ResourcePermission permissions, TimeSpan ttl)

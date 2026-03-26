@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Middleware;
@@ -9,6 +10,7 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Middleware;
 /// </summary>
 public class CosmosExceptionMiddleware
 {
+    private static readonly JsonSerializerOptions s_jsonOptions = new() { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
     private readonly Microsoft.AspNetCore.Http.RequestDelegate _next;
 
     public CosmosExceptionMiddleware(Microsoft.AspNetCore.Http.RequestDelegate next)
@@ -33,7 +35,7 @@ public class CosmosExceptionMiddleware
             {
                 code = ex.ErrorCode,
                 message = ex.Message
-            });
+            }, s_jsonOptions);
             var errorBytes = System.Text.Encoding.UTF8.GetBytes(errorPayload);
             await context.Response.Body.WriteAsync(errorBytes);
         }

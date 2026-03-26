@@ -29,7 +29,10 @@ internal sealed class DbChangeFeedRecord
 public class SurrealDbChangeFeedProvider : IChangeFeedProvider
 {
     private const string ChangeFeedTable = "cosmos_changefeed";
-    private static readonly JsonSerializerOptions JsonOptions = new();
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver()
+    };
     private static readonly IReadOnlyDictionary<string, object?> EmptyParameters = new Dictionary<string, object?>();
 
     private readonly SurrealDbConnectionManager _connectionManager;

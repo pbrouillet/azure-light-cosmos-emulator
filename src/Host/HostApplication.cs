@@ -3,6 +3,7 @@ using Azure.Cosmos.LightEmulator.Core.Consistency;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
 using Azure.Cosmos.LightEmulator.Host.Configuration;
+using Azure.Cosmos.LightEmulator.Kql;
 using Azure.Cosmos.LightEmulator.NoSql.Controllers;
 using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Azure.Cosmos.LightEmulator.NoSql.Middleware;
@@ -51,14 +52,57 @@ public static class HostApplication
         services.AddSingleton<ThroughputManager>();
         services.AddSingleton<IProgrammabilityEngine, JintProgrammabilityEngine>();
         services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
+        services.AddSingleton<IndexValidationService>();
+        services.AddSingleton<QueryExplainService>();
+        services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
         services.AddSingleton<IAuthProvider, EmulatorAuthProvider>();
         services.AddSingleton<CosmosResponseHeaderService>();
+        services.AddSingleton<IQueryTelemetryStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbQueryTelemetryStore>();
+        services.AddSingleton<IActivityStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbActivityStore>();
+        services.AddSingleton<KqlSchemaRegistry>(sp =>
+        {
+            var registry = new KqlSchemaRegistry();
+            registry.RegisterTable(new KqlTableSchema("activity",
+            [
+                new KqlColumnSchema("timestamp", "datetime"),
+                new KqlColumnSchema("method", "string"),
+                new KqlColumnSchema("path", "string"),
+                new KqlColumnSchema("statusCode", "long"),
+                new KqlColumnSchema("requestCharge", "real"),
+                new KqlColumnSchema("latencyMs", "real"),
+                new KqlColumnSchema("databaseId", "string"),
+                new KqlColumnSchema("containerId", "string"),
+            ]));
+            registry.RegisterTable(new KqlTableSchema("telemetry",
+            [
+                new KqlColumnSchema("timestamp", "datetime"),
+                new KqlColumnSchema("databaseId", "string"),
+                new KqlColumnSchema("containerId", "string"),
+                new KqlColumnSchema("sqlText", "string"),
+                new KqlColumnSchema("partitionKey", "string"),
+                new KqlColumnSchema("consistencyLevel", "string"),
+                new KqlColumnSchema("requestCharge", "real"),
+                new KqlColumnSchema("latencyMs", "long"),
+                new KqlColumnSchema("itemCount", "long"),
+                new KqlColumnSchema("statusCode", "long"),
+                new KqlColumnSchema("activityId", "string"),
+                new KqlColumnSchema("isCrossPartition", "bool"),
+            ]));
+            return registry;
+        });
+        services.AddSingleton<KqlQueryExecutor>();
         services.AddHostedService<TtlCleanupService>();
 
         services
             .AddControllers()
-            .AddApplicationPart(typeof(DatabasesController).Assembly);
+            .AddJsonOptions(options =>
+            {
+                options.JsonSerializerOptions.PropertyNamingPolicy = null;
+                options.JsonSerializerOptions.TypeInfoResolverChain.Add(new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver());
+            })
+            .AddApplicationPart(typeof(DatabasesController).Assembly)
+            .AddApplicationPart(typeof(Azure.Cosmos.LightEmulator.Host.Controllers.QueryTelemetryController).Assembly);
 
         services.AddEndpointsApiExplorer();
         services.AddSwaggerGen();
@@ -68,9 +112,15 @@ public static class HostApplication
     {
         app.Services.GetRequiredService<SurrealDbConnectionManager>().InitializeAsync().GetAwaiter().GetResult();
 
+        // Wire up activity store into the RU tracker for persistent logging
+        var ruTracker = app.Services.GetRequiredService<RuTracker>();
+        var activityStore = app.Services.GetRequiredService<IActivityStore>();
+        ruTracker.SetActivityStore(activityStore);
+
         app.UseMiddleware<EmulatorRequestTrackingMiddleware>();
         app.UseMiddleware<CosmosExceptionMiddleware>();
         app.UseMiddleware<CosmosAuthMiddleware>();
+        app.UseMiddleware<ConsistencyMiddleware>();
 
         app.MapMethods("/", ["GET", "HEAD"], async (HttpContext context, CosmosResponseHeaderService responseHeaders, CancellationToken ct) =>
         {

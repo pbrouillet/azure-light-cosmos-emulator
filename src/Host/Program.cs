@@ -93,8 +93,10 @@ public static class Program
                 // Cosmos DB REST API uses PascalCase for collection properties
                 // (Databases, DocumentCollections, Documents, etc.)
                 options.JsonSerializerOptions.PropertyNamingPolicy = null;
+                options.JsonSerializerOptions.TypeInfoResolverChain.Add(new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver());
             })
-            .AddApplicationPart(typeof(DatabasesController).Assembly);
+            .AddApplicationPart(typeof(DatabasesController).Assembly)
+            .AddApplicationPart(typeof(Azure.Cosmos.LightEmulator.Host.Controllers.QueryTelemetryController).Assembly);
 
         builder.Services.AddSingleton(sp =>
         {
@@ -118,6 +120,40 @@ public static class Program
         builder.Services.AddSingleton<IProgrammabilityEngine, Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.JintProgrammabilityEngine>();
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         builder.Services.AddSingleton<CosmosResponseHeaderService>();
+        builder.Services.AddSingleton<IQueryTelemetryStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbQueryTelemetryStore>();
+        builder.Services.AddSingleton<IActivityStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbActivityStore>();
+        builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Kql.KqlSchemaRegistry>(sp =>
+        {
+            var registry = new Azure.Cosmos.LightEmulator.Kql.KqlSchemaRegistry();
+            registry.RegisterTable(new Azure.Cosmos.LightEmulator.Kql.KqlTableSchema("activity",
+            [
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("timestamp", "datetime"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("method", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("path", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("statusCode", "long"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("requestCharge", "real"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("latencyMs", "real"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("databaseId", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("containerId", "string"),
+            ]));
+            registry.RegisterTable(new Azure.Cosmos.LightEmulator.Kql.KqlTableSchema("telemetry",
+            [
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("timestamp", "datetime"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("databaseId", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("containerId", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("sqlText", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("partitionKey", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("consistencyLevel", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("requestCharge", "real"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("latencyMs", "long"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("itemCount", "long"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("statusCode", "long"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("activityId", "string"),
+                new Azure.Cosmos.LightEmulator.Kql.KqlColumnSchema("isCrossPartition", "bool"),
+            ]));
+            return registry;
+        });
+        builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Kql.KqlQueryExecutor>();
         builder.Services.AddHostedService<TtlCleanupService>();
 
         var app = builder.Build();
@@ -128,6 +164,7 @@ public static class Program
         app.UseMiddleware<CosmosExceptionMiddleware>();
         app.UseMiddleware<ThroughputEnforcementMiddleware>();
         app.UseMiddleware<CosmosAuthMiddleware>();
+        app.UseMiddleware<ConsistencyMiddleware>();
 
         if (emulatorOptions.EnableExplorer)
         {
@@ -175,27 +212,31 @@ public static class Program
             var mongoEndpoint = $"mongodb://localhost:{emulatorOptions.MongoPort}";
             var connectionString = $"AccountEndpoint={noSqlEndpoint};AccountKey={emulatorOptions.MasterKey};";
 
+            const int width = 110;
+            const int inner = width - 2;
+            var border = new string('═', inner);
+
             Console.WriteLine();
-            Console.WriteLine("╔══════════════════════════════════════════════════════════════════════════╗");
-            Console.WriteLine("║  Azure Cosmos DB Light Emulator                                        ║");
-            Console.WriteLine("╠══════════════════════════════════════════════════════════════════════════╣");
-            Console.WriteLine($"║  NoSQL Endpoint:   {noSqlEndpoint,-53}║");
-            Console.WriteLine($"║  MongoDB Endpoint: {mongoEndpoint,-53}║");
+            Console.WriteLine($"╔{border}╗");
+            Console.WriteLine($"║{"  Azure Cosmos DB Light Emulator",-108}║");
+            Console.WriteLine($"╠{border}╣");
+            Console.WriteLine($"║  NoSQL Endpoint:   {noSqlEndpoint,-88}║");
+            Console.WriteLine($"║  MongoDB Endpoint: {mongoEndpoint,-88}║");
             if (emulatorOptions.EnableExplorer)
-                Console.WriteLine($"║  Explorer:         {noSqlEndpoint + "/explorer",-53}║");
-            Console.WriteLine($"║  Consistency:      {emulatorOptions.ConsistencyLevel,-53}║");
-            Console.WriteLine("╠══════════════════════════════════════════════════════════════════════════╣");
-            Console.WriteLine($"║  Master Key:                                                          ║");
-            Console.WriteLine($"║    {emulatorOptions.MasterKey,-70}║");
-            Console.WriteLine("╠══════════════════════════════════════════════════════════════════════════╣");
-            Console.WriteLine($"║  Connection String:                                                   ║");
+                Console.WriteLine($"║  Explorer:         {noSqlEndpoint + "/explorer",-88}║");
+            Console.WriteLine($"║  Consistency:      {emulatorOptions.ConsistencyLevel,-88}║");
+            Console.WriteLine($"╠{border}╣");
+            Console.WriteLine($"║{"  Master Key:",-108}║");
+            Console.WriteLine($"║    {emulatorOptions.MasterKey,-104}║");
+            Console.WriteLine($"╠{border}╣");
+            Console.WriteLine($"║{"  Connection String:",-108}║");
             // Break long connection string across lines
-            for (var i = 0; i < connectionString.Length; i += 70)
+            for (var i = 0; i < connectionString.Length; i += 104)
             {
-                var chunk = connectionString.Substring(i, Math.Min(70, connectionString.Length - i));
-                Console.WriteLine($"║    {chunk,-70}║");
+                var chunk = connectionString.Substring(i, Math.Min(104, connectionString.Length - i));
+                Console.WriteLine($"║    {chunk,-104}║");
             }
-            Console.WriteLine("╚══════════════════════════════════════════════════════════════════════════╝");
+            Console.WriteLine($"╚{border}╝");
             Console.WriteLine();
 
             logger.LogInformation("Azure Cosmos Light Emulator listening on {Endpoint}", noSqlEndpoint);
@@ -228,7 +269,7 @@ public static class Program
     /// </summary>
     private static string ResolveExplorerRoot(string contentRoot)
     {
-        var hostAssemblyDir = Path.GetDirectoryName(typeof(Program).Assembly.Location) ?? AppContext.BaseDirectory;
+        var hostAssemblyDir = AppContext.BaseDirectory;
 
         var candidates = new[]
         {

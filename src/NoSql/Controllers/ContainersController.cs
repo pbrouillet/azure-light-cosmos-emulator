@@ -20,6 +20,7 @@ public class ContainersController : CosmosControllerBase
     private static readonly JsonSerializerOptions IndexingPolicySerializerOptions = new()
     {
         PropertyNameCaseInsensitive = true,
+        TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver(),
         Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
     };
 
@@ -61,6 +62,12 @@ public class ContainersController : CosmosControllerBase
 
         if (body["maxThroughput"]?.GetValue<int>() is int maxThroughput)
             container.MaxThroughput = maxThroughput;
+
+        if (body["uniqueKeyPolicy"] is JsonObject uniqueKeyNode)
+            container.UniqueKeyPolicy = JsonSerializer.Deserialize<UniqueKeyPolicy>(uniqueKeyNode, IndexingPolicySerializerOptions);
+
+        if (body["vectorEmbeddingPolicy"] is JsonObject vectorPolicyNode)
+            container.VectorEmbeddingPolicy = JsonSerializer.Deserialize<VectorEmbeddingPolicy>(vectorPolicyNode, IndexingPolicySerializerOptions);
 
         try
         {
@@ -136,6 +143,9 @@ public class ContainersController : CosmosControllerBase
 
             if (body["maxThroughput"]?.GetValue<int>() is int maxThroughput)
                 existing.MaxThroughput = maxThroughput;
+
+            if (body["vectorEmbeddingPolicy"] is JsonObject vectorPolicyNode)
+                existing.VectorEmbeddingPolicy = JsonSerializer.Deserialize<VectorEmbeddingPolicy>(vectorPolicyNode, IndexingPolicySerializerOptions);
 
             var result = await _store.ReplaceContainerAsync(dbId, existing, ct);
             await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
@@ -230,6 +240,8 @@ public class ContainersController : CosmosControllerBase
             version = c.PartitionKey.Version
         },
         indexingPolicy = c.IndexingPolicy,
+        uniqueKeyPolicy = c.UniqueKeyPolicy,
+        vectorEmbeddingPolicy = c.VectorEmbeddingPolicy,
         defaultTtl = c.DefaultTimeToLive,
         maxThroughput = c.MaxThroughput
     };

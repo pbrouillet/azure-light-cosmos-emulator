@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization.Metadata;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
@@ -14,6 +15,7 @@ namespace Azure.Cosmos.LightEmulator.Triggers.Engine;
 public class TriggerEngine
 {
     private static readonly TimeSpan TriggerTimeout = TimeSpan.FromSeconds(5);
+    private static readonly System.Text.Json.JsonSerializerOptions s_jsonOptions = new() { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
 
     private readonly IProgrammabilityEngine _programmability;
 
@@ -91,7 +93,7 @@ public class TriggerEngine
                 {
                     var jsonStr = value.IsString()
                         ? value.AsString()
-                        : System.Text.Json.JsonSerializer.Serialize(value.ToObject());
+                        : System.Text.Json.JsonSerializer.Serialize(value.ToObject(), s_jsonOptions);
                     var json = JsonNode.Parse(jsonStr)?.AsObject();
                     if (json is not null)
                     {
@@ -106,7 +108,7 @@ public class TriggerEngine
                 {
                     var jsonStr = value.IsString()
                         ? value.AsString()
-                        : System.Text.Json.JsonSerializer.Serialize(value.ToObject());
+                        : System.Text.Json.JsonSerializer.Serialize(value.ToObject(), s_jsonOptions);
                     var json = JsonNode.Parse(jsonStr)?.AsObject();
                     if (json is not null)
                     {

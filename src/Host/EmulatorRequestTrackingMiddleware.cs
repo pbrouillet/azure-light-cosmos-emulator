@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using Azure.Cosmos.LightEmulator.Core.Models;
 using Microsoft.AspNetCore.Http;
 
@@ -8,6 +9,10 @@ namespace Azure.Cosmos.LightEmulator.Host;
 
 public sealed class EmulatorRequestTrackingMiddleware(RequestDelegate next)
 {
+    private static readonly JsonSerializerOptions s_jsonOptions = new()
+    {
+        TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+    };
     public async Task InvokeAsync(HttpContext context, RuTracker ruTracker)
     {
         if (!ShouldTrack(context.Request.Path))
@@ -37,7 +42,7 @@ public sealed class EmulatorRequestTrackingMiddleware(RequestDelegate next)
                 requestCharge = Math.Round(requestCharge, 2),
                 partitionId = "0",
                 activityId
-            });
+            }, s_jsonOptions);
 
             return Task.CompletedTask;
         });
@@ -112,6 +117,7 @@ public sealed class EmulatorRequestTrackingMiddleware(RequestDelegate next)
         return !value.Equals("/", StringComparison.OrdinalIgnoreCase)
             && !value.Equals("/api/emulator/activity", StringComparison.OrdinalIgnoreCase)
             && !value.Equals("/api/emulator/explain", StringComparison.OrdinalIgnoreCase)
+            && !value.Equals("/api/emulator/kql", StringComparison.OrdinalIgnoreCase)
             && !value.StartsWith("/api/emulator/throughput", StringComparison.OrdinalIgnoreCase)
             && !value.StartsWith("/explorer", StringComparison.OrdinalIgnoreCase)
             && !value.StartsWith("/health", StringComparison.OrdinalIgnoreCase)
