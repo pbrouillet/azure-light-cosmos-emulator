@@ -23,12 +23,13 @@ public interface IDocumentStore
     Task DeleteContainerAsync(string databaseId, string containerId, CancellationToken ct = default);
 
     // Document operations
-    Task<CosmosDocument> CreateDocumentAsync(string databaseId, string containerId, JsonObject document, CancellationToken ct = default);
+    Task<CosmosDocument> CreateDocumentAsync(string databaseId, string containerId, JsonObject document, bool? isIndexed = null, CancellationToken ct = default);
     Task<CosmosDocument> ReadDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, CancellationToken ct = default);
-    Task<CosmosDocument> ReplaceDocumentAsync(string databaseId, string containerId, string documentId, JsonObject document, string? ifMatch = null, CancellationToken ct = default);
-    Task<CosmosDocument> UpsertDocumentAsync(string databaseId, string containerId, JsonObject document, CancellationToken ct = default);
+    Task<CosmosDocument> ReplaceDocumentAsync(string databaseId, string containerId, string documentId, JsonObject document, string? ifMatch = null, bool? isIndexed = null, CancellationToken ct = default);
+    Task<CosmosDocument> UpsertDocumentAsync(string databaseId, string containerId, JsonObject document, bool? isIndexed = null, CancellationToken ct = default);
     Task<CosmosDocument> PatchDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, IReadOnlyList<PatchOperation> operations, string? ifMatch = null, string? condition = null, CancellationToken ct = default);
     Task DeleteDocumentAsync(string databaseId, string containerId, string documentId, PartitionKeyValue partitionKey, CancellationToken ct = default);
+    Task<int> EmptyContainerAsync(string databaseId, string containerId, CancellationToken ct = default);
     Task<long> GetGlobalLsnAsync(CancellationToken ct = default);
 
     // Batch operations

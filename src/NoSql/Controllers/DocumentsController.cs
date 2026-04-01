@@ -30,6 +30,7 @@ public class DocumentsController : CosmosControllerBase
     private readonly IQueryTelemetryStore _telemetryStore;
     private readonly IConsistencyManager _consistencyManager;
     private readonly QueryExplainService _queryExplainService;
+    private readonly DmlCommandService _dmlCommandService;
 
     public DocumentsController(
         IDocumentStore store,
@@ -38,6 +39,7 @@ public class DocumentsController : CosmosControllerBase
         IQueryTelemetryStore telemetryStore,
         IConsistencyManager consistencyManager,
         QueryExplainService queryExplainService,
+        DmlCommandService dmlCommandService,
         CosmosResponseHeaderService responseHeaders)
         : base(responseHeaders)
     {
@@ -47,6 +49,7 @@ public class DocumentsController : CosmosControllerBase
         _telemetryStore = telemetryStore;
         _consistencyManager = consistencyManager;
         _queryExplainService = queryExplainService;
+        _dmlCommandService = dmlCommandService;
     }
 
     [HttpPost]
@@ -166,6 +169,30 @@ public class DocumentsController : CosmosControllerBase
                 IncludeSessionToken = true,
                 SessionLsn = await _store.GetGlobalLsnAsync(ct)
             }, ct);
+            return NoContent();
+        }
+        catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return NotFound(ErrorResponse(ex.ErrorCode, ex.Message));
+        }
+    }
+
+    [HttpDelete]
+    public async Task<IActionResult> DeleteAll(string dbId, string collId, CancellationToken ct)
+    {
+        try
+        {
+            var deletedCount = await _store.EmptyContainerAsync(dbId, collId, ct);
+
+            await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+            {
+                RequestCharge = RuCostCalculator.Delete() * deletedCount,
+                DatabaseId = dbId,
+                ContainerId = collId,
+                IncludeSessionToken = true,
+                SessionLsn = await _store.GetGlobalLsnAsync(ct)
+            }, ct);
+            Response.Headers[CosmosHeaders.ItemCount] = deletedCount.ToString();
             return NoContent();
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -348,6 +375,41 @@ public class DocumentsController : CosmosControllerBase
         var maxItemCount = Request.Headers[CosmosHeaders.MaxItemCount].FirstOrDefault();
         var continuation = Request.Headers[CosmosHeaders.Continuation].FirstOrDefault();
         var enableScan = Request.Headers[CosmosHeaders.EnableScan].FirstOrDefault();
+
+        // Route DML statements (INSERT/UPDATE/DELETE) to DmlCommandService
+        if (DmlCommandService.IsDml(queryText))
+        {
+            try
+            {
+                var dmlResult = await _dmlCommandService.ExecuteAsync(dbId, collId, queryText, parameters, ct);
+                var dmlCharge = dmlResult.Resources.Count * 5.0; // estimate ~5 RU per affected doc
+                var dmlActivityId = Guid.NewGuid().ToString();
+
+                await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+                {
+                    RequestCharge = dmlCharge,
+                    DatabaseId = dbId,
+                    ContainerId = collId,
+                    IncludeSessionToken = true,
+                    ActivityId = dmlActivityId
+                }, ct);
+                Response.Headers[CosmosHeaders.ItemCount] = dmlResult.Resources.Count.ToString();
+
+                return Ok(new
+                {
+                    _rid = dmlResult.Rid,
+                    Documents = dmlResult.Resources,
+                    _count = dmlResult.Resources.Count
+                });
+            }
+            catch (CosmosEmulatorException ex) when (
+                ex.StatusCode == HttpStatusCode.BadRequest ||
+                ex.StatusCode == HttpStatusCode.NotFound ||
+                ex.StatusCode == HttpStatusCode.Conflict)
+            {
+                return StatusCode((int)ex.StatusCode, ErrorResponse(ex.ErrorCode, ex.Message));
+            }
+        }
 
         // Read effective consistency from middleware
         var effectiveConsistency = HttpContext.Items.TryGetValue(ConsistencyMiddleware.EffectiveConsistencyKey, out var cl)

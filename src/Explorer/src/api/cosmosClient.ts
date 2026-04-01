@@ -6,7 +6,9 @@ import type {
   CosmosQueryParameter,
   CosmosTrigger,
   EmulatorInfo,
+  KqlQueryResult,
   QueryExplainResult,
+  QueryTelemetryEntry,
   EmulatorStats,
   FeedResponse,
   StoredProcedure,
@@ -89,6 +91,14 @@ export class CosmosClient {
     return this.toFeed<CosmosContainer>(body, 'DocumentCollections', headers)
   }
 
+  async getContainer(dbId: string, collId: string): Promise<CosmosContainer> {
+    const { body } = await this.request<CosmosContainer>(
+      `/dbs/${encodeURIComponent(dbId)}/colls/${encodeURIComponent(collId)}`,
+    )
+
+    return body
+  }
+
   async createContainer(
     dbId: string,
     id: string,
@@ -117,6 +127,36 @@ export class CosmosClient {
       `/dbs/${encodeURIComponent(dbId)}/colls/${encodeURIComponent(collId)}`,
       { method: 'DELETE' },
     )
+  }
+
+  async emptyContainer(dbId: string, collId: string): Promise<void> {
+    await this.request(
+      `/dbs/${encodeURIComponent(dbId)}/colls/${encodeURIComponent(collId)}/docs`,
+      { method: 'DELETE' },
+    )
+  }
+
+  async replaceContainer(
+    dbId: string,
+    collId: string,
+    updates: {
+      indexingPolicy?: unknown
+      defaultTtl?: number | null
+      maxThroughput?: number | null
+    },
+  ): Promise<CosmosContainer> {
+    const { body } = await this.request<CosmosContainer>(
+      `/dbs/${encodeURIComponent(dbId)}/colls/${encodeURIComponent(collId)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          id: collId,
+          ...updates,
+        }),
+      },
+    )
+
+    return body
   }
 
   async listDocuments(
@@ -493,6 +533,33 @@ export class CosmosClient {
         body: JSON.stringify({ maxThroughput }),
       },
     )
+    return body
+  }
+
+  async getQueryTelemetry(
+    dbId?: string,
+    containerId?: string,
+    max = 100,
+  ): Promise<QueryTelemetryEntry[]> {
+    const params = new URLSearchParams()
+    if (dbId) params.set('db', dbId)
+    if (containerId) params.set('container', containerId)
+    params.set('max', max.toString())
+    const { body } = await this.request<QueryTelemetryEntry[]>(
+      `/api/emulator/telemetry?${params.toString()}`,
+    )
+    return body
+  }
+
+  async clearQueryTelemetry(): Promise<void> {
+    await this.request('/api/emulator/telemetry', { method: 'DELETE' })
+  }
+
+  async executeKqlQuery(query: string): Promise<KqlQueryResult> {
+    const { body } = await this.request<KqlQueryResult>('/api/emulator/kql', {
+      method: 'POST',
+      body: JSON.stringify({ query }),
+    })
     return body
   }
 

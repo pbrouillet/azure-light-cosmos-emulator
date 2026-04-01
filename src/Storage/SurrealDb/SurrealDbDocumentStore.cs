@@ -538,6 +538,30 @@ public class SurrealDbDocumentStore : IDocumentStore
         await _changeFeed.RecordChangeAsync(databaseId, containerId, removed, ChangeType.Delete, ct: ct);
     }
 
+    public async Task<int> EmptyContainerAsync(string databaseId, string containerId, CancellationToken ct = default)
+    {
+        await GetContainerAsync(databaseId, containerId, ct);
+
+        var documents = await SelectTableRecordsAsync<DbDocumentRecord>(DocumentTable, ct);
+        var containerDocs = documents.Where(d =>
+            string.Equals(d.DatabaseId, databaseId, StringComparison.Ordinal)
+            && string.Equals(d.ContainerId, containerId, StringComparison.Ordinal)).ToList();
+
+        foreach (var document in containerDocs)
+        {
+            var pk = DeserializePartitionKey(document.PartitionKeyJson);
+            var documentKey = MakeDocumentRecordKey(databaseId, containerId, document.Id, pk);
+            var removed = ToCosmosDocument(document);
+            removed.Lsn = await GetNextLsnAsync(ct);
+            removed.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            await DeleteRecordAsync(DocumentTable, documentKey, "Document", document.Id, ct);
+            await _changeFeed.RecordChangeAsync(databaseId, containerId, removed, ChangeType.Delete, ct: ct);
+        }
+
+        return containerDocs.Count;
+    }
+
     public async Task<long> GetGlobalLsnAsync(CancellationToken ct = default)
     {
         var meta = await SelectRecordAsync<DbMetaRecord>(MetaTable, MakeMetaRecordKey(GlobalLsnKey), ct);

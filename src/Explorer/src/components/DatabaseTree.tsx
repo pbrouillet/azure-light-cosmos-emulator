@@ -1,5 +1,5 @@
-import type { ChangeEvent, ReactElement, ReactNode } from 'react'
-import { useCallback, useMemo, useRef, useState } from 'react'
+import type { ReactElement, ReactNode } from 'react'
+import { useMemo, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -40,6 +40,7 @@ import {
   TableRegular,
 } from '@fluentui/react-icons'
 import { cosmosClient } from '../api/cosmosClient'
+import { ImportDocumentsDialog } from './ImportDocumentsDialog'
 import type { CosmosContainer, CosmosDatabase, CosmosDocument } from '../types/cosmos'
 
 const useStyles = makeStyles({
@@ -171,7 +172,7 @@ const useStyles = makeStyles({
   },
 })
 
-type ContainerSection = 'query' | 'sprocs' | 'triggers' | 'udfs'
+type ContainerSection = 'query' | 'documents' | 'settings' | 'sprocs' | 'triggers' | 'udfs'
 
 interface ExplorerSelection {
   dbId?: string
@@ -222,14 +223,9 @@ interface ThroughputTarget {
   collId?: string
 }
 
-interface ImportState {
+interface ImportDialogTarget {
   dbId: string
   collId: string
-  status: 'importing' | 'done'
-  total: number
-  completed: number
-  failed: number
-  errors: string[]
 }
 
 export function DatabaseTree() {
@@ -252,9 +248,8 @@ export function DatabaseTree() {
   const [throughputTarget, setThroughputTarget] = useState<ThroughputTarget | null>(null)
   const [throughputValue, setThroughputValue] = useState('')
   const [throughputEnabled, setThroughputEnabled] = useState(false)
-  const [importState, setImportState] = useState<ImportState | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-  const importTargetRef = useRef<{ dbId: string; collId: string } | null>(null)
+  const [importDialogTarget, setImportDialogTarget] = useState<ImportDialogTarget | null>(null)
+  const [emptyContainerTarget, setEmptyContainerTarget] = useState<ImportDialogTarget | null>(null)
 
   const documentPartitionKeyProperties = useMemo(
     () => (createDocumentTarget ? getPartitionKeyProperties(createDocumentTarget.partitionKeyPaths) : []),
@@ -328,6 +323,14 @@ export function DatabaseTree() {
       if (selection.dbId === variables.dbId && selection.collId === variables.collId) {
         navigate(`/db/${encodeURIComponent(variables.dbId)}`)
       }
+    },
+  })
+
+  const emptyContainerMutation = useMutation({
+    mutationFn: ({ dbId, collId }: { dbId: string; collId: string }) => cosmosClient.emptyContainer(dbId, collId),
+    onSuccess: async (_, variables) => {
+      setEmptyContainerTarget(null)
+      await queryClient.invalidateQueries({ queryKey: ['documents', variables.dbId, variables.collId] })
     },
   })
 
@@ -505,98 +508,7 @@ export function DatabaseTree() {
 
   function handleImportData(dbId: string, collId: string) {
     setContextMenu(null)
-    importTargetRef.current = { dbId, collId }
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ''
-      fileInputRef.current.click()
-    }
-  }
-
-  async function handleImportFileSelected(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
-    const target = importTargetRef.current
-    if (!file || !target) return
-
-    importTargetRef.current = null
-    const { dbId, collId } = target
-
-    try {
-      const text = await file.text()
-      const data: unknown = JSON.parse(text)
-
-      let documents: CosmosDocument[]
-      if (Array.isArray(data)) {
-        documents = data as CosmosDocument[]
-      } else if (
-        data !== null &&
-        typeof data === 'object' &&
-        Array.isArray((data as Record<string, unknown>).documents)
-      ) {
-        documents = (data as Record<string, unknown>).documents as CosmosDocument[]
-      } else {
-        documents = []
-      }
-
-      if (documents.length === 0) {
-        setImportState({
-          dbId, collId,
-          status: 'done',
-          total: 0, completed: 0, failed: 0,
-          errors: ['No documents found in the file.'],
-        })
-        return
-      }
-
-      let completed = 0
-      let failed = 0
-      const errors: string[] = []
-
-      setImportState({
-        dbId, collId,
-        status: 'importing',
-        total: documents.length,
-        completed: 0, failed: 0,
-        errors: [],
-      })
-
-      for (const doc of documents) {
-        try {
-          await cosmosClient.upsertDocument(dbId, collId, doc)
-          completed++
-        } catch (err) {
-          failed++
-          const docId = typeof doc.id === 'string' ? doc.id : '(unknown id)'
-          errors.push(`${docId}: ${err instanceof Error ? err.message : 'Unknown error'}`)
-        }
-
-        setImportState({
-          dbId, collId,
-          status: 'importing',
-          total: documents.length,
-          completed,
-          failed,
-          errors: errors.slice(),
-        })
-      }
-
-      setImportState({
-        dbId, collId,
-        status: 'done',
-        total: documents.length,
-        completed,
-        failed,
-        errors: errors.slice(),
-      })
-
-      await queryClient.invalidateQueries({ queryKey: ['documents', dbId, collId] })
-    } catch (error) {
-      setImportState({
-        dbId, collId,
-        status: 'done',
-        total: 0, completed: 0, failed: 1,
-        errors: [`Failed to read file: ${error instanceof Error ? error.message : 'Unknown error'}`],
-      })
-    }
+    setImportDialogTarget({ dbId, collId })
   }
 
   return (
@@ -730,6 +642,16 @@ export function DatabaseTree() {
                 </button>
                 <button className={styles.contextMenuItem} onClick={() => callbacks.onDelete('container', contextMenu.dbId, contextMenu.collId)}>
                   <DeleteRegular /> Delete Container
+                </button>
+                <button
+                  className={styles.contextMenuItem}
+                  onClick={() => {
+                    setContextMenu(null)
+                    emptyContainerMutation.reset()
+                    setEmptyContainerTarget({ dbId: contextMenu.dbId, collId: contextMenu.collId! })
+                  }}
+                >
+                  <DeleteRegular /> Empty Container
                 </button>
                 <button className={styles.contextMenuItem} onClick={() => void handleExportData(contextMenu.dbId, contextMenu.collId!)}>
                   <ArrowDownloadRegular /> Export Data
@@ -900,6 +822,25 @@ export function DatabaseTree() {
         />
       )}
 
+      {emptyContainerTarget && (
+        <ConfirmDialog
+          confirmLabel={emptyContainerMutation.isPending ? 'Emptying…' : 'Empty'}
+          error={emptyContainerMutation.error}
+          message={`Delete all documents in container "${emptyContainerTarget.collId}"? This cannot be undone.`}
+          onConfirm={() => {
+            emptyContainerMutation.mutate({ dbId: emptyContainerTarget.dbId, collId: emptyContainerTarget.collId })
+          }}
+          onOpenChange={(open) => {
+            if (!open) {
+              emptyContainerMutation.reset()
+              setEmptyContainerTarget(null)
+            }
+          }}
+          open
+          title="Empty container"
+        />
+      )}
+
       {throughputTarget && (
         <ThroughputDialog
           isLoading={throughputQuery.isPending}
@@ -924,84 +865,21 @@ export function DatabaseTree() {
         />
       )}
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".json"
-        style={{ display: 'none' }}
-        onChange={handleImportFileSelected}
-      />
-
-      {importState && (
-        <Dialog
-          modalType="non-modal"
+      {importDialogTarget && (
+        <ImportDocumentsDialog
           open
-          onOpenChange={(_, data) => {
-            if (!data.open && importState.status === 'done') {
-              setImportState(null)
-            }
+          dbId={importDialogTarget.dbId}
+          collId={importDialogTarget.collId}
+          onClose={() => setImportDialogTarget(null)}
+          onImportComplete={() => {
+            void queryClient.invalidateQueries({
+              queryKey: ['documents', importDialogTarget.dbId, importDialogTarget.collId],
+            })
+            void queryClient.invalidateQueries({
+              queryKey: ['tree-documents', importDialogTarget.dbId, importDialogTarget.collId],
+            })
           }}
-        >
-          <DialogSurface
-            backdrop={importState.status === 'done' ? { onClick: () => setImportState(null) } : undefined}
-          >
-            <DialogBody>
-              <DialogTitle>
-                {importState.status === 'importing' ? 'Importing Data' : 'Import Complete'}
-              </DialogTitle>
-              <DialogContent>
-                <div className={styles.dialogFields}>
-                  {importState.status === 'importing' && (
-                    <div className={styles.loadingState}>
-                      <Spinner size="tiny" />
-                      <Text>
-                        Importing {importState.completed + importState.failed}/{importState.total}…
-                      </Text>
-                    </div>
-                  )}
-                  {importState.status === 'done' && (
-                    <>
-                      <Text block>
-                        {importState.completed} of {importState.total} document{importState.total !== 1 ? 's' : ''} imported successfully.
-                      </Text>
-                      {importState.failed > 0 && (
-                        <StatusMessage intent="warning" title={`${importState.failed} document${importState.failed !== 1 ? 's' : ''} failed`}>
-                          {importState.errors.slice(0, 10).map((err, i) => (
-                            <Text key={i} block size={200}>
-                              {err}
-                            </Text>
-                          ))}
-                          {importState.errors.length > 10 && (
-                            <Text block size={200}>
-                              …and {importState.errors.length - 10} more
-                            </Text>
-                          )}
-                        </StatusMessage>
-                      )}
-                      {importState.failed === 0 && importState.total > 0 && (
-                        <StatusMessage intent="success" title="Success">
-                          All documents were imported successfully.
-                        </StatusMessage>
-                      )}
-                      {importState.total === 0 && (
-                        <StatusMessage intent="warning" title="No documents">
-                          {importState.errors[0] ?? 'The file contained no documents.'}
-                        </StatusMessage>
-                      )}
-                    </>
-                  )}
-                </div>
-              </DialogContent>
-              {importState.status === 'done' && (
-                <DialogActions>
-                  <Button appearance="primary" onClick={() => setImportState(null)}>
-                    Close
-                  </Button>
-                </DialogActions>
-              )}
-            </DialogBody>
-          </DialogSurface>
-        </Dialog>
+        />
       )}
     </aside>
   )
@@ -1186,17 +1064,31 @@ function ContainerNode({
             </TreeItem>
           )
         })}
+        <TreeItem
+          itemType="leaf"
+          value={`container-section:${dbId}:${container.id}:settings`}
+        >
+          <TreeItemLayout iconBefore={<SettingsRegular />}>
+            <Button
+              appearance={selection.collId === container.id && selection.section === 'settings' ? 'secondary' : 'transparent'}
+              className={styles.labelButton}
+              onClick={(event) =>
+                handleTreeAction(event, () => navigate(buildContainerSectionPath(dbId, container.id, 'settings')))
+              }
+              size="small"
+            >
+              Settings
+            </Button>
+          </TreeItemLayout>
+        </TreeItem>
       </Tree>
     </TreeItem>
   )
 }
 
-const DOCUMENTS_PAGE_SIZE = 25
-
 function DocumentsSectionNode({
   dbId,
   collId,
-  partitionKeyPaths,
   selection,
 }: {
   dbId: string
@@ -1206,126 +1098,26 @@ function DocumentsSectionNode({
 }) {
   const styles = useStyles()
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
-  const [expanded, setExpanded] = useState(false)
-  const [extraDocs, setExtraDocs] = useState<CosmosDocument[]>([])
-  const [continuation, setContinuation] = useState<string | null | undefined>(undefined)
 
-  const isDocumentsSection = selection.collId === collId && selection.section === 'query'
-
-  const documentsQuery = useQuery({
-    queryKey: ['tree-documents', dbId, collId],
-    queryFn: () => cosmosClient.listDocumentsPaged(dbId, collId, DOCUMENTS_PAGE_SIZE),
-    enabled: expanded,
-  })
-
-  const loadMoreMutation = useMutation({
-    mutationFn: (token: string) =>
-      cosmosClient.listDocumentsPaged(dbId, collId, DOCUMENTS_PAGE_SIZE, token),
-    onSuccess: (data) => {
-      setExtraDocs((prev) => [...prev, ...data.items])
-      setContinuation(data.continuationToken)
-    },
-  })
-
-  const activeContinuation = extraDocs.length > 0 ? continuation : documentsQuery.data?.continuationToken
-  const hasMore = activeContinuation != null && activeContinuation !== ''
-
-  const allDocuments = useMemo(() => {
-    const initial = documentsQuery.data?.items ?? []
-    return [...initial, ...extraDocs]
-  }, [documentsQuery.data, extraDocs])
-
-  const handleOpenChange = useCallback(
-    (_: unknown, data: { open: boolean }) => {
-      setExpanded(data.open)
-      if (!data.open) {
-        setExtraDocs([])
-        setContinuation(undefined)
-        loadMoreMutation.reset()
-        queryClient.removeQueries({ queryKey: ['tree-documents', dbId, collId] })
-      }
-    },
-    [dbId, collId, queryClient, loadMoreMutation],
-  )
-
-  const handleLoadMore = useCallback(() => {
-    if (activeContinuation) {
-      loadMoreMutation.mutate(activeContinuation)
-    }
-  }, [activeContinuation, loadMoreMutation])
+  const isDocumentsSection = selection.collId === collId && (selection.section === 'documents' || selection.section === 'query')
 
   return (
     <TreeItem
-      itemType="branch"
-      onOpenChange={handleOpenChange}
-      open={expanded}
-      value={`container-section:${dbId}:${collId}:query`}
+      itemType="leaf"
+      value={`container-section:${dbId}:${collId}:documents`}
     >
       <TreeItemLayout iconBefore={<DocumentRegular />}>
         <Button
           appearance={isDocumentsSection ? 'secondary' : 'transparent'}
           className={styles.labelButton}
           onClick={(event) =>
-            handleTreeAction(event, () => navigate(buildContainerSectionPath(dbId, collId, 'query')))
+            handleTreeAction(event, () => navigate(buildContainerSectionPath(dbId, collId, 'documents')))
           }
           size="small"
         >
           Documents
         </Button>
       </TreeItemLayout>
-
-      <Tree appearance="subtle" className={styles.childTree} size="small">
-        {documentsQuery.isPending && <LoadingState label="Loading documents…" />}
-        {documentsQuery.isError && (
-          <StatusMessage intent="error" title="Could not load documents">
-            {toErrorMessage(documentsQuery.error)}
-          </StatusMessage>
-        )}
-        {allDocuments.map((doc) => {
-          const isSelected = selection.docId === doc.id
-          return (
-            <TreeItem
-              itemType="leaf"
-              key={`${doc.id}-${doc._rid ?? ''}`}
-              value={`doc:${dbId}:${collId}:${doc.id}`}
-            >
-              <TreeItemLayout iconBefore={<DocumentRegular />}>
-                <Button
-                  appearance={isSelected ? 'secondary' : 'transparent'}
-                  className={styles.labelButton}
-                  onClick={(event) =>
-                    handleTreeAction(event, () =>
-                      navigate(buildDocumentPath(dbId, collId, partitionKeyPaths, doc)),
-                    )
-                  }
-                  size="small"
-                >
-                  {doc.id}
-                </Button>
-              </TreeItemLayout>
-            </TreeItem>
-          )
-        })}
-        {loadMoreMutation.isPending && <LoadingState label="Loading more…" />}
-        {hasMore && !loadMoreMutation.isPending && (
-          <TreeItem itemType="leaf" value={`load-more:${dbId}:${collId}`}>
-            <TreeItemLayout>
-              <Button
-                appearance="transparent"
-                className={styles.labelButton}
-                onClick={(event) => handleTreeAction(event, handleLoadMore)}
-                size="small"
-              >
-                Load more…
-              </Button>
-            </TreeItemLayout>
-          </TreeItem>
-        )}
-        {documentsQuery.isSuccess && allDocuments.length === 0 && (
-          <StatusMessage title="No documents">This container has no documents yet.</StatusMessage>
-        )}
-      </Tree>
     </TreeItem>
   )
 }
@@ -1419,7 +1211,11 @@ function parseSelection(pathname: string): ExplorerSelection {
     segments[2] === 'container' && segments[3]
       ? sectionSegment === 'sprocs' || sectionSegment === 'triggers' || sectionSegment === 'udfs'
         ? sectionSegment
-        : 'query'
+        : sectionSegment === 'documents'
+          ? 'documents'
+          : sectionSegment === 'settings'
+            ? 'settings'
+            : 'query'
       : undefined
 
   return {
@@ -1482,11 +1278,10 @@ function getPartitionKeyProperties(partitionKeyPaths: string[]): string[] {
 }
 
 function getPartitionKeyValue(document: CosmosDocument, partitionKeyPaths: string[]): unknown {
-  const values = partitionKeyPaths.map((path) => document[path.replace(/^\//, '')])
-  if (values.every((value) => value === undefined)) {
-    return undefined
-  }
-
+  const values = partitionKeyPaths.map((path) => {
+    const prop = path.replace(/^\//, '')
+    return prop in document ? document[prop] : null
+  })
   return values.length === 1 ? values[0] : values
 }
 
