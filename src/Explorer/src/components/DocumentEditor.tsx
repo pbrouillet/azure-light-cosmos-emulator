@@ -117,7 +117,7 @@ export function DocumentEditor({
 
   const document = documentQuery.data
   const initialEditorValue = useMemo(
-    () => (document ? JSON.stringify(toEditableDocument(document), null, 2) : '{}'),
+    () => (document ? JSON.stringify(document, null, 2) : '{}'),
     [document],
   )
 
@@ -313,16 +313,6 @@ export function DocumentEditor({
       </div>
     </section>
   )
-}
-
-function toEditableDocument(document: CosmosDocument): CosmosDocument {
-  return Object.entries(document).reduce<CosmosDocument>((next, [key, value]) => {
-    if (!systemProperties.includes(key as (typeof systemProperties)[number])) {
-      next[key] = value
-    }
-
-    return next
-  }, { id: document.id })
 }
 
 function parseJsonObject(value: string): CosmosDocument {
