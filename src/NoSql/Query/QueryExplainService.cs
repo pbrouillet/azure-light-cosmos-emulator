@@ -554,6 +554,8 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
             PathExpression path => path.Path,
             FunctionCallExpression function => $"{function.Name.ToUpperInvariant()}({string.Join(", ", function.Arguments.Select(FormatScalarExpression))})",
             StarExpression => "*",
+            ScalarSubqueryExpression subquery => $"({subquery.InnerQuery})",
+            ArrayLiteralExpression arrayLit => $"[{string.Join(", ", arrayLit.Elements.Select(FormatScalarExpression))}]",
             _ => expression.ToString() ?? string.Empty
         };
     }
@@ -729,10 +731,15 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
 
     private sealed record StarExpression : ScalarExpression;
 
+    private sealed record ScalarSubqueryExpression(string InnerQuery) : ScalarExpression;
+
+    private sealed record ArrayLiteralExpression(IReadOnlyList<ScalarExpression> Elements) : ScalarExpression;
+
     private static class SqlParser
     {
         public static ParsedQuery Parse(string query)
         {
+            query = CosmosQueryEngine.StripSqlComments(query.Trim()).TrimEnd(';').Trim();
             if (!query.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
             {
                 throw CosmosEmulatorException.BadRequest("Only SELECT queries are supported.");
@@ -876,6 +883,57 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
         private static (string FromAlias, IReadOnlyList<JoinClause> Joins) ParseFromClause(string fromClause)
         {
             var remainder = fromClause.Trim();
+
+            // Detect subquery source: (SELECT ...) AS alias
+            if (remainder.StartsWith('('))
+            {
+                var depth = 0;
+                var closeIndex = -1;
+                var inString = false;
+                for (var i = 0; i < remainder.Length; i++)
+                {
+                    var ch = remainder[i];
+                    if (inString)
+                    {
+                        if (ch == '\'' && (i + 1 >= remainder.Length || remainder[i + 1] != '\''))
+                            inString = false;
+                        else if (ch == '\'' && i + 1 < remainder.Length && remainder[i + 1] == '\'')
+                            i++;
+                        continue;
+                    }
+
+                    if (ch == '\'') { inString = true; continue; }
+                    if (ch == '(') { depth++; continue; }
+                    if (ch == ')')
+                    {
+                        depth--;
+                        if (depth == 0) { closeIndex = i; break; }
+                    }
+                }
+
+                if (closeIndex < 0)
+                    throw CosmosEmulatorException.BadRequest("Unsupported FROM clause: unmatched parenthesis.");
+
+                var afterParen = remainder[(closeIndex + 1)..].Trim();
+                string alias;
+                if (afterParen.StartsWith("AS", StringComparison.OrdinalIgnoreCase)
+                    && afterParen.Length > 2
+                    && char.IsWhiteSpace(afterParen[2]))
+                {
+                    afterParen = afterParen[2..].TrimStart();
+                    alias = ReadLeadingIdentifier(afterParen, out _);
+                }
+                else
+                {
+                    alias = ReadLeadingIdentifier(afterParen, out _);
+                }
+
+                if (string.IsNullOrWhiteSpace(alias))
+                    throw CosmosEmulatorException.BadRequest("Subquery in FROM requires an alias.");
+
+                return (alias, []);
+            }
+
             var fromAlias = ReadLeadingIdentifier(remainder, out var consumedLength);
             if (string.IsNullOrWhiteSpace(fromAlias))
             {
@@ -991,13 +1049,13 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
                     continue;
                 }
 
-                if (current == '(')
+                if (current is '(' or '[')
                 {
                     depth++;
                     continue;
                 }
 
-                if (current == ')')
+                if (current is ')' or ']')
                 {
                     depth = Math.Max(0, depth - 1);
                     continue;
@@ -1063,10 +1121,10 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
                     case '\'':
                         inString = true;
                         break;
-                    case '(':
+                    case '(' or '[':
                         depth++;
                         break;
-                    case ')':
+                    case ')' or ']':
                         depth = Math.Max(0, depth - 1);
                         break;
                     default:
@@ -1214,6 +1272,7 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
             return Current.Type switch
             {
                 TokenType.OpenParen => ParseParenthesizedScalar(),
+                TokenType.OpenBracket => ParseArrayLiteral(),
                 TokenType.Parameter => ConsumeParameter(),
                 TokenType.String => ConsumeString(),
                 TokenType.Number => ConsumeNumber(),
@@ -1223,9 +1282,40 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
             };
         }
 
+        private ScalarExpression ParseArrayLiteral()
+        {
+            _index++; // consume [
+            var elements = new List<ScalarExpression>();
+            if (Current.Type != TokenType.CloseBracket)
+            {
+                do
+                {
+                    elements.Add(ParseScalarPrimary());
+                }
+                while (TryConsume(TokenType.Comma));
+            }
+
+            if (Current.Type != TokenType.CloseBracket)
+            {
+                throw CosmosEmulatorException.BadRequest("Expected ']'.");
+            }
+
+            _index++; // consume ]
+            return new ArrayLiteralExpression(elements);
+        }
+
         private ScalarExpression ParseParenthesizedScalar()
         {
             Expect(TokenType.OpenParen, "(");
+
+            if (Current.Type == TokenType.Identifier
+                && string.Equals(Current.Text, "SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                var innerQuery = CollectInnerQueryText();
+                Expect(TokenType.CloseParen, ")");
+                return new ScalarSubqueryExpression(innerQuery);
+            }
+
             var expression = ParseScalarPrimary();
             Expect(TokenType.CloseParen, ")");
             return expression;
@@ -1311,6 +1401,36 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
                 "<=" => ComparisonOperator.LessThanOrEqual,
                 _ => throw CosmosEmulatorException.BadRequest("Unsupported comparison operator.")
             };
+        }
+
+        private string CollectInnerQueryText()
+        {
+            var depth = 0;
+            var parts = new List<string>();
+            while (Current.Type != TokenType.End)
+            {
+                if (Current.Type == TokenType.OpenParen)
+                {
+                    depth++;
+                }
+                else if (Current.Type == TokenType.CloseParen)
+                {
+                    if (depth == 0)
+                    {
+                        break;
+                    }
+
+                    depth--;
+                }
+
+                var text = Current.Type == TokenType.String
+                    ? "'" + Current.Text.Replace("'", "''") + "'"
+                    : Current.Text;
+                parts.Add(text);
+                _index++;
+            }
+
+            return string.Join(" ", parts);
         }
 
         private bool TryConsume(TokenType tokenType)
@@ -1424,6 +1544,14 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
                         tokens.Add(new Token(TokenType.Comma, ","));
                         index++;
                         break;
+                    case '[':
+                        tokens.Add(new Token(TokenType.OpenBracket, "["));
+                        index++;
+                        break;
+                    case ']':
+                        tokens.Add(new Token(TokenType.CloseBracket, "]"));
+                        index++;
+                        break;
                     case '*':
                         tokens.Add(new Token(TokenType.Asterisk, "*"));
                         index++;
@@ -1465,6 +1593,8 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
         Number,
         OpenParen,
         CloseParen,
+        OpenBracket,
+        CloseBracket,
         Comma,
         Operator,
         Asterisk

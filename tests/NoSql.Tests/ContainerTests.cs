@@ -48,7 +48,7 @@ public class ContainerTests
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
         var body = await ReadBodyAsync(response);
-        var ids = body["documentCollections"]!
+        var ids = body["DocumentCollections"]!
             .AsArray()
             .Select(container => container!["id"]!.GetValue<string>())
             .ToArray();

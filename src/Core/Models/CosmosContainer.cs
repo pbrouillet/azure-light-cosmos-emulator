@@ -40,4 +40,7 @@ public class CosmosContainer
 
     /// <summary>Conflict resolution policy.</summary>
     public ConflictResolutionPolicy? ConflictResolutionPolicy { get; set; }
+
+    /// <summary>Vector embedding policy for vector search.</summary>
+    public VectorEmbeddingPolicy? VectorEmbeddingPolicy { get; set; }
 }

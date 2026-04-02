@@ -24,6 +24,23 @@ public sealed class TtlCleanupService(
         }
     }
 
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await base.StopAsync(cancellationToken);
+        }
+        catch (AggregateException ex) when (ex.InnerExceptions.All(e => e is ObjectDisposedException))
+        {
+            // The SurrealDB embedded client creates linked CancellationTokenSource instances
+            // from the stoppingToken for each database operation. A race condition between
+            // CTS disposal and callback execution causes ObjectDisposedException when the
+            // stopping token is canceled during shutdown. This is benign — the service is
+            // stopping and no data integrity is at risk.
+            logger.LogDebug("Suppressed CancellationTokenSource disposal race during shutdown.");
+        }
+    }
+
     private async Task RunCleanupAsync(CancellationToken ct)
     {
         try

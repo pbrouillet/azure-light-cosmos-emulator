@@ -10,20 +10,46 @@
 ## CORE PROVIDER & STYLING
 
 ### FluentProvider
-\\\	s
-import { FluentProvider } from '@fluentui/react-components';
+```ts
+import { FluentProvider, PortalMountNodeProvider } from '@fluentui/react-components';
 
 interface FluentProviderProps {
   theme?: PartialTheme;           // Theme object
   dir?: 'ltr' | 'rtl';
-  applyStylesToPortals?: boolean; // default: true
+  applyStylesToPortals?: boolean; // default: true — SET TO FALSE (see below)
   targetDocument?: Document;      // For SSR
 }
+```
 
-<FluentProvider theme={teamsLightTheme}>
-  {/* All child components */}
-</FluentProvider>
-\\\
+**CRITICAL: Portal styling bug.** `applyStylesToPortals` must be `false` in this project.
+When `true` (default), FluentProvider passes its full Griffel className (including
+`background-color: var(--colorNeutralBackground1)`) to every portal mount node. Portal
+mount nodes render with `position: absolute; z-index: 1000000`. In Edge/Chromium, an
+opaque background on a z-index:1000000 element triggers GPU compositor layer occlusion —
+the compositor skips painting lower-z content, making it visually disappear. Setting
+`applyStylesToPortals={false}` passes only the CSS variable class (theme tokens) to
+portals, not the visual Griffel classes. All portal content components (`DialogSurface`,
+`PopoverSurface`, etc.) set their own explicit `background-color` and `color`.
+
+**Portal mount node setup.** Use `PortalMountNodeProvider` to redirect portals inside
+`#root` (instead of `document.body`) so they share the same stacking context:
+```tsx
+function Root() {
+  const [portalNode, setPortalNode] = useState<HTMLDivElement | undefined>()
+  const portalRef = useCallback((node: HTMLDivElement | null) => {
+    if (node) setPortalNode(node)
+  }, [])
+
+  return (
+    <FluentProvider applyStylesToPortals={false} theme={webDarkTheme}>
+      <PortalMountNodeProvider value={portalNode}>
+        <App />
+      </PortalMountNodeProvider>
+      <div ref={portalRef} />
+    </FluentProvider>
+  )
+}
+```
 
 ### makeStyles (Griffel)
 \\\	s

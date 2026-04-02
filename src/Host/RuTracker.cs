@@ -1,17 +1,19 @@
 using System.Collections.Concurrent;
+using System.Text.Json.Serialization;
+using Azure.Cosmos.LightEmulator.Core.Interfaces;
 
 namespace Azure.Cosmos.LightEmulator.Host;
 
 public class ActivityLogEntry
 {
-    public DateTimeOffset Timestamp { get; set; }
-    public string Method { get; set; } = "";
-    public string Path { get; set; } = "";
-    public int StatusCode { get; set; }
-    public double RequestCharge { get; set; }
-    public double LatencyMs { get; set; }
-    public string? DatabaseId { get; set; }
-    public string? ContainerId { get; set; }
+    [JsonPropertyName("timestamp")] public DateTimeOffset Timestamp { get; set; }
+    [JsonPropertyName("method")] public string Method { get; set; } = "";
+    [JsonPropertyName("path")] public string Path { get; set; } = "";
+    [JsonPropertyName("statusCode")] public int StatusCode { get; set; }
+    [JsonPropertyName("requestCharge")] public double RequestCharge { get; set; }
+    [JsonPropertyName("latencyMs")] public double LatencyMs { get; set; }
+    [JsonPropertyName("databaseId")] public string? DatabaseId { get; set; }
+    [JsonPropertyName("containerId")] public string? ContainerId { get; set; }
 }
 
 public sealed class RuTracker
@@ -24,6 +26,12 @@ public sealed class RuTracker
     private long _totalRequests;
     private double _totalRu;
     private readonly DateTimeOffset _startTime = DateTimeOffset.UtcNow;
+    private IActivityStore? _activityStore;
+
+    public void SetActivityStore(IActivityStore activityStore)
+    {
+        _activityStore = activityStore;
+    }
 
     public void RecordRequest(
         double ru,
@@ -60,6 +68,32 @@ public sealed class RuTracker
 
         while (_recentActivity.Count > MaxRecentActivity && _recentActivity.TryDequeue(out _))
         {
+        }
+
+        // Fire-and-forget persist to SurrealDB
+        if (_activityStore is not null)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _activityStore.RecordAsync(new ActivityEntry
+                    {
+                        Timestamp = DateTimeOffset.UtcNow,
+                        Method = method ?? string.Empty,
+                        Path = path ?? string.Empty,
+                        StatusCode = statusCode ?? 0,
+                        RequestCharge = ru,
+                        LatencyMs = latencyMs ?? 0,
+                        DatabaseId = databaseId,
+                        ContainerId = containerId
+                    });
+                }
+                catch
+                {
+                    // Best-effort persistence — don't fail the request pipeline
+                }
+            });
         }
     }
 

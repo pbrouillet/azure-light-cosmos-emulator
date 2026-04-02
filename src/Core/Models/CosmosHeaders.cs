@@ -20,6 +20,7 @@ public static class CosmosHeaders
     public const string IsUpsert = "x-ms-documentdb-is-upsert";
     public const string PreTriggerInclude = "x-ms-documentdb-pre-trigger-include";
     public const string PostTriggerInclude = "x-ms-documentdb-post-trigger-include";
+    public const string IndexingDirective = "x-ms-indexing-directive";
     public const string IsBatchRequest = "x-ms-cosmos-is-batch-request";
     public const string IncrementalFeed = "A-IM";
     public const string ContentType = "Content-Type";
@@ -40,6 +41,7 @@ public static class CosmosHeaders
     public const string CosmosItemLsn = "x-ms-cosmos-item-llsn";
     public const string LastStateChangeUtc = "x-ms-last-state-change-utc";
     public const string Diagnostics = "x-ms-cosmos-diagnostics";
+    public const string PartitionKeyRangeId = "x-ms-documentdb-partitionkeyrangeid";
 
     // Content types
     public const string JsonContentType = "application/json";

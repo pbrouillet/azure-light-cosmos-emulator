@@ -16,6 +16,8 @@ public class IndexingPolicy
     public List<CompositeIndex>? CompositeIndexes { get; set; }
 
     public List<SpatialIndex>? SpatialIndexes { get; set; }
+
+    public List<VectorIndex>? VectorIndexes { get; set; }
 }
 
 public enum IndexingMode

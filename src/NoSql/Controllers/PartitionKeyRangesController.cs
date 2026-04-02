@@ -11,7 +11,12 @@ public class PartitionKeyRangesController(CosmosResponseHeaderService responseHe
     [HttpGet]
     public async Task<IActionResult> List(string dbId, string collId, CancellationToken ct)
     {
-        await SetCommonHeadersAsync(new CosmosResponseHeaderOptions { DatabaseId = dbId, ContainerId = collId }, ct);
+        await SetCommonHeadersAsync(new CosmosResponseHeaderOptions
+        {
+            RequestCharge = 1.0,
+            DatabaseId = dbId,
+            ContainerId = collId
+        }, ct);
         Response.Headers[CosmosHeaders.ItemCount] = "1";
 
         return Ok(new
@@ -23,10 +28,15 @@ public class PartitionKeyRangesController(CosmosResponseHeaderService responseHe
                 {
                     id = "0",
                     _rid = "0",
+                    _self = $"dbs/{dbId}/colls/{collId}/pkranges/0/",
+                    _etag = "\"00000000-0000-0000-0000-000000000000\"",
+                    _ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                     minInclusive = string.Empty,
                     maxExclusive = "FF",
+                    ridPrefix = 0,
                     throughputFraction = 1,
-                    status = "online"
+                    status = "online",
+                    parents = Array.Empty<string>()
                 }
             },
             _count = 1

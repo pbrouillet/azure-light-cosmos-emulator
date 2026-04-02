@@ -6,10 +6,12 @@ using Azure.Cosmos.LightEmulator.Auth.KeyAuth;
 using Azure.Cosmos.LightEmulator.Core.Models;
 using Azure.Cosmos.LightEmulator.Host;
 using Azure.Cosmos.LightEmulator.Host.Configuration;
+using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Azure.Cosmos.LightEmulator.Parity;
 
@@ -105,12 +107,59 @@ public abstract class ParityTestBase : IAsyncLifetime
 
         if (_app is not null)
         {
-            await _app.DisposeAsync();
+            // Explicitly dispose the SurrealDB connection manager first so RocksDB
+            // releases its file locks before we attempt to delete the data directory.
+            try
+            {
+                var connectionManager = _app.Services.GetService<SurrealDbConnectionManager>();
+                if (connectionManager is not null)
+                {
+                    await connectionManager.DisposeAsync();
+                }
+            }
+            catch (Exception)
+            {
+                // Best-effort — the manager may already be disposed.
+            }
+
+            try
+            {
+                await _app.StopAsync();
+            }
+            catch (Exception)
+            {
+                // CancellationTokenSource disposal race during shutdown is benign.
+            }
+
+            try
+            {
+                await _app.DisposeAsync();
+            }
+            catch (AggregateException)
+            {
+                // Suppress disposal exceptions from CTS/SurrealDB cleanup race.
+            }
         }
 
         if (_dataDirectory is not null && Directory.Exists(_dataDirectory))
         {
-            Directory.Delete(_dataDirectory, recursive: true);
+            // RocksDB may still hold file locks briefly after disposal; retry with back-off
+            for (var attempt = 0; attempt < 10; attempt++)
+            {
+                try
+                {
+                    Directory.Delete(_dataDirectory, recursive: true);
+                    return;
+                }
+                catch (IOException) when (attempt < 9)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(200 * (attempt + 1)));
+                }
+                catch (UnauthorizedAccessException) when (attempt < 9)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(200 * (attempt + 1)));
+                }
+            }
         }
     }
 }

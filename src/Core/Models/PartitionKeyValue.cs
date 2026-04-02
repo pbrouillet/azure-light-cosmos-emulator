@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace Azure.Cosmos.LightEmulator.Core.Models;
 
@@ -34,7 +33,7 @@ public class PartitionKeyValue
         var parts = Components.Select(c => c switch
         {
             null => "null",
-            string s => JsonSerializer.Serialize(s),
+            string s => $"\"{JsonEncodedText.Encode(s)}\"",
             bool b => b ? "true" : "false",
             _ => c.ToString() ?? "null"
         });

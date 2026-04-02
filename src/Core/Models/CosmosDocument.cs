@@ -44,6 +44,9 @@ public class CosmosDocument
     /// <summary>Logical sequence number for change feed ordering.</summary>
     public long Lsn { get; set; }
 
+    /// <summary>Whether this document is included in query indexes (affected by x-ms-indexing-directive).</summary>
+    public bool IsIndexed { get; set; } = true;
+
     /// <summary>
     /// Merges system properties into the body for serialization.
     /// </summary>

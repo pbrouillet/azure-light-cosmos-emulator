@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
@@ -92,6 +93,7 @@ public sealed class StubQueryEngine : IQueryEngine
         };
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = "SurrealDbDocumentStore is rooted via TrimmerRootAssembly")]
     private IEnumerable<CosmosDocument> GetContainerDocuments(string databaseId, string containerId)
     {
         if (_documentStore is not SurrealDbDocumentStore surrealStore)

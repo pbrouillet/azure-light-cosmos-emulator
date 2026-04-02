@@ -160,4 +160,69 @@ public class CosmosQueryEngineTests
 
         return (store, new CosmosQueryEngine(store, new IndexValidationService()));
     }
+
+    [Theory]
+    [InlineData("-- leading comment\nSELECT * FROM c", "")]
+    [InlineData("/* block comment */ SELECT * FROM c", "")]
+    [InlineData("-- line1\n-- line2\nSELECT * FROM c", "")]
+    [InlineData("/* multi\nline\ncomment */\nSELECT * FROM c", "")]
+    [InlineData("SELECT * FROM c -- trailing comment", "")]
+    [InlineData("SELECT * FROM c /* inline */ WHERE c.id = '1'", "")]
+    public void StripSqlComments_RemovesComments(string input, string _)
+    {
+        var result = CosmosQueryEngine.StripSqlComments(input);
+
+        result.Trim().Should().StartWith("SELECT", "comments before SELECT should be stripped");
+        result.Should().NotContain("--");
+        result.Should().NotContain("/*");
+        result.Should().NotContain("*/");
+    }
+
+    [Fact]
+    public void StripSqlComments_PreservesStringLiterals()
+    {
+        var input = "SELECT * FROM c WHERE c.name = '-- not a comment'";
+        var result = CosmosQueryEngine.StripSqlComments(input);
+
+        result.Should().Contain("'-- not a comment'");
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_AcceptsQueryWithLeadingSingleLineComment()
+    {
+        var (store, engine) = CreateSut();
+        await SeedDocumentsAsync(store,
+            CreateDocument("doc-1", "t1", "alpha", 5, 2, "a", ["tag1"], true));
+
+        var result = await engine.ExecuteQueryAsync("db", "coll",
+            "-- get all docs\nSELECT * FROM c");
+
+        result.Resources.Should().ContainSingle();
+        result.Resources[0]["id"]!.GetValue<string>().Should().Be("doc-1");
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_AcceptsQueryWithLeadingBlockComment()
+    {
+        var (store, engine) = CreateSut();
+        await SeedDocumentsAsync(store,
+            CreateDocument("doc-1", "t1", "alpha", 5, 2, "a", ["tag1"], true));
+
+        var result = await engine.ExecuteQueryAsync("db", "coll",
+            "/* fetch all documents */ SELECT * FROM c");
+
+        result.Resources.Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_RejectsNonSelectEvenWithComments()
+    {
+        var (_, engine) = CreateSut();
+
+        var act = () => engine.ExecuteQueryAsync("db", "coll",
+            "-- this is a comment\nDELETE FROM c");
+
+        await act.Should().ThrowAsync<Core.Exceptions.CosmosEmulatorException>()
+            .WithMessage("*Only SELECT queries are supported*");
+    }
 }

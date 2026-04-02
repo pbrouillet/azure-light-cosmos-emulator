@@ -2,7 +2,7 @@ import { useCallback, useImperativeHandle, useMemo, useRef, useState } from 'rea
 import type { Ref } from 'react'
 import Editor from '@monaco-editor/react'
 import type { Monaco } from '@monaco-editor/react'
-import type { IDisposable } from 'monaco-editor'
+import type { IDisposable, editor, Position } from 'monaco-editor'
 import { useMutation } from '@tanstack/react-query'
 import {
   Badge,
@@ -213,7 +213,7 @@ const useStyles = makeStyles({
 function registerCosmosSqlCompletionProvider(monaco: Monaco): IDisposable {
   return monaco.languages.registerCompletionItemProvider('sql', {
     triggerCharacters: ['.', ' '],
-    provideCompletionItems(model, position) {
+    provideCompletionItems(model: editor.ITextModel, position: Position) {
       const word = model.getWordUntilPosition(position)
       const range = {
         startLineNumber: position.lineNumber,
@@ -248,13 +248,27 @@ function registerCosmosSqlCompletionProvider(monaco: Monaco): IDisposable {
       const functions = [
         'CONTAINS', 'STARTSWITH', 'ENDSWITH', 'UPPER', 'LOWER', 'CONCAT',
         'LENGTH', 'SUBSTRING', 'REPLACE', 'TRIM', 'LEFT', 'RIGHT', 'REVERSE',
-        'LTRIM', 'RTRIM', 'REPLICATE', 'ARRAY_CONTAINS', 'ARRAY_LENGTH',
-        'ARRAY_CONCAT', 'ARRAY_SLICE', 'IS_STRING', 'IS_NUMBER', 'IS_BOOL',
+        'LTRIM', 'RTRIM', 'REPLICATE', 'INDEX_OF', 'StringEquals', 'StringToArray',
+        'StringToBoolean', 'StringToNull', 'StringToNumber', 'StringToObject',
+        'IIF',
+        'ARRAY_CONTAINS', 'ARRAY_CONTAINS_ALL', 'ARRAY_CONTAINS_ANY', 'ARRAY_LENGTH',
+        'ARRAY_CONCAT', 'ARRAY_SLICE', 'SetIntersect', 'SetUnion',
+        'IS_STRING', 'IS_NUMBER', 'IS_BOOL',
         'IS_NULL', 'IS_ARRAY', 'IS_OBJECT', 'IS_PRIMITIVE', 'IS_DEFINED',
+        'IS_INTEGER', 'IS_FINITE', 'IS_NAN',
         'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ABS', 'CEILING', 'FLOOR',
         'ROUND', 'POWER', 'SQRT', 'LOG', 'LOG10', 'EXP', 'SIN', 'COS',
-        'TAN', 'PI', 'GETCURRENTDATETIME', 'GETCURRENTTIMESTAMP',
-        'DATETIMEADD', 'DATETIMEDIFF', 'REGEXMATCH',
+        'TAN', 'ACOS', 'ASIN', 'ATAN', 'ATN2', 'COT', 'SQUARE', 'RAND',
+        'NumberBin', 'PI', 'SIGN', 'TRUNC', 'DEGREES', 'RADIANS',
+        'IntAdd', 'IntSub', 'IntMul', 'IntDiv', 'IntMod',
+        'IntBitAnd', 'IntBitOr', 'IntBitXor', 'IntBitNot',
+        'IntBitLeftShift', 'IntBitRightShift',
+        'GETCURRENTDATETIME', 'GETCURRENTTIMESTAMP', 'GETCURRENTTICKS',
+        'DATETIMEADD', 'DATETIMEDIFF', 'DATETIMEPART',
+        'DATETIMETOTICKS', 'TICKSTODATETIME',
+        'DateTimeBin', 'DateTimeFromParts', 'DateTimeToTimestamp', 'TimestampToDateTime',
+        'REGEXMATCH',
+        'FullTextContains', 'FullTextContainsAll', 'FullTextContainsAny', 'FullTextScore',
       ]
 
       const suggestions = [
@@ -328,9 +342,10 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
     [executeQuery],
   )
 
-  const columns = useMemo(() => {
-    const items = queryMutation.data?.items ?? []
-    return Array.from(new Set(items.flatMap((item) => Object.keys(item))))
+  const resultsJson = useMemo(() => {
+    const items = queryMutation.data?.items
+    if (!items || items.length === 0) return ''
+    return JSON.stringify(items, null, 2)
   }, [queryMutation.data])
 
   const explainPlanJson = useMemo(
@@ -566,32 +581,25 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
               <Body1 className={styles.subtleText}>No items returned.</Body1>
             )}
 
-            {(queryMutation.data?.items.length ?? 0) > 0 && (
+            {resultsJson.length > 0 && (
               <div className={styles.resultsWrapper}>
-                <table className={styles.table}>
-                  <thead>
-                    <tr>
-                      {columns.map((column) => (
-                        <th className={styles.headCell} key={column}>
-                          <Text as="span" size={200} weight="semibold">
-                            {column}
-                          </Text>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {queryMutation.data?.items.map((item, index) => (
-                      <tr key={`${item.id}-${index}`}>
-                        {columns.map((column) => (
-                          <td className={styles.bodyCell} key={`${item.id}-${column}`}>
-                            {formatCellValue(item[column])}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <Editor
+                  defaultLanguage="json"
+                  height={`${Math.min(Math.max(resultsJson.split('\n').length * 19, 120), 600)}px`}
+                  onChange={() => {}}
+                  options={{
+                    automaticLayout: true,
+                    folding: true,
+                    fontSize: 13,
+                    lineNumbers: 'on',
+                    minimap: { enabled: false },
+                    readOnly: true,
+                    scrollBeyondLastLine: false,
+                    wordWrap: 'on',
+                  }}
+                  theme={isDark ? 'vs-dark' : 'vs'}
+                  value={resultsJson}
+                />
               </div>
             )}
 
@@ -614,6 +622,7 @@ export function QueryEditor({ dbId, collId, executeRef }: QueryEditorProps) {
           <Textarea
             className={styles.textarea}
             onChange={(_, data) => setParametersJson(data.value)}
+            placeholder='[{"name": "@param", "value": "..."}]'
             resize="vertical"
             rows={10}
             value={parametersJson}
@@ -655,7 +664,17 @@ function MetricCard({ label, value }: { label: string; value: string }) {
 }
 
 function parseParameters(value: string): CosmosQueryParameter[] {
-  const parsed = JSON.parse(value) as unknown
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    // Retry with single quotes replaced by double quotes (common copy-paste mistake)
+    try {
+      parsed = JSON.parse(value.replace(/'/g, '"'))
+    } catch {
+      throw new Error('Invalid JSON parameters. Use double quotes for property names and string values.')
+    }
+  }
   if (!Array.isArray(parsed)) {
     throw new Error('Parameters must be a JSON array.')
   }
@@ -685,14 +704,4 @@ function formatNumber(value: number | string): string {
   return Number.isInteger(value) ? value.toString() : value.toFixed(1)
 }
 
-function formatCellValue(value: unknown): string {
-  if (value === null) {
-    return 'null'
-  }
 
-  if (value === undefined) {
-    return '—'
-  }
-
-  return typeof value === 'string' ? value : JSON.stringify(value)
-}

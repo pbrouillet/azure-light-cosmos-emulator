@@ -38,6 +38,7 @@ public sealed class CosmosResponseHeaderService(
         response.Headers[CosmosHeaders.GlobalCommittedLsn] = globalLsn.ToString(CultureInfo.InvariantCulture);
         response.Headers[CosmosHeaders.CosmosLlsn] = globalLsn.ToString(CultureInfo.InvariantCulture);
         response.Headers[CosmosHeaders.LastStateChangeUtc] = runtimeState.StartedAtUtc.UtcDateTime.ToString("R", CultureInfo.InvariantCulture);
+        response.Headers[CosmosHeaders.PartitionKeyRangeId] = "0";
 
         if (options.ItemLsn.HasValue)
         {

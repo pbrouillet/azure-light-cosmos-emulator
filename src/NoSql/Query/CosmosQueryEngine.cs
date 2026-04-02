@@ -14,6 +14,7 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Query;
 public sealed class CosmosQueryEngine : IQueryEngine
 {
     private static readonly object UndefinedValue = new();
+    private static readonly AsyncLocal<DateTimeOffset> s_queryNow = new();
 
     private readonly IDocumentStore _documentStore;
     private readonly IndexValidationService _indexValidation;
@@ -41,6 +42,11 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         ct.ThrowIfCancellationRequested();
+
+        // Capture a fixed timestamp for the entire query execution so that
+        // GetCurrentDateTime / GetCurrentTimestamp / GetCurrentTicks return
+        // the same value for every row (matching Cosmos DB behavior).
+        s_queryNow.Value = DateTimeOffset.UtcNow;
 
         var plan = ParseQuery(query, parameters);
         var container = await _documentStore.GetContainerAsync(databaseId, containerId, ct);
@@ -232,7 +238,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
     private QueryPlan ParseQuery(string query, IReadOnlyDictionary<string, object?>? parameters)
     {
-        var trimmedQuery = query.Trim().TrimEnd(';').Trim();
+        var trimmedQuery = StripSqlComments(query.Trim()).TrimEnd(';').Trim();
         if (!trimmedQuery.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
         {
             throw CosmosEmulatorException.BadRequest("Only SELECT queries are supported.");
@@ -309,6 +315,72 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         return new QueryPlan(fromAlias, joins, projection, where, groupBy, orderBy, top, offset, limit, distinct, fromSubquery, arrayIterationSource);
+    }
+
+    /// <summary>
+    /// Strips single-line (<c>-- ...</c>) and multi-line (<c>/* ... */</c>) SQL comments from query text.
+    /// </summary>
+    internal static string StripSqlComments(string sql)
+    {
+        var sb = new System.Text.StringBuilder(sql.Length);
+        var i = 0;
+        while (i < sql.Length)
+        {
+            if (i + 1 < sql.Length && sql[i] == '-' && sql[i + 1] == '-')
+            {
+                // Single-line comment: skip to end of line
+                i += 2;
+                while (i < sql.Length && sql[i] != '\n')
+                    i++;
+                if (i < sql.Length)
+                    i++; // skip the newline itself
+            }
+            else if (i + 1 < sql.Length && sql[i] == '/' && sql[i + 1] == '*')
+            {
+                // Multi-line comment: skip to closing */
+                i += 2;
+                while (i + 1 < sql.Length && !(sql[i] == '*' && sql[i + 1] == '/'))
+                    i++;
+                if (i + 1 < sql.Length)
+                    i += 2; // skip */
+            }
+            else if (sql[i] == '\'' || sql[i] == '"')
+            {
+                // String literal: copy verbatim (don't strip comments inside strings)
+                var quote = sql[i];
+                sb.Append(sql[i]);
+                i++;
+                while (i < sql.Length)
+                {
+                    sb.Append(sql[i]);
+                    if (sql[i] == quote)
+                    {
+                        i++;
+                        // Handle escaped quotes (double quote)
+                        if (i < sql.Length && sql[i] == quote)
+                        {
+                            sb.Append(sql[i]);
+                            i++;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        i++;
+                    }
+                }
+            }
+            else
+            {
+                sb.Append(sql[i]);
+                i++;
+            }
+        }
+
+        return sb.ToString();
     }
 
     private static bool ParseDistinct(ref string selectClause)
@@ -1411,16 +1483,24 @@ public sealed class CosmosQueryEngine : IQueryEngine
             "INDEX_OF" => EvaluateIndexOf(arguments),
             "STRINGEQUALS" => EvaluateStringEquals(arguments),
             "STRINGTOARRAY" => EvaluateStringToArray(arguments),
+            "STRINGTOBOOLEAN" => EvaluateStringToBoolean(arguments),
+            "STRINGTONULL" => EvaluateStringToNull(arguments),
+            "STRINGTONUMBER" => EvaluateStringToNumber(arguments),
+            "STRINGTOOBJECT" => EvaluateStringToObject(arguments),
+            // Conditional
+            "IIF" => EvaluateIif(arguments),
             // Advanced array
             "ARRAY_LENGTH" => EvaluateArrayLength(arguments),
             "ARRAY_CONCAT" => EvaluateArrayConcat(arguments),
             "ARRAY_SLICE" => EvaluateArraySlice(arguments),
+            "ARRAY_CONTAINS_ALL" => EvaluateArrayContainsAllOrAny(arguments, all: true),
+            "ARRAY_CONTAINS_ANY" => EvaluateArrayContainsAllOrAny(arguments, all: false),
             "SETINTERSECT" => EvaluateSetOperation(arguments, intersect: true),
             "SETUNION" => EvaluateSetOperation(arguments, intersect: false),
-            // Date/time
-            "GETCURRENTDATETIME" => DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ"),
-            "GETCURRENTTIMESTAMP" => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            "GETCURRENTTICKS" => DateTimeOffset.UtcNow.Ticks,
+            // Date/time (use per-query captured timestamp for consistency)
+            "GETCURRENTDATETIME" => s_queryNow.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ"),
+            "GETCURRENTTIMESTAMP" => s_queryNow.Value.ToUnixTimeMilliseconds(),
+            "GETCURRENTTICKS" => s_queryNow.Value.Ticks,
             "DATETIMEADD" => EvaluateDateTimeAdd(arguments),
             "DATETIMEDIFF" => EvaluateDateTimeDiff(arguments),
             "DATETIMEPART" => EvaluateDateTimePart(arguments),
@@ -1430,6 +1510,11 @@ public sealed class CosmosQueryEngine : IQueryEngine
             "DATETIMEFROMPARTS" => EvaluateDateTimeFromParts(arguments),
             "DATETIMETOTIMESTAMP" => EvaluateDateTimeToTimestamp(arguments),
             "TIMESTAMPTODATETIME" => EvaluateTimestampToDateTime(arguments),
+            // Full-text search (simplified emulator approximation)
+            "FULLTEXTCONTAINS" => EvaluateFullTextContains(arguments),
+            "FULLTEXTCONTAINSALL" => EvaluateFullTextContainsAllOrAny(arguments, all: true),
+            "FULLTEXTCONTAINSANY" => EvaluateFullTextContainsAllOrAny(arguments, all: false),
+            "FULLTEXTSCORE" => EvaluateFullTextScore(arguments),
             // Spatial functions
             "ST_DISTANCE" => EvaluateStDistance(arguments),
             "ST_WITHIN" => EvaluateStWithin(arguments),
@@ -1454,9 +1539,9 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
     private static object? EvaluateArrayContains(IReadOnlyList<object?> arguments)
     {
-        if (arguments.Count != 2)
+        if (arguments.Count is < 2 or > 3)
         {
-            throw CosmosEmulatorException.BadRequest("ARRAY_CONTAINS expects two arguments.");
+            throw CosmosEmulatorException.BadRequest("ARRAY_CONTAINS expects two or three arguments.");
         }
 
         if (arguments[0] is not JsonArray array)
@@ -1464,9 +1549,17 @@ public sealed class CosmosQueryEngine : IQueryEngine
             return false;
         }
 
+        var partialMatch = arguments.Count == 3 && arguments[2] is true;
+
         foreach (var item in array)
         {
-            if (AreEqual(NormalizeRuntimeValue(item), arguments[1]))
+            var normalized = NormalizeRuntimeValue(item);
+            if (partialMatch && normalized is JsonObject itemObj && arguments[1] is JsonObject searchObj)
+            {
+                if (IsPartialMatch(itemObj, searchObj))
+                    return true;
+            }
+            else if (AreEqual(normalized, arguments[1]))
             {
                 return true;
             }
@@ -1856,27 +1949,19 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
     private static object? EvaluateStringToArray(IReadOnlyList<object?> arguments)
     {
-        if (arguments.Count is < 1 or > 2)
-            throw CosmosEmulatorException.BadRequest("StringToArray expects one or two arguments.");
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("StringToArray expects one argument.");
         if (arguments[0] is not string input)
-            return null;
-        var result = new JsonArray();
-        if (arguments.Count == 2 && arguments[1] is string separator)
+            return UndefinedValue;
+        try
         {
-            if (string.IsNullOrEmpty(separator))
-            {
-                result.Add(JsonValue.Create(input));
-                return result;
-            }
-            foreach (var part in input.Split(separator))
-                result.Add(JsonValue.Create(part));
+            var node = JsonNode.Parse(input.Trim());
+            return node is JsonArray array ? array : UndefinedValue;
         }
-        else
+        catch
         {
-            foreach (var ch in input)
-                result.Add(JsonValue.Create(ch.ToString()));
+            return UndefinedValue;
         }
-        return result;
     }
 
     private static object? EvaluateSetOperation(IReadOnlyList<object?> arguments, bool intersect)
@@ -1914,6 +1999,148 @@ public sealed class CosmosQueryEngine : IQueryEngine
             }
         }
         return result;
+    }
+
+    // ── STRINGTO* functions (Cosmos DB JSON-parsing semantics) ───────────
+
+    private static object? EvaluateStringToBoolean(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("StringToBoolean expects one argument.");
+        if (arguments[0] is not string input)
+            return UndefinedValue;
+        var trimmed = input.Trim();
+        if (trimmed == "true") return true;
+        if (trimmed == "false") return false;
+        return UndefinedValue;
+    }
+
+    private static object? EvaluateStringToNull(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("StringToNull expects one argument.");
+        if (arguments[0] is not string input)
+            return UndefinedValue;
+        return input.Trim() == "null" ? null : UndefinedValue;
+    }
+
+    private static object? EvaluateStringToNumber(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("StringToNumber expects one argument.");
+        if (arguments[0] is not string input)
+            return UndefinedValue;
+        var trimmed = input.Trim();
+        if (long.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var longVal))
+            return (double)longVal;
+        if (double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var dblVal))
+            return dblVal;
+        return UndefinedValue;
+    }
+
+    private static object? EvaluateStringToObject(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 1)
+            throw CosmosEmulatorException.BadRequest("StringToObject expects one argument.");
+        if (arguments[0] is not string input)
+            return UndefinedValue;
+        try
+        {
+            var node = JsonNode.Parse(input.Trim());
+            return node is JsonObject obj ? obj : UndefinedValue;
+        }
+        catch
+        {
+            return UndefinedValue;
+        }
+    }
+
+    // ── IIF conditional ─────────────────────────────────────────────────
+
+    private static object? EvaluateIif(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 3)
+            throw CosmosEmulatorException.BadRequest("IIF expects three arguments.");
+        // Cosmos DB IIF: only boolean true returns the true-branch; all other values (numbers, strings, arrays, objects, null) return the false-branch.
+        return arguments[0] is true ? arguments[1] : arguments[2];
+    }
+
+    // ── ARRAY_CONTAINS_ALL / ARRAY_CONTAINS_ANY ─────────────────────────
+
+    private static object? EvaluateArrayContainsAllOrAny(IReadOnlyList<object?> arguments, bool all)
+    {
+        if (arguments.Count < 2)
+            throw CosmosEmulatorException.BadRequest($"ARRAY_CONTAINS_{(all ? "ALL" : "ANY")} expects at least two arguments.");
+        if (arguments[0] is not JsonArray array)
+            return false;
+
+        for (var i = 1; i < arguments.Count; i++)
+        {
+            var found = array.Any(item => AreEqual(NormalizeRuntimeValue(item), arguments[i]));
+            if (all && !found) return false;
+            if (!all && found) return true;
+        }
+
+        return all;
+    }
+
+    // ── Partial object matching helper (for ARRAY_CONTAINS 3rd param) ───
+
+    private static bool IsPartialMatch(JsonObject candidate, JsonObject search)
+    {
+        foreach (var prop in search)
+        {
+            if (!candidate.TryGetPropertyValue(prop.Key, out var candidateValue))
+                return false;
+            if (!AreEqual(NormalizeRuntimeValue(candidateValue), NormalizeRuntimeValue(prop.Value)))
+                return false;
+        }
+        return true;
+    }
+
+    // ── Full-text search (simplified emulator approximation) ────────────
+
+    private static object? EvaluateFullTextContains(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count != 2)
+            throw CosmosEmulatorException.BadRequest("FullTextContains expects two arguments.");
+        if (arguments[0] is not string text || arguments[1] is not string search)
+            return false;
+        return text.Contains(search, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static object? EvaluateFullTextContainsAllOrAny(IReadOnlyList<object?> arguments, bool all)
+    {
+        if (arguments.Count < 2)
+            throw CosmosEmulatorException.BadRequest($"FullTextContains{(all ? "All" : "Any")} expects at least two arguments.");
+        if (arguments[0] is not string text)
+            return false;
+
+        for (var i = 1; i < arguments.Count; i++)
+        {
+            if (arguments[i] is not string term) continue;
+            var found = text.Contains(term, StringComparison.OrdinalIgnoreCase);
+            if (all && !found) return false;
+            if (!all && found) return true;
+        }
+
+        return all;
+    }
+
+    private static object? EvaluateFullTextScore(IReadOnlyList<object?> arguments)
+    {
+        if (arguments.Count < 2)
+            throw CosmosEmulatorException.BadRequest("FullTextScore expects at least two arguments.");
+        if (arguments[0] is not string text)
+            return 0.0;
+
+        var score = 0.0;
+        for (var i = 1; i < arguments.Count; i++)
+        {
+            if (arguments[i] is string term && text.Contains(term, StringComparison.OrdinalIgnoreCase))
+                score += 1.0;
+        }
+        return score;
     }
 
     private static object? EvaluateDateTimeBin(IReadOnlyList<object?> arguments)

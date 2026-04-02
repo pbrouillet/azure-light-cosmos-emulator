@@ -46,4 +46,7 @@ public class QueryOptions
 
     /// <summary>Enable index scan for queries on excluded paths or IndexingMode.None.</summary>
     public bool EnableScan { get; set; }
+
+    /// <summary>The effective consistency level for this query request.</summary>
+    public ConsistencyLevel? ConsistencyLevel { get; set; }
 }

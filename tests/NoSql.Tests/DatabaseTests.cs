@@ -36,7 +36,7 @@ public class DatabaseTests
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
         var body = await ReadBodyAsync(response);
-        var ids = body["databases"]!
+        var ids = body["Databases"]!
             .AsArray()
             .Select(database => database!["id"]!.GetValue<string>())
             .ToArray();

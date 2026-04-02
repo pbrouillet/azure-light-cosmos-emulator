@@ -24,12 +24,18 @@
   <Folder Name="/src/Triggers/">
     <Project Path="src/Triggers/Azure.Cosmos.LightEmulator.Triggers.csproj" />
   </Folder>
+  <Folder Name="/src/Kql/">
+    <Project Path="src/Kql/Azure.Cosmos.LightEmulator.Kql.csproj" />
+  </Folder>
   <Folder Name="/tests/" />
   <Folder Name="/tests/Auth.Tests/">
     <Project Path="tests/Auth.Tests/Azure.Cosmos.LightEmulator.Auth.Tests.csproj" />
   </Folder>
   <Folder Name="/tests/Core.Tests/">
     <Project Path="tests/Core.Tests/Azure.Cosmos.LightEmulator.Core.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/Host.Tests/">
+    <Project Path="tests/Host.Tests/Azure.Cosmos.LightEmulator.Host.Tests.csproj" />
   </Folder>
   <Folder Name="/tests/MongoDB.Tests/">
     <Project Path="tests/MongoDB.Tests/Azure.Cosmos.LightEmulator.MongoDB.Tests.csproj" />
@@ -42,5 +48,8 @@
   </Folder>
   <Folder Name="/tests/Storage.Tests/">
     <Project Path="tests/Storage.Tests/Azure.Cosmos.LightEmulator.Storage.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/Kql.Tests/">
+    <Project Path="tests/Kql.Tests/Azure.Cosmos.LightEmulator.Kql.Tests.csproj" />
   </Folder>
 </Solution>

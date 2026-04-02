@@ -10,6 +10,12 @@ namespace Azure.Cosmos.LightEmulator.Auth.KeyAuth;
 /// </summary>
 public class MasterKeyAuthProvider : IAuthProvider
 {
+    /// <summary>
+    /// The well-known default master key used by the Azure Cosmos DB Emulator.
+    /// </summary>
+    public const string DefaultMasterKey =
+        "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
+
     private readonly byte[] _keyBytes;
 
     public MasterKeyAuthProvider(string masterKey)

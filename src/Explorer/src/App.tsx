@@ -49,16 +49,19 @@ import {
 } from 'react-router-dom'
 import { cosmosClient } from './api/cosmosClient'
 import { ClusterSettings } from './components/ClusterSettings'
+import { ContainerSettingsPanel } from './components/ContainerSettingsPanel'
 import { DatabaseTree } from './components/DatabaseTree'
 import { DocumentEditor } from './components/DocumentEditor'
+import { DocumentListPanel } from './components/DocumentListPanel'
 import { ProgrammabilityEditor } from './components/ProgrammabilityEditor'
 import { QueryEditor } from './components/QueryEditor'
+import { QueryTelemetry } from './components/QueryTelemetry'
 import type { QueryEditorHandle } from './components/QueryEditor'
 import { useTheme } from './theme'
 import type { CosmosContainer, CosmosDatabase } from './types/cosmos'
 
-type ContainerTab = 'query' | 'sprocs' | 'triggers' | 'udfs'
-type WorkspaceTabType = 'query' | 'container' | 'document'
+type ContainerTab = 'query' | 'documents' | 'settings' | 'sprocs' | 'triggers' | 'udfs'
+type WorkspaceTabType = 'query' | 'documents' | 'settings' | 'container' | 'document'
 
 interface ExplorerSelection {
   dbId?: string
@@ -76,6 +79,7 @@ interface WorkspaceTab {
   section?: ContainerTab
   docId?: string
   partitionKey?: unknown
+  partitionKeyPaths?: string[]
 }
 
 interface OpenTabOptions {
@@ -316,7 +320,7 @@ function App() {
 
   const [sidebarWidth, setSidebarWidth] = useState(384) // 24rem
   const [isDragging, setIsDragging] = useState(false)
-  const [activeView, setActiveView] = useState<'explorer' | 'settings'>('explorer')
+  const [activeView, setActiveView] = useState<'explorer' | 'settings' | 'telemetry'>('explorer')
   const [tabs, setTabs] = useState<WorkspaceTab[]>([])
   const [activeTabId, setActiveTabId] = useState<string | null>(null)
 
@@ -479,6 +483,56 @@ function App() {
       return
     }
 
+    if (routeSelection.section === 'documents') {
+      const docsTabId = requestedTabId ?? `documents-${routeSelection.dbId}-${routeSelection.collId}`
+      const existingDocsTab = tabsRef.current.find((tab) => tab.id === docsTabId && tab.type === 'documents')
+
+      if (existingDocsTab) {
+        openTab(existingDocsTab)
+        return
+      }
+
+      const openedTab = openTab({
+        id: docsTabId,
+        type: 'documents',
+        label: `${routeSelection.collId} – Documents`,
+        dbId: routeSelection.dbId,
+        collId: routeSelection.collId,
+        section: 'documents',
+      })
+
+      if (!requestedTabId) {
+        navigateToTab(openedTab, true)
+      }
+
+      return
+    }
+
+    if (routeSelection.section === 'settings') {
+      const settingsTabId = requestedTabId ?? `settings-${routeSelection.dbId}-${routeSelection.collId}`
+      const existingTab = tabsRef.current.find((tab) => tab.id === settingsTabId && tab.type === 'settings')
+
+      if (existingTab) {
+        openTab(existingTab)
+        return
+      }
+
+      const openedTab = openTab({
+        id: settingsTabId,
+        type: 'settings',
+        label: `${routeSelection.collId} – Settings`,
+        dbId: routeSelection.dbId,
+        collId: routeSelection.collId,
+        section: 'settings',
+      })
+
+      if (!requestedTabId) {
+        navigateToTab(openedTab, true)
+      }
+
+      return
+    }
+
     if (routeSelection.section === 'query') {
       const existingQueryTab = requestedTabId
         ? tabsRef.current.find((tab) => tab.id === requestedTabId && tab.type === 'query')
@@ -520,6 +574,31 @@ function App() {
             collId={tab.collId}
             dbId={tab.dbId}
             executeRef={(handle) => registerQueryExecuteRef(tab.id, handle)}
+          />
+        </WorkspacePanel>
+      )
+    }
+
+    if (tab.type === 'documents') {
+      return (
+        <WorkspacePanel dbId={tab.dbId} subtitle={`Container: ${tab.collId}`} title="Documents">
+          <DocumentListPanel
+            key={tab.id}
+            collId={tab.collId}
+            dbId={tab.dbId}
+            partitionKeyPaths={tab.partitionKeyPaths ?? ['/id']}
+          />
+        </WorkspacePanel>
+      )
+    }
+
+    if (tab.type === 'settings') {
+      return (
+        <WorkspacePanel dbId={tab.dbId} subtitle={`Container: ${tab.collId}`} title="Settings">
+          <ContainerSettingsPanel
+            key={tab.id}
+            collId={tab.collId}
+            dbId={tab.dbId}
           />
         </WorkspacePanel>
       )
@@ -578,9 +657,6 @@ function App() {
             <Text block className={styles.eyebrow} size={300} weight="semibold">
               Azure Cosmos DB
             </Text>
-            <Text as="h1" block size={800} weight="bold">
-              Cosmos DB Emulator Explorer
-            </Text>
             <Text block className={styles.subtleText} size={300}>
               Explorer UI served from /explorer
             </Text>
@@ -620,6 +696,12 @@ function App() {
             icon={<SettingsRegular />}
             onClick={() => setActiveView('settings')}
             title="Cluster Settings"
+          />
+          <Button
+            appearance={activeView === 'telemetry' ? 'subtle' : 'transparent'}
+            icon={<DocumentSearchRegular />}
+            onClick={() => setActiveView('telemetry')}
+            title="Query Telemetry"
           />
         </div>
 
@@ -696,9 +778,13 @@ function App() {
               )}
             </main>
           </>
-        ) : (
+        ) : activeView === 'settings' ? (
           <main className={styles.main}>
             <ClusterSettings />
+          </main>
+        ) : (
+          <main className={styles.main}>
+            <QueryTelemetry />
           </main>
         )}
       </div>
@@ -1156,9 +1242,13 @@ function parseSelection(pathname: string): ExplorerSelection {
     isContainerRoute && sectionSegment !== 'doc'
       ? sectionSegment === 'sprocs' || sectionSegment === 'triggers' || sectionSegment === 'udfs'
         ? sectionSegment
-        : sectionSegment === 'query' || sectionSegment === undefined
-          ? 'query'
-          : undefined
+        : sectionSegment === 'documents'
+          ? 'documents'
+          : sectionSegment === 'settings'
+            ? 'settings'
+            : sectionSegment === 'query' || sectionSegment === undefined
+              ? 'query'
+              : undefined
       : undefined
 
   return {
@@ -1216,7 +1306,7 @@ function buildWorkspaceLandingPath(dbId?: string): string {
   return dbId ? `/db/${encodeURIComponent(dbId)}` : '/'
 }
 
-function buildContainerTabId(dbId: string, collId: string, section: Exclude<ContainerTab, 'query'>): string {
+function buildContainerTabId(dbId: string, collId: string, section: Exclude<ContainerTab, 'query' | 'documents' | 'settings'>): string {
   return `${section}-${dbId}-${collId}`
 }
 
@@ -1236,6 +1326,14 @@ function buildWorkspaceTabPath(tab: WorkspaceTab): string {
     return `/db/${encodeURIComponent(tab.dbId)}/container/${encodeURIComponent(tab.collId)}/doc/${encodeURIComponent(tab.docId)}?${searchParams.toString()}`
   }
 
+  if (tab.type === 'documents') {
+    return `${buildContainerSectionPath(tab.dbId, tab.collId, 'documents')}?${searchParams.toString()}`
+  }
+
+  if (tab.type === 'settings') {
+    return `${buildContainerSectionPath(tab.dbId, tab.collId, 'settings')}?${searchParams.toString()}`
+  }
+
   if (tab.type === 'container') {
     return `${buildContainerSectionPath(tab.dbId, tab.collId, tab.section ?? 'sprocs')}?${searchParams.toString()}`
   }
@@ -1243,7 +1341,7 @@ function buildWorkspaceTabPath(tab: WorkspaceTab): string {
   return `${buildContainerSectionPath(tab.dbId, tab.collId, 'query')}?${searchParams.toString()}`
 }
 
-function sectionLabel(section: Exclude<ContainerTab, 'query'>): string {
+function sectionLabel(section: Exclude<ContainerTab, 'query' | 'documents' | 'settings'>): string {
   switch (section) {
     case 'sprocs':
       return 'Sprocs'
@@ -1254,7 +1352,7 @@ function sectionLabel(section: Exclude<ContainerTab, 'query'>): string {
   }
 }
 
-function sectionEditorLabel(section: Exclude<ContainerTab, 'query'>): 'Stored procedures' | 'Triggers' | 'User-defined functions' {
+function sectionEditorLabel(section: Exclude<ContainerTab, 'query' | 'documents' | 'settings'>): 'Stored procedures' | 'Triggers' | 'User-defined functions' {
   switch (section) {
     case 'sprocs':
       return 'Stored procedures'

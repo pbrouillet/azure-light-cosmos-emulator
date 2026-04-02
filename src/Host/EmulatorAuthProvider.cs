@@ -10,7 +10,7 @@ public sealed class EmulatorAuthProvider(
     IOptions<EmulatorOptions> emulatorOptions,
     EmulatorAdminSettingsStore adminSettingsStore) : IAuthProvider
 {
-    private readonly MasterKeyAuthProvider _masterKeyAuthProvider = new(emulatorOptions.Value.MasterKey!);
+    private readonly MasterKeyAuthProvider _masterKeyAuthProvider = new(emulatorOptions.Value.MasterKey);
 
     public async Task<AuthResult> ValidateAsync(
         string authHeader,

@@ -51,8 +51,14 @@ jobs:
       - name: Get version from tag
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
       - name: Publish linux-x64
-        run: dotnet publish src/Host/Azure.Cosmos.LightEmulator.Host.csproj -c Release -r linux-x64 --self-contained -o publish/linux-x64
+        run: >-
+          dotnet publish src/Cli/Azure.Cosmos.LightEmulator.Cli.csproj
+          -c Release -r linux-x64 --self-contained
+          -o publish/linux-x64
       - name: Zip binaries
         run: cd publish/linux-x64 && zip -r ../../azure-cosmos-light-emulator-linux-x64.zip .
       - name: Create GitHub Release

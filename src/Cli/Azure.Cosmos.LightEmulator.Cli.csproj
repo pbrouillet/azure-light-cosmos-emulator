@@ -9,6 +9,17 @@
     <ToolCommandName>cosmos-emulator</ToolCommandName>
   </PropertyGroup>
 
+  <!-- Single-file publish settings.
+       These properties only take effect during 'dotnet publish'.
+       SelfContained is passed via command line to avoid NETSDK1150 during build.
+       Trimming is disabled because the emulator's deep dependency chains
+       (SurrealDb → Dahomey.Cbor, Jint, Quartz) rely heavily on reflection
+       and cannot survive TrimMode=full even with extensive TrimmerRootAssembly entries. -->
+  <PropertyGroup>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="System.CommandLine" />
     <PackageReference Include="Serilog.AspNetCore" />
