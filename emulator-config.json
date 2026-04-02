@@ -1,0 +1,6 @@
+{
+  "Emulator": {
+    "Storage": "SurrealDb",
+    "DataDirectory": ""
+  }
+}

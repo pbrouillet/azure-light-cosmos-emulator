@@ -7,8 +7,7 @@ using Azure.Cosmos.LightEmulator.NoSql.Controllers;
 using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Azure.Cosmos.LightEmulator.NoSql.Middleware;
 using Azure.Cosmos.LightEmulator.NoSql.Query;
-using Azure.Cosmos.LightEmulator.Storage.ChangeFeed;
-using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
+using Azure.Cosmos.LightEmulator.Storage;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Options;
 using Serilog;
@@ -33,20 +32,17 @@ public static class Program
             Args = args
         });
 
+        // Load optional side config file from the executable directory.
+        // Priority: appsettings.json < emulator-config.json < CLI overrides
+        var configFilePath = Path.Combine(AppContext.BaseDirectory, "emulator-config.json");
+        builder.Configuration.AddJsonFile(configFilePath, optional: true, reloadOnChange: true);
+
         if (configurationOverrides is { Count: > 0 })
         {
             builder.Configuration.AddInMemoryCollection(configurationOverrides);
         }
 
         var emulatorOptions = BindOptions(builder.Configuration);
-        if (string.IsNullOrWhiteSpace(emulatorOptions.MasterKey))
-        {
-            emulatorOptions.MasterKey = MasterKeyAuthProvider.GenerateMasterKey();
-            builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
-            {
-                [$"{EmulatorOptions.SectionName}:{nameof(EmulatorOptions.MasterKey)}"] = emulatorOptions.MasterKey
-            });
-        }
 
         Directory.CreateDirectory(emulatorOptions.DataDirectory);
 
@@ -98,15 +94,14 @@ public static class Program
             .AddApplicationPart(typeof(DatabasesController).Assembly)
             .AddApplicationPart(typeof(Azure.Cosmos.LightEmulator.Host.Controllers.QueryTelemetryController).Assembly);
 
-        builder.Services.AddSingleton(sp =>
+        builder.Services.ConfigureHttpJsonOptions(options =>
         {
-            var options = sp.GetRequiredService<IOptions<EmulatorOptions>>().Value;
-            var manager = new SurrealDbConnectionManager(options.DataDirectory);
-            manager.InitializeAsync().GetAwaiter().GetResult();
-            return manager;
+            options.SerializerOptions.PropertyNamingPolicy = null;
+            options.SerializerOptions.TypeInfoResolverChain.Add(new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver());
         });
-        builder.Services.AddSingleton<IChangeFeedProvider, SurrealDbChangeFeedProvider>();
-        builder.Services.AddSingleton<IDocumentStore, SurrealDbDocumentStore>();
+
+        var storageType = StorageServiceRegistration.ParseStorageType(emulatorOptions.Storage);
+        builder.Services.AddEmulatorStorage(storageType, emulatorOptions.DataDirectory);
         builder.Services.AddSingleton<EmulatorRuntimeState>();
         builder.Services.AddSingleton<EmulatorAdminSettingsStore>();
         builder.Services.AddSingleton<IEmulatorInfoService, EmulatorInfoService>();
@@ -115,13 +110,12 @@ public static class Program
         builder.Services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
         builder.Services.AddSingleton<QueryExplainService>();
         builder.Services.AddSingleton<IndexValidationService>();
+        builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.NoSql.Query.DmlCommandService>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
         builder.Services.AddSingleton<IAuthProvider, EmulatorAuthProvider>();
         builder.Services.AddSingleton<IProgrammabilityEngine, Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.JintProgrammabilityEngine>();
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         builder.Services.AddSingleton<CosmosResponseHeaderService>();
-        builder.Services.AddSingleton<IQueryTelemetryStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbQueryTelemetryStore>();
-        builder.Services.AddSingleton<IActivityStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbActivityStore>();
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Kql.KqlSchemaRegistry>(sp =>
         {
             var registry = new Azure.Cosmos.LightEmulator.Kql.KqlSchemaRegistry();
@@ -168,10 +162,7 @@ public static class Program
 
         if (emulatorOptions.EnableExplorer)
         {
-            var explorerRoot = ResolveExplorerRoot(app.Environment.ContentRootPath);
-            Directory.CreateDirectory(explorerRoot);
-
-            var explorerProvider = new PhysicalFileProvider(explorerRoot);
+            var explorerProvider = ResolveExplorerFileProvider(app.Environment.ContentRootPath);
             app.UseDefaultFiles(new DefaultFilesOptions
             {
                 RequestPath = "/explorer",
@@ -184,11 +175,12 @@ public static class Program
             });
             app.MapFallback("/explorer/{*path:nonfile}", async context =>
             {
-                var indexPath = Path.Combine(explorerRoot, "index.html");
-                if (File.Exists(indexPath))
+                var indexFile = explorerProvider.GetFileInfo("index.html");
+                if (indexFile.Exists)
                 {
                     context.Response.ContentType = "text/html";
-                    await context.Response.SendFileAsync(indexPath);
+                    await using var stream = indexFile.CreateReadStream();
+                    await stream.CopyToAsync(context.Response.Body);
                     return;
                 }
 
@@ -225,6 +217,7 @@ public static class Program
             if (emulatorOptions.EnableExplorer)
                 Console.WriteLine($"║  Explorer:         {noSqlEndpoint + "/explorer",-88}║");
             Console.WriteLine($"║  Consistency:      {emulatorOptions.ConsistencyLevel,-88}║");
+            Console.WriteLine($"║  Storage:          {storageType,-88}║");
             Console.WriteLine($"╠{border}╣");
             Console.WriteLine($"║{"  Master Key:",-108}║");
             Console.WriteLine($"║    {emulatorOptions.MasterKey,-104}║");
@@ -261,6 +254,33 @@ public static class Program
         Enum.TryParse<ConsistencyLevel>(value, ignoreCase: true, out var consistencyLevel)
             ? consistencyLevel
             : ConsistencyLevel.Session;
+
+    /// <summary>
+    /// Returns an <see cref="IFileProvider"/> for the Explorer SPA assets.
+    /// In Release/single-file builds the assets are embedded in the assembly via
+    /// <see cref="ManifestEmbeddedFileProvider"/>. In Debug/development builds the
+    /// assets are served from the physical <c>wwwroot/explorer</c> directory.
+    /// </summary>
+    private static IFileProvider ResolveExplorerFileProvider(string contentRoot)
+    {
+        // Try embedded resources first (Release / single-file publish)
+        try
+        {
+            var embedded = new ManifestEmbeddedFileProvider(
+                typeof(Program).Assembly, "wwwroot/explorer");
+            if (embedded.GetFileInfo("index.html").Exists)
+                return embedded;
+        }
+        catch (InvalidOperationException)
+        {
+            // No embedded manifest — Debug build or assets not embedded
+        }
+
+        // Fall back to physical file system
+        var explorerRoot = ResolveExplorerRoot(contentRoot);
+        Directory.CreateDirectory(explorerRoot);
+        return new PhysicalFileProvider(explorerRoot);
+    }
 
     /// <summary>
     /// Finds the explorer wwwroot directory by checking multiple candidate paths.

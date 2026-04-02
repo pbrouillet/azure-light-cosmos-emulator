@@ -9,8 +9,7 @@ using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Azure.Cosmos.LightEmulator.NoSql.Middleware;
 using Azure.Cosmos.LightEmulator.NoSql.Query;
 using Azure.Cosmos.LightEmulator.NoSql.StoredProcedures;
-using Azure.Cosmos.LightEmulator.Storage.ChangeFeed;
-using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
+using Azure.Cosmos.LightEmulator.Storage;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
@@ -29,7 +28,6 @@ public static class HostApplication
     public static WebApplication Build(WebApplicationBuilder builder)
     {
         var emulatorOptions = builder.Configuration.GetSection(EmulatorOptions.SectionName).Get<EmulatorOptions>() ?? new EmulatorOptions();
-        emulatorOptions.MasterKey ??= MasterKeyAuthProvider.GenerateMasterKey();
 
         ConfigureServices(builder.Services, emulatorOptions);
 
@@ -42,9 +40,8 @@ public static class HostApplication
     {
         services.AddSingleton(emulatorOptions);
         services.AddSingleton<IOptions<EmulatorOptions>>(_ => Options.Create(emulatorOptions));
-        services.AddSingleton(new SurrealDbConnectionManager(emulatorOptions.DataDirectory));
-        services.AddSingleton<IChangeFeedProvider, InMemoryChangeFeedProvider>();
-        services.AddSingleton<IDocumentStore, SurrealDbDocumentStore>();
+        var storageType = StorageServiceRegistration.ParseStorageType(emulatorOptions.Storage);
+        services.AddEmulatorStorage(storageType, emulatorOptions.DataDirectory);
         services.AddSingleton<EmulatorRuntimeState>();
         services.AddSingleton<EmulatorAdminSettingsStore>();
         services.AddSingleton<IEmulatorInfoService, EmulatorInfoService>();
@@ -54,12 +51,11 @@ public static class HostApplication
         services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
         services.AddSingleton<IndexValidationService>();
         services.AddSingleton<QueryExplainService>();
+        services.AddSingleton<DmlCommandService>();
         services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
         services.AddSingleton<IAuthProvider, EmulatorAuthProvider>();
         services.AddSingleton<CosmosResponseHeaderService>();
-        services.AddSingleton<IQueryTelemetryStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbQueryTelemetryStore>();
-        services.AddSingleton<IActivityStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbActivityStore>();
         services.AddSingleton<KqlSchemaRegistry>(sp =>
         {
             var registry = new KqlSchemaRegistry();
@@ -104,13 +100,21 @@ public static class HostApplication
             .AddApplicationPart(typeof(DatabasesController).Assembly)
             .AddApplicationPart(typeof(Azure.Cosmos.LightEmulator.Host.Controllers.QueryTelemetryController).Assembly);
 
+        services.ConfigureHttpJsonOptions(options =>
+        {
+            options.SerializerOptions.PropertyNamingPolicy = null;
+            options.SerializerOptions.TypeInfoResolverChain.Add(new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver());
+        });
+
         services.AddEndpointsApiExplorer();
         services.AddSwaggerGen();
     }
 
     private static void ConfigurePipeline(WebApplication app, EmulatorOptions emulatorOptions)
     {
-        app.Services.GetRequiredService<SurrealDbConnectionManager>().InitializeAsync().GetAwaiter().GetResult();
+        // Initialize SurrealDB connection if that storage backend is active
+        var surrealManager = app.Services.GetService<Azure.Cosmos.LightEmulator.Storage.SurrealDb.SurrealDbConnectionManager>();
+        surrealManager?.InitializeAsync().GetAwaiter().GetResult();
 
         // Wire up activity store into the RU tracker for persistent logging
         var ruTracker = app.Services.GetRequiredService<RuTracker>();

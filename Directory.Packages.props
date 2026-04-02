@@ -12,6 +12,10 @@
     <PackageVersion Include="Quartz" Version="3.14.0" />
     <!-- Query Parsing -->
     <PackageVersion Include="Antlr4.Runtime.Standard" Version="4.13.1" />
+    <!-- KQL Parsing -->
+    <PackageVersion Include="Microsoft.Azure.Kusto.Language" Version="12.3.2" />
+    <!-- SQLite -->
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.0" />
     <!-- Spatial / Geospatial -->
     <PackageVersion Include="NetTopologySuite" Version="2.6.0" />
     <!-- Authentication -->
@@ -23,6 +27,8 @@
     <!-- CLI -->
     <PackageVersion Include="System.CommandLine" Version="2.0.0-beta5.25306.1" />
     <!-- ASP.NET & Hosting -->
+    <PackageVersion Include="Microsoft.Extensions.FileProviders.Embedded" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
     <PackageVersion Include="Swashbuckle.AspNetCore" Version="7.3.1" />
     <!-- Logging -->

@@ -1,3 +1,5 @@
+using Azure.Cosmos.LightEmulator.Auth.KeyAuth;
+
 namespace Azure.Cosmos.LightEmulator.Host.Configuration;
 
 /// <summary>
@@ -13,13 +15,16 @@ public class EmulatorOptions
     /// <summary>Port for the MongoDB wire protocol (default: 10255).</summary>
     public int MongoPort { get; set; } = 10255;
 
-    /// <summary>Data directory for RocksDB persistence.</summary>
+    /// <summary>Storage backend: SurrealDb (default), Sqlite, or InMemory.</summary>
+    public string Storage { get; set; } = "SurrealDb";
+
+    /// <summary>Data directory for persistent storage backends.</summary>
     public string DataDirectory { get; set; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "CosmosEmulator", "data");
 
-    /// <summary>Master key for authentication. Auto-generated if not set.</summary>
-    public string? MasterKey { get; set; }
+    /// <summary>Master key for authentication. Defaults to the well-known Azure Cosmos DB Emulator key.</summary>
+    public string MasterKey { get; set; } = Auth.KeyAuth.MasterKeyAuthProvider.DefaultMasterKey;
 
     /// <summary>Enable EntraID authentication.</summary>
     public bool EnableEntraId { get; set; }

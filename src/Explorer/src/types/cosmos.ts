@@ -115,6 +115,7 @@ export interface EmulatorInfo {
   configuration: {
     port: number
     mongoPort: number
+    storage: string
     dataDirectory: string
     consistencyLevel: string
     enableSsl: boolean
@@ -145,4 +146,38 @@ export interface ActivityLogEntry {
   latencyMs: number
   databaseId: string | null
   containerId: string | null
+}
+
+export interface QueryTelemetryEntry {
+  id: string
+  timestamp: string
+  databaseId: string
+  containerId: string
+  sqlText: string
+  partitionKey: string | null
+  consistencyLevel: string
+  requestCharge: number
+  latencyMs: number
+  itemCount: number
+  statusCode: number
+  activityId: string
+  continuationToken: string | null
+  isCrossPartition: boolean
+  queryPlan: string | null
+}
+
+export interface KqlColumnSchema {
+  name: string
+  type: string
+}
+
+export interface KqlQueryResult {
+  columns: KqlColumnSchema[]
+  rows: unknown[][]
+}
+
+export interface EmulatorConfig {
+  storage: string
+  dataDirectory: string
+  restartRequired: boolean
 }

@@ -35,6 +35,7 @@ public sealed class EmulatorInfoService(
             {
                 ["port"] = options.Port,
                 ["mongoPort"] = options.MongoPort,
+                ["storage"] = options.Storage,
                 ["dataDirectory"] = options.DataDirectory,
                 ["consistencyLevel"] = options.ConsistencyLevel,
                 ["enableSsl"] = options.EnableSsl,

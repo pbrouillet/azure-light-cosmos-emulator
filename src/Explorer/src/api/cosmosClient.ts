@@ -5,6 +5,7 @@ import type {
   CosmosDocument,
   CosmosQueryParameter,
   CosmosTrigger,
+  EmulatorConfig,
   EmulatorInfo,
   KqlQueryResult,
   QueryExplainResult,
@@ -45,6 +46,19 @@ export class CosmosClient {
 
   async getEmulatorInfo(): Promise<EmulatorInfo> {
     const { body } = await this.request<EmulatorInfo>('/api/emulator/info')
+    return body
+  }
+
+  async getEmulatorConfig(): Promise<EmulatorConfig> {
+    const { body } = await this.request<EmulatorConfig>('/api/emulator/config')
+    return body
+  }
+
+  async updateEmulatorConfig(config: { storage?: string; dataDirectory?: string }): Promise<EmulatorConfig> {
+    const { body } = await this.request<EmulatorConfig>('/api/emulator/config', {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    })
     return body
   }
 

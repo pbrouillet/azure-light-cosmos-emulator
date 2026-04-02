@@ -3,10 +3,10 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using Azure.Cosmos.LightEmulator.Auth.KeyAuth;
 using Azure.Cosmos.LightEmulator.Core.Models;
 using Azure.Cosmos.LightEmulator.Host.Configuration;
@@ -14,12 +14,12 @@ using HostProgram = Azure.Cosmos.LightEmulator.Host.Program;
 
 namespace Azure.Cosmos.LightEmulator.Cli;
 
-public static class Program
+public static partial class Program
 {
     private const string DefaultConsistency = "Session";
     private const string StateFileName = "emulator-instance.json";
     private const string PidFileName = "emulator.pid";
-    private static readonly JsonSerializerOptions StateJsonOptions = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions StateJsonOptions = new() { WriteIndented = true, TypeInfoResolverChain = { CliJsonContext.Default } };
 
     public static async Task<int> Main(string[] args)
     {
@@ -53,6 +53,7 @@ public static class Program
             DefaultValueFactory = _ => DefaultConsistency
         };
         var verboseOption = new Option<bool>("--verbose") { Description = "Enable verbose logging." };
+        var storageOption = new Option<string?>("--storage") { Description = "Storage backend: SurrealDb, Sqlite, or InMemory." };
         var backgroundOption = new Option<bool>("--background") { Description = "Run the emulator in the background." };
         var runHostInternalOption = new Option<bool>("--run-host-internal")
         {
@@ -67,6 +68,7 @@ public static class Program
         startCommand.Add(enableEntraOption);
         startCommand.Add(consistencyOption);
         startCommand.Add(verboseOption);
+        startCommand.Add(storageOption);
         startCommand.Add(backgroundOption);
         startCommand.Add(runHostInternalOption);
         startCommand.SetAction(async (parseResult, cancellationToken) =>
@@ -79,6 +81,7 @@ public static class Program
                 parseResult.GetValue(enableEntraOption),
                 parseResult.GetValue(consistencyOption) ?? DefaultConsistency,
                 parseResult.GetValue(verboseOption),
+                parseResult.GetValue(storageOption),
                 parseResult.GetValue(backgroundOption));
 
             return await StartAsync(startOptions, parseResult.GetValue(runHostInternalOption), cancellationToken);
@@ -580,8 +583,14 @@ public static class Program
 
         if (string.Equals(Path.GetFileName(processPath), "dotnet.exe", StringComparison.OrdinalIgnoreCase))
         {
-            var entryAssemblyPath = Assembly.GetEntryAssembly()?.Location;
-            if (string.IsNullOrWhiteSpace(entryAssemblyPath))
+            // When launched via 'dotnet run', re-launch with the DLL path.
+            // In single-file publish Environment.ProcessPath is the exe itself,
+            // so this branch is not reached (processPath != "dotnet.exe").
+            var entryAssemblyPath = AppContext.BaseDirectory is { Length: > 0 } baseDir
+                ? Path.Combine(baseDir, "Azure.Cosmos.LightEmulator.Cli.dll")
+                : null;
+
+            if (string.IsNullOrWhiteSpace(entryAssemblyPath) || !File.Exists(entryAssemblyPath))
             {
                 throw new InvalidOperationException("Unable to determine the CLI assembly path.");
             }
@@ -621,6 +630,12 @@ public static class Program
             startInfo.ArgumentList.Add("--verbose");
         }
 
+        if (!string.IsNullOrWhiteSpace(options.Storage))
+        {
+            startInfo.ArgumentList.Add("--storage");
+            startInfo.ArgumentList.Add(options.Storage);
+        }
+
         return startInfo;
     }
 
@@ -633,6 +648,7 @@ public static class Program
         ["Emulator:EnableEntraId"] = options.EnableEntraId.ToString(),
         ["Emulator:ConsistencyLevel"] = options.Consistency,
         ["Emulator:Verbose"] = options.Verbose.ToString(),
+        ["Emulator:Storage"] = options.Storage,
         ["Emulator:EnableSsl"] = bool.FalseString,
         ["Emulator:EnableExplorer"] = bool.TrueString
     };
@@ -727,26 +743,30 @@ public static class Program
         var mongoEndpoint = $"mongodb://localhost:{state.MongoPort}";
         var connectionString = $"AccountEndpoint={state.Endpoint};AccountKey={state.MasterKey};";
 
+        const int width = 110;
+        const int inner = width - 2;
+        var border = new string('═', inner);
+
         Console.WriteLine();
-        Console.WriteLine("╔══════════════════════════════════════════════════════════════════════════╗");
-        Console.WriteLine("║  Azure Cosmos DB Light Emulator                                        ║");
-        Console.WriteLine("╠══════════════════════════════════════════════════════════════════════════╣");
+        Console.WriteLine($"╔{border}╗");
+        Console.WriteLine($"║{"  Azure Cosmos DB Light Emulator",-108}║");
+        Console.WriteLine($"╠{border}╣");
         if (includeStatus)
-            Console.WriteLine($"║  Status:           {"Running (PID " + state.ProcessId + ")",-53}║");
-        Console.WriteLine($"║  NoSQL Endpoint:   {state.Endpoint,-53}║");
-        Console.WriteLine($"║  MongoDB Endpoint: {mongoEndpoint,-53}║");
-        Console.WriteLine($"║  Consistency:      {state.ConsistencyLevel,-53}║");
-        Console.WriteLine("╠══════════════════════════════════════════════════════════════════════════╣");
-        Console.WriteLine($"║  Master Key:                                                          ║");
-        Console.WriteLine($"║    {state.MasterKey,-70}║");
-        Console.WriteLine("╠══════════════════════════════════════════════════════════════════════════╣");
-        Console.WriteLine($"║  Connection String:                                                   ║");
-        for (var i = 0; i < connectionString.Length; i += 70)
+            Console.WriteLine($"║  Status:           {"Running (PID " + state.ProcessId + ")",-88}║");
+        Console.WriteLine($"║  NoSQL Endpoint:   {state.Endpoint,-88}║");
+        Console.WriteLine($"║  MongoDB Endpoint: {mongoEndpoint,-88}║");
+        Console.WriteLine($"║  Consistency:      {state.ConsistencyLevel,-88}║");
+        Console.WriteLine($"╠{border}╣");
+        Console.WriteLine($"║{"  Master Key:",-108}║");
+        Console.WriteLine($"║    {state.MasterKey,-104}║");
+        Console.WriteLine($"╠{border}╣");
+        Console.WriteLine($"║{"  Connection String:",-108}║");
+        for (var i = 0; i < connectionString.Length; i += 104)
         {
-            var chunk = connectionString.Substring(i, Math.Min(70, connectionString.Length - i));
-            Console.WriteLine($"║    {chunk,-70}║");
+            var chunk = connectionString.Substring(i, Math.Min(104, connectionString.Length - i));
+            Console.WriteLine($"║    {chunk,-104}║");
         }
-        Console.WriteLine("╚══════════════════════════════════════════════════════════════════════════╝");
+        Console.WriteLine($"╚{border}╝");
         Console.WriteLine();
     }
 
@@ -756,7 +776,7 @@ public static class Program
             ? DefaultDataDirectory
             : Path.GetFullPath(options.DataDirectory);
         var masterKey = string.IsNullOrWhiteSpace(options.MasterKey)
-            ? MasterKeyAuthProvider.GenerateMasterKey()
+            ? MasterKeyAuthProvider.DefaultMasterKey
             : options.MasterKey;
 
         Directory.CreateDirectory(dataDirectory);
@@ -910,9 +930,14 @@ public static class Program
         bool EnableEntraId,
         string Consistency,
         bool Verbose,
+        string? Storage,
         bool Background);
 
     private sealed record CurrentInstancePointer(string DataDirectory);
+
+    [JsonSerializable(typeof(EmulatorInstanceState))]
+    [JsonSerializable(typeof(CurrentInstancePointer))]
+    private sealed partial class CliJsonContext : JsonSerializerContext;
 
     private sealed record EmulatorInstanceState
     {

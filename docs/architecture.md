@@ -6,7 +6,24 @@ Azure.Cosmos.LightEmulator is a lightweight, open-source emulator for Azure Cosm
 
 ## Storage Layer
 
-The emulator uses **SurrealDB embedded** with a **RocksDB KV** backend for durable storage. The mapping between Cosmos DB and SurrealDB concepts:
+The emulator supports three **pluggable storage backends**, selected via configuration:
+
+| Backend | Engine | Persistence | Use Case |
+|---|---|---|---|
+| **SurrealDb** (default) | SurrealDB embedded + RocksDB KV | ✅ Persistent | Production-like testing |
+| **Sqlite** | Microsoft.Data.Sqlite | ✅ Persistent (single file) | Lightweight, portable |
+| **InMemory** | ConcurrentDictionary | ❌ Ephemeral | Fast tests, CI/CD |
+
+All backends implement the `IDocumentStore` interface (31 methods) and can be selected at startup:
+- **Config file**: Place `emulator-config.json` next to the executable with `{ "Emulator": { "Storage": "Sqlite" } }`
+- **CLI**: `cosmos-emulator start --storage sqlite`
+- **Priority**: `appsettings.json` → `emulator-config.json` → CLI arguments
+
+Storage services are registered via `StorageServiceRegistration.AddEmulatorStorage()` which dispatches `IDocumentStore`, `IChangeFeedProvider`, `IActivityStore`, and `IQueryTelemetryStore` based on the configured backend.
+
+### SurrealDB backend
+
+The SurrealDB mapping between Cosmos DB and SurrealDB concepts:
 
 | Cosmos DB | SurrealDB | Notes |
 |---|---|---|

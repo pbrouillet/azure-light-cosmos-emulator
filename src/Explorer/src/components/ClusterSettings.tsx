@@ -9,16 +9,18 @@ import {
   MessageBar,
   MessageBarBody,
   MessageBarTitle,
+  Select,
   Spinner,
   Switch,
   Text,
   makeStyles,
   tokens,
 } from '@fluentui/react-components'
-import { CopyRegular, EyeOffRegular, EyeRegular, SaveRegular } from '@fluentui/react-icons'
+import { CopyRegular, EyeOffRegular, EyeRegular, SaveRegular, WarningRegular } from '@fluentui/react-icons'
 import { cosmosClient } from '../api/cosmosClient'
 import { useTheme } from '../theme'
-import type { ActivityLogEntry, EmulatorInfo, EmulatorStats } from '../types/cosmos'
+import { KqlQueryEditor } from './KqlQueryEditor'
+import type { ActivityLogEntry, EmulatorConfig, EmulatorInfo, EmulatorStats } from '../types/cosmos'
 
 const useStyles = makeStyles({
   root: {
@@ -224,7 +226,7 @@ function formatActivityTime(timestamp: string): string {
 }
 
 function getMethodColor(method: string): string {
-  switch (method.toUpperCase()) {
+  switch ((method ?? '').toUpperCase()) {
     case 'GET':
       return tokens.colorPaletteBlueForeground2
     case 'POST':
@@ -388,11 +390,135 @@ function ConfigurationCard({ info }: { info: EmulatorInfo }) {
       <div className={styles.infoList}>
         <InfoRow label="Port" value={info.configuration.port.toString()} />
         <InfoRow label="MongoDB port" value={info.configuration.mongoPort.toString()} />
+        <InfoRow label="Storage backend" value={info.configuration.storage ?? 'SurrealDb'} />
         <InfoRow label="Consistency level" value={info.configuration.consistencyLevel} />
         <InfoRow label="SSL enabled" value={info.configuration.enableSsl ? 'Yes' : 'No'} />
         <InfoRow label="Explorer enabled" value={info.configuration.enableExplorer ? 'Yes' : 'No'} />
         <InfoRow label="Data directory" value={info.configuration.dataDirectory} />
       </div>
+    </Card>
+  )
+}
+
+const storageOptions = ['SurrealDb', 'Sqlite', 'InMemory'] as const
+
+function StorageConfigCard() {
+  const styles = useStyles()
+  const queryClient = useQueryClient()
+  const [restartNeeded, setRestartNeeded] = useState(false)
+
+  const configQuery = useQuery({
+    queryKey: ['emulatorConfig'],
+    queryFn: () => cosmosClient.getEmulatorConfig(),
+  })
+
+  const [draft, setDraft] = useState<{ storage: string; dataDirectory: string } | null>(null)
+
+  const config = configQuery.data
+  const current = draft ?? {
+    storage: config?.storage ?? 'SurrealDb',
+    dataDirectory: config?.dataDirectory ?? '',
+  }
+
+  const hasChanges = useMemo(() => {
+    if (!config) return false
+    return current.storage !== config.storage || current.dataDirectory !== config.dataDirectory
+  }, [config, current])
+
+  const saveMutation = useMutation({
+    mutationFn: () => cosmosClient.updateEmulatorConfig({
+      storage: current.storage,
+      dataDirectory: current.dataDirectory,
+    }),
+    onSuccess: (result: EmulatorConfig) => {
+      setDraft(null)
+      setRestartNeeded(result.restartRequired)
+      queryClient.setQueryData(['emulatorConfig'], result)
+      void queryClient.invalidateQueries({ queryKey: ['emulatorInfo'] })
+    },
+  })
+
+  return (
+    <Card className={`${styles.card} ${styles.wideCard}`}>
+      <Text as="h2" size={500} weight="semibold">
+        Storage Configuration
+      </Text>
+
+      {restartNeeded && (
+        <MessageBar intent="warning" layout="multiline">
+          <MessageBarBody>
+            <MessageBarTitle>Restart required</MessageBarTitle>
+            Storage settings have been saved to <code>emulator-config.json</code>. Restart the emulator for changes to take effect.
+          </MessageBarBody>
+        </MessageBar>
+      )}
+
+      {saveMutation.isError && (
+        <MessageBar intent="error">
+          <MessageBarBody>
+            <MessageBarTitle>Save failed</MessageBarTitle>
+            {saveMutation.error instanceof Error ? saveMutation.error.message : 'An unexpected error occurred.'}
+          </MessageBarBody>
+        </MessageBar>
+      )}
+
+      {configQuery.isPending ? (
+        <div className={styles.spinnerRow}>
+          <Spinner size="tiny" />
+          <Text>Loading storage config…</Text>
+        </div>
+      ) : (
+        <>
+          <div className={styles.fieldGrid}>
+            <Field label="Storage backend" hint="Engine used to persist emulator data.">
+              <Select
+                value={current.storage}
+                onChange={(_, data) =>
+                  setDraft((prev) => ({
+                    ...(prev ?? { storage: config?.storage ?? 'SurrealDb', dataDirectory: config?.dataDirectory ?? '' }),
+                    storage: data.value,
+                  }))
+                }
+              >
+                {storageOptions.map((opt) => (
+                  <option key={opt} value={opt}>
+                    {opt === 'SurrealDb' ? 'SurrealDb (RocksDB)' : opt === 'Sqlite' ? 'SQLite' : 'In-Memory (ephemeral)'}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+
+            <Field label="Data directory" hint="Disk path for persistent storage.">
+              <Input
+                placeholder="Leave empty for default"
+                value={current.dataDirectory}
+                onChange={(e) =>
+                  setDraft((prev) => ({
+                    ...(prev ?? { storage: config?.storage ?? 'SurrealDb', dataDirectory: config?.dataDirectory ?? '' }),
+                    dataDirectory: e.target.value,
+                  }))
+                }
+              />
+            </Field>
+          </div>
+
+          <div className={styles.buttonRow}>
+            {hasChanges && (
+              <Text className={styles.subtleText} size={200}>
+                <WarningRegular /> Changes require an emulator restart
+              </Text>
+            )}
+            <Button
+              appearance="primary"
+              disabled={!hasChanges || saveMutation.isPending}
+              icon={<SaveRegular />}
+              onClick={() => saveMutation.mutate()}
+            >
+              {saveMutation.isPending ? 'Saving…' : 'Save'}
+            </Button>
+          </div>
+        </>
+      )}
     </Card>
   )
 }
@@ -563,6 +689,8 @@ export function ClusterSettings() {
         {emulatorStats ? <ClusterStatsCard stats={emulatorStats} /> : <LoadingCard title="Cluster Stats" />}
         {emulatorInfo ? <ConfigurationCard info={emulatorInfo} /> : <LoadingCard title="Configuration" />}
 
+        <StorageConfigCard />
+
         <Card className={`${styles.card} ${styles.wideCard}`}>
           <Text as="h2" size={500} weight="semibold">
             Entra ID Authentication
@@ -632,6 +760,8 @@ export function ClusterSettings() {
         ) : (
           <LoadingCard title="Recent Activity" />
         )}
+
+        <KqlQueryEditor />
       </div>
     </section>
   )

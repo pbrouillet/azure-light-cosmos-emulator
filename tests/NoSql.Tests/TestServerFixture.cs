@@ -10,8 +10,7 @@ using Azure.Cosmos.LightEmulator.NoSql.Infrastructure;
 using Azure.Cosmos.LightEmulator.NoSql.Middleware;
 using Azure.Cosmos.LightEmulator.NoSql.Query;
 using Azure.Cosmos.LightEmulator.NoSql.StoredProcedures;
-using Azure.Cosmos.LightEmulator.Storage.ChangeFeed;
-using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
+using Azure.Cosmos.LightEmulator.Storage;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
@@ -22,7 +21,7 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Tests;
 
 public sealed class TestServerFixture : IAsyncDisposable
 {
-    public const string KnownMasterKey = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
+    public const string KnownMasterKey = MasterKeyAuthProvider.DefaultMasterKey;
 
     private readonly string _dataDirectory = Path.Combine(
         Path.GetTempPath(),
@@ -31,9 +30,13 @@ public sealed class TestServerFixture : IAsyncDisposable
     private readonly MasterKeyAuthProvider _authProvider = new(KnownMasterKey);
 
     private WebApplication? _app;
-    private SurrealDbConnectionManager? _connectionManager;
 
     public HttpClient Client { get; private set; } = null!;
+
+    /// <summary>
+    /// Storage backend to use for tests. Defaults to SurrealDb for backward compatibility.
+    /// </summary>
+    public StorageType StorageType { get; init; } = StorageType.SurrealDb;
 
     public T GetService<T>() where T : notnull
     {
@@ -99,8 +102,6 @@ public sealed class TestServerFixture : IAsyncDisposable
     private async Task InitializeAsync()
     {
         Directory.CreateDirectory(_dataDirectory);
-        _connectionManager = new SurrealDbConnectionManager(_dataDirectory);
-        await _connectionManager.InitializeAsync();
 
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions
         {
@@ -113,27 +114,31 @@ public sealed class TestServerFixture : IAsyncDisposable
             .AddControllers()
             .AddJsonOptions(options =>
             {
+                options.JsonSerializerOptions.PropertyNamingPolicy = null;
                 options.JsonSerializerOptions.TypeInfoResolverChain.Add(new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver());
             })
             .AddApplicationPart(typeof(DatabasesController).Assembly);
 
-        builder.Services.AddSingleton(_connectionManager);
-        builder.Services.AddSingleton<IChangeFeedProvider, SurrealDbChangeFeedProvider>();
-        builder.Services.AddSingleton<SurrealDbDocumentStore>();
-        builder.Services.AddSingleton<IDocumentStore>(sp => sp.GetRequiredService<SurrealDbDocumentStore>());
+        builder.Services.AddEmulatorStorage(StorageType, _dataDirectory);
         builder.Services.AddSingleton<EmulatorRuntimeState>();
         builder.Services.AddSingleton<IEmulatorInfoService, FakeEmulatorInfoService>();
         builder.Services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
         builder.Services.AddSingleton<QueryExplainService>();
         builder.Services.AddSingleton<IndexValidationService>();
+        builder.Services.AddSingleton<DmlCommandService>();
         builder.Services.AddSingleton<IAuthProvider>(_ => new MasterKeyAuthProvider(KnownMasterKey));
         builder.Services.AddSingleton<IProgrammabilityEngine, JintProgrammabilityEngine>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ConsistencyLevel.Session));
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         builder.Services.AddSingleton<CosmosResponseHeaderService>();
-        builder.Services.AddSingleton<IQueryTelemetryStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbQueryTelemetryStore>();
 
         _app = builder.Build();
+
+        // Initialize SurrealDB connection if that storage backend is active
+        var surrealManager = _app.Services.GetService<Azure.Cosmos.LightEmulator.Storage.SurrealDb.SurrealDbConnectionManager>();
+        if (surrealManager is not null)
+            await surrealManager.InitializeAsync();
+
         _app.UseMiddleware<CosmosExceptionMiddleware>();
         _app.UseMiddleware<CosmosAuthMiddleware>();
         _app.UseMiddleware<ConsistencyMiddleware>();
@@ -206,13 +211,13 @@ public sealed class TestServerFixture : IAsyncDisposable
 
         if (_app is not null)
         {
+            // Dispose SurrealDB connection manager if present
+            var surrealManager = _app.Services.GetService<Azure.Cosmos.LightEmulator.Storage.SurrealDb.SurrealDbConnectionManager>();
+            if (surrealManager is not null)
+                await surrealManager.DisposeAsync();
+
             await _app.StopAsync();
             await _app.DisposeAsync();
-        }
-
-        if (_connectionManager is not null)
-        {
-            await _connectionManager.DisposeAsync();
         }
 
         if (Directory.Exists(_dataDirectory))
