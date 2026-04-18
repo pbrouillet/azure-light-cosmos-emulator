@@ -188,11 +188,11 @@ public static class Program
             });
         }
 
-        app.MapGet("/", () => Results.Ok(new
+        app.MapMethods("/", ["GET", "HEAD"], async (HttpContext context, CosmosResponseHeaderService responseHeaders, CancellationToken ct) =>
         {
-            name = "Azure Cosmos Light Emulator",
-            explorer = emulatorOptions.EnableExplorer ? "/explorer" : null
-        }));
+            await responseHeaders.ApplyAsync(context.Response, new CosmosResponseHeaderOptions(), ct);
+            return Results.Json(AccountMetadataHelper.CreateAccountResponse(context, emulatorOptions.ConsistencyLevel));
+        });
         app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
         app.MapControllers();

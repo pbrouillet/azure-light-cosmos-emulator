@@ -13,6 +13,7 @@ using Azure.Cosmos.LightEmulator.NoSql.StoredProcedures;
 using Azure.Cosmos.LightEmulator.Storage;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -142,6 +143,26 @@ public sealed class TestServerFixture : IAsyncDisposable
         _app.UseMiddleware<CosmosExceptionMiddleware>();
         _app.UseMiddleware<CosmosAuthMiddleware>();
         _app.UseMiddleware<ConsistencyMiddleware>();
+
+        _app.MapMethods("/", ["GET", "HEAD"], async (HttpContext context, CosmosResponseHeaderService responseHeaders, CancellationToken ct) =>
+        {
+            await responseHeaders.ApplyAsync(context.Response, new CosmosResponseHeaderOptions(), ct);
+            var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/";
+            var location = new { name = "Local", databaseAccountEndpoint = endpoint };
+            return Results.Json(new
+            {
+                _self = string.Empty,
+                id = context.Request.Host.Host,
+                _rid = context.Request.Host.Host,
+                media = "/media/",
+                addresses = "/addresses/",
+                _dbs = "/dbs/",
+                writableLocations = new[] { location },
+                readableLocations = new[] { location },
+                enableMultipleWriteLocations = false,
+                userConsistencyPolicy = new { defaultConsistencyLevel = "Session" },
+            });
+        });
         _app.MapControllers();
 
         await _app.StartAsync();

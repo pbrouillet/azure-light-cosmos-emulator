@@ -20,7 +20,7 @@ namespace Azure.Cosmos.LightEmulator.Host;
 
 public static class HostApplication
 {
-    private const string QueryEngineConfiguration = "{\"maxSqlQueryInputLength\":262144,\"maxJoinsPerSqlQuery\":5,\"maxLogicalAndPerSqlQuery\":500,\"maxLogicalOrPerSqlQuery\":500,\"maxUdfRefPerSqlQuery\":10,\"maxInExpressionItemsCount\":16000,\"queryMaxInMemorySortDocumentCount\":500,\"maxQueryRequestTimeoutFraction\":0.9,\"sqlAllowNonFiniteNumbers\":false,\"sqlAllowAggregateFunctions\":true,\"sqlAllowSubQuery\":true,\"sqlAllowScalarSubQuery\":true,\"allowNewKeywords\":true,\"sqlAllowLike\":true,\"sqlAllowGroupByClause\":true,\"maxSpatialQueryCells\":12,\"spatialMaxGeometryPointCount\":256,\"sqlDisableOptimizationFlags\":0,\"sqlAllowTop\":true,\"enableSpatialIndexing\":true}";
+
 
     public static WebApplicationBuilder CreateBuilder(string[]? args = null) =>
         WebApplication.CreateBuilder(args ?? []);
@@ -129,7 +129,7 @@ public static class HostApplication
         app.MapMethods("/", ["GET", "HEAD"], async (HttpContext context, CosmosResponseHeaderService responseHeaders, CancellationToken ct) =>
         {
             await responseHeaders.ApplyAsync(context.Response, new CosmosResponseHeaderOptions(), ct);
-            return Results.Json(CreateAccountResponse(context));
+            return Results.Json(AccountMetadataHelper.CreateAccountResponse(context, emulatorOptions.ConsistencyLevel));
         });
 
         app.MapGet("/health", () => Results.Ok(new { status = "Healthy" }));
@@ -140,50 +140,6 @@ public static class HostApplication
             app.UseSwagger();
             app.UseSwaggerUI();
         }
-    }
-
-    private static object CreateAccountResponse(HttpContext context)
-    {
-        var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/";
-        var location = new
-        {
-            name = "Local",
-            databaseAccountEndpoint = endpoint
-        };
-
-        return new
-        {
-            _self = string.Empty,
-            id = context.Request.Host.Host,
-            _rid = context.Request.Host.Host,
-            media = "/media/",
-            addresses = "/addresses/",
-            _dbs = "/dbs/",
-            writableLocations = new[] { location },
-            readableLocations = new[] { location },
-            enableMultipleWriteLocations = false,
-            userReplicationPolicy = new
-            {
-                asyncReplication = false,
-                minReplicaSetSize = 1,
-                maxReplicasetSize = 4
-            },
-            userConsistencyPolicy = new
-            {
-                defaultConsistencyLevel = "Session"
-            },
-            systemReplicationPolicy = new
-            {
-                minReplicaSetSize = 1,
-                maxReplicasetSize = 4
-            },
-            readPolicy = new
-            {
-                primaryReadCoefficient = 1,
-                secondaryReadCoefficient = 1
-            },
-            queryEngineConfiguration = QueryEngineConfiguration
-        };
     }
 
     private static ConsistencyLevel ParseConsistencyLevel(string? value) =>
