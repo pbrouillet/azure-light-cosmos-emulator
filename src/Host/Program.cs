@@ -74,6 +74,7 @@ public static class Program
         {
             serverOptions.ListenAnyIP(resolvedPort, listenOptions =>
             {
+                listenOptions.Protocols = Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http1AndHttp2;
                 if (emulatorOptions.EnableSsl)
                 {
                     listenOptions.UseHttps();
