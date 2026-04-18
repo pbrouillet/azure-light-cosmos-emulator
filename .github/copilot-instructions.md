@@ -152,7 +152,7 @@ Fluent UI v9 components that render portals (dropdowns, comboboxes, dialogs) nee
 - **Framework**: xUnit with FluentAssertions and Moq
 - **Integration tests** use `TestServerFixture` (`tests/NoSql.Tests/TestServerFixture.cs`) which spins up an in-process `WebApplication` with `TestServer`, registers all services, and provides an `HttpClient` with auto-injected HMAC auth headers
 - **Unit tests** directly instantiate the class under test (no DI container)
-- **SDK parity tests** (`tests/Parity/`) clone the official Azure Cosmos .NET SDK test suite via MSBuild target (`CloneSdkTests.targets`) and run tests against the emulator. Skip with `-p:SkipCloneSdkTests=true`
+- **SDK parity tests** (`tests/Parity.Tests/`) clone the official Azure Cosmos .NET SDK test suite via MSBuild target (`CloneSdkTests.targets`) and run tests against the emulator. Skip with `-p:SkipCloneSdkTests=true`
 
 ### Three DI registration surfaces — keep in sync
 

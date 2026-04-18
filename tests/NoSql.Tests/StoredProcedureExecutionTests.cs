@@ -11,7 +11,7 @@ using FluentAssertions;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Tests;
 
-public class UnitTest1
+public class StoredProcedureExecutionTests
 {
     [Fact]
     public async Task ExecuteStoredProcedureAsync_UsesCosmosContextAndReturnsResponseBody()

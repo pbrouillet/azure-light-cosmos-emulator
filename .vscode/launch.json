@@ -106,7 +106,7 @@
       "request": "launch",
       "preLaunchTask": "build",
       "program": "dotnet",
-      "args": ["test", "--no-build", "tests/Parity", "--verbosity", "normal", "-p:SkipCloneSdkTests=true"],
+      "args": ["test", "--no-build", "tests/Parity.Tests", "--verbosity", "normal", "-p:SkipCloneSdkTests=true"],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
     }

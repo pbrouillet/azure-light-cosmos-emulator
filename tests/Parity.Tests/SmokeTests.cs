@@ -4,7 +4,7 @@ using System.Text.Json.Nodes;
 using FluentAssertions;
 using Microsoft.Azure.Cosmos;
 
-namespace Azure.Cosmos.LightEmulator.Parity;
+namespace Azure.Cosmos.LightEmulator.Parity.Tests;
 
 public class SmokeTests : ParityTestBase
 {

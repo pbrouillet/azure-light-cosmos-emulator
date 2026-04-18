@@ -21,7 +21,7 @@ COPY ["tests/Host.Tests/Azure.Cosmos.LightEmulator.Host.Tests.csproj", "tests/Ho
 COPY ["tests/Kql.Tests/Azure.Cosmos.LightEmulator.Kql.Tests.csproj", "tests/Kql.Tests/"]
 COPY ["tests/MongoDB.Tests/Azure.Cosmos.LightEmulator.MongoDB.Tests.csproj", "tests/MongoDB.Tests/"]
 COPY ["tests/NoSql.Tests/Azure.Cosmos.LightEmulator.NoSql.Tests.csproj", "tests/NoSql.Tests/"]
-COPY ["tests/Parity/Azure.Cosmos.LightEmulator.Parity.csproj", "tests/Parity/"]
+COPY ["tests/Parity.Tests/Azure.Cosmos.LightEmulator.Parity.Tests.csproj", "tests/Parity.Tests/"]
 COPY ["tests/Storage.Tests/Azure.Cosmos.LightEmulator.Storage.Tests.csproj", "tests/Storage.Tests/"]
 
 RUN dotnet restore src/Host/Azure.Cosmos.LightEmulator.Host.csproj

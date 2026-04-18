@@ -43,8 +43,8 @@
   <Folder Name="/tests/NoSql.Tests/">
     <Project Path="tests/NoSql.Tests/Azure.Cosmos.LightEmulator.NoSql.Tests.csproj" />
   </Folder>
-  <Folder Name="/tests/Parity/">
-    <Project Path="tests/Parity/Azure.Cosmos.LightEmulator.Parity.csproj" />
+  <Folder Name="/tests/Parity.Tests/">
+    <Project Path="tests/Parity.Tests/Azure.Cosmos.LightEmulator.Parity.Tests.csproj" />
   </Folder>
   <Folder Name="/tests/Storage.Tests/">
     <Project Path="tests/Storage.Tests/Azure.Cosmos.LightEmulator.Storage.Tests.csproj" />

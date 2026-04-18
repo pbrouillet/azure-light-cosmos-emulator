@@ -13,7 +13,7 @@ using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
-namespace Azure.Cosmos.LightEmulator.Parity;
+namespace Azure.Cosmos.LightEmulator.Parity.Tests;
 
 public abstract class ParityTestBase : IAsyncLifetime
 {

@@ -4,7 +4,7 @@ using FluentAssertions;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Tests;
 
-public class UniqueKeyDiagTest
+public class UniqueKeyDiagTests
 {
     [Fact]
     public async Task ContainerWithUniqueKeyPolicy_HasPolicyInResponse()

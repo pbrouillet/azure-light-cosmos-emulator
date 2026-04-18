@@ -99,7 +99,7 @@
       "command": "dotnet",
       "args": [
         "test",
-        "${workspaceFolder}/tests/Parity",
+        "${workspaceFolder}/tests/Parity.Tests",
         "--verbosity", "normal",
         "-p:SkipCloneSdkTests=true"
       ],
