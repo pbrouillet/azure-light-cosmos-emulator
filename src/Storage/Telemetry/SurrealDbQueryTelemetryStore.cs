@@ -112,6 +112,18 @@ public class SurrealDbQueryTelemetryStore : IQueryTelemetryStore
         await ExecuteAsync($"DELETE {TelemetryTable}", null, ct);
     }
 
+    public async Task TrimAsync(int maxEntries, CancellationToken ct = default)
+    {
+        var records = await QueryRecordsAsync<DbQueryTelemetryRecord>(
+            $"SELECT * FROM {TelemetryTable}",
+            null, ct);
+
+        if (records.Count > maxEntries)
+        {
+            await ExecuteAsync($"DELETE {TelemetryTable}", null, ct);
+        }
+    }
+
     private async Task ExecuteAsync(string sql, IReadOnlyDictionary<string, object?>? parameters, CancellationToken ct)
     {
         var client = await GetClientAsync(ct);

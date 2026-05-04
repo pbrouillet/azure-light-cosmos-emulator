@@ -150,6 +150,7 @@ public static class Program
         });
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Kql.KqlQueryExecutor>();
         builder.Services.AddHostedService<TtlCleanupService>();
+        builder.Services.AddHostedService<DataMaintenanceService>();
 
         var app = builder.Build();
         var logger = app.Logger;

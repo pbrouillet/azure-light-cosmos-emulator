@@ -81,6 +81,21 @@ public class SurrealDbActivityStore : IActivityStore
         await ExecuteAsync($"DELETE {ActivityTable}", null, ct);
     }
 
+    public async Task TrimAsync(int maxEntries, CancellationToken ct = default)
+    {
+        // SurrealDB embedded SDK v0.9.0 has limited WHERE clause support,
+        // so we check the count and clear the table when it exceeds the limit.
+        // For a development emulator, clearing diagnostic telemetry is acceptable.
+        var records = await QueryRecordsAsync<DbActivityRecord>(
+            $"SELECT * FROM {ActivityTable}",
+            null, ct);
+
+        if (records.Count > maxEntries)
+        {
+            await ExecuteAsync($"DELETE {ActivityTable}", null, ct);
+        }
+    }
+
     private async Task ExecuteAsync(string sql, IReadOnlyDictionary<string, object?>? parameters, CancellationToken ct)
     {
         var client = await GetClientAsync(ct);

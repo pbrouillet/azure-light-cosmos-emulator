@@ -34,4 +34,20 @@ public class InMemoryQueryTelemetryStore : IQueryTelemetryStore
         _entries.Clear();
         return Task.CompletedTask;
     }
+
+    public Task TrimAsync(int maxEntries, CancellationToken ct = default)
+    {
+        if (_entries.Count <= maxEntries)
+            return Task.CompletedTask;
+
+        var kept = _entries
+            .OrderByDescending(e => e.Timestamp)
+            .Take(maxEntries)
+            .ToList();
+        _entries.Clear();
+        foreach (var entry in kept)
+            _entries.Add(entry);
+
+        return Task.CompletedTask;
+    }
 }

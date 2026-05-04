@@ -4,6 +4,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Workstation GC uses less memory than Server GC, better for an emulator -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
     <!-- Set to true to skip the Explorer SPA build (e.g. in CI when unchanged, or test projects) -->
     <SkipExplorerBuild Condition="'$(SkipExplorerBuild)' == ''">false</SkipExplorerBuild>
     <ExplorerDir>$(MSBuildThisFileDirectory)..\Explorer</ExplorerDir>

@@ -31,6 +31,11 @@ public interface IChangeFeedProvider
         ChangeType changeType,
         CosmosDocument? previousImage = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Trims change feed entries older than <paramref name="retention"/>.
+    /// </summary>
+    Task TrimAsync(TimeSpan retention, CancellationToken ct = default);
 }
 
 /// <summary>

@@ -25,4 +25,9 @@ public interface IQueryTelemetryStore
     /// Clears all query telemetry entries.
     /// </summary>
     Task ClearAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Trims the telemetry store to the most recent <paramref name="maxEntries"/> entries.
+    /// </summary>
+    Task TrimAsync(int maxEntries, CancellationToken ct = default);
 }

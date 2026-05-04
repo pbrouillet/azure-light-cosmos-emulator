@@ -71,4 +71,15 @@ public class SqliteActivityStore : IActivityStore
 
         return Task.CompletedTask;
     }
+
+    public Task TrimAsync(int maxEntries, CancellationToken ct = default)
+    {
+        using var connection = _connectionManager.CreateConnection();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT @max)";
+        cmd.Parameters.AddWithValue("@max", maxEntries);
+        cmd.ExecuteNonQuery();
+
+        return Task.CompletedTask;
+    }
 }

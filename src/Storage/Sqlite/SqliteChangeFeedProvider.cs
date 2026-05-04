@@ -184,6 +184,18 @@ public class SqliteChangeFeedProvider : IChangeFeedProvider
         });
     }
 
+    public Task TrimAsync(TimeSpan retention, CancellationToken ct = default)
+    {
+        var cutoff = (DateTimeOffset.UtcNow - retention).ToString("O");
+        using var connection = _connectionManager.CreateConnection();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM changefeed WHERE timestamp < @cutoff";
+        cmd.Parameters.AddWithValue("@cutoff", cutoff);
+        cmd.ExecuteNonQuery();
+
+        return Task.CompletedTask;
+    }
+
     private static ChangeFeedDocumentData SerializeDocumentForChangeFeed(CosmosDocument doc) => new()
     {
         Id = doc.Id,

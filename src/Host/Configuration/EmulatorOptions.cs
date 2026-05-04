@@ -46,4 +46,13 @@ public class EmulatorOptions
 
     /// <summary>Verbose logging.</summary>
     public bool Verbose { get; set; }
+
+    /// <summary>Maximum number of activity log entries to retain (default: 5000).</summary>
+    public int MaxActivityLogEntries { get; set; } = 5000;
+
+    /// <summary>Maximum number of query telemetry entries to retain (default: 5000).</summary>
+    public int MaxQueryTelemetryEntries { get; set; } = 5000;
+
+    /// <summary>Change feed retention in minutes (default: 60). Entries older than this are trimmed.</summary>
+    public int ChangeFeedRetentionMinutes { get; set; } = 60;
 }

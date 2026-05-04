@@ -143,6 +143,29 @@ public class SurrealDbChangeFeedProvider : IChangeFeedProvider
         };
     }
 
+    public async Task TrimAsync(TimeSpan retention, CancellationToken ct = default)
+    {
+        var cutoffMs = DateTimeOffset.UtcNow.Subtract(retention).ToUnixTimeMilliseconds();
+        // SurrealDB embedded SDK v0.9.0 has limited WHERE clause support,
+        // so we load all records, identify stale ones, and delete by record key.
+        var allRecords = await SelectTableRecordsAsync<DbChangeFeedRecord>(ChangeFeedTable, ct);
+        var staleRecords = allRecords.Where(r => r.Timestamp < cutoffMs).ToList();
+
+        var client = await GetClientAsync(ct);
+        foreach (var record in staleRecords)
+        {
+            var recordKey = $"{EncodeRecordKey(record.DatabaseId)}:{EncodeRecordKey(record.ContainerId)}:{EncodeRecordKey(record.Lsn.ToString())}";
+            try
+            {
+                await client.Delete(new RecordIdOfString(ChangeFeedTable, recordKey), ct);
+            }
+            catch
+            {
+                // Best effort trimming
+            }
+        }
+    }
+
     private static ChangeFeedItem ToChangeFeedItem(DbChangeFeedRecord record)
     {
         var body = JsonNode.Parse(record.BodyJson)?.AsObject()

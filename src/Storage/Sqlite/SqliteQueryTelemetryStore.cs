@@ -111,4 +111,15 @@ public class SqliteQueryTelemetryStore : IQueryTelemetryStore
 
         return Task.CompletedTask;
     }
+
+    public Task TrimAsync(int maxEntries, CancellationToken ct = default)
+    {
+        using var connection = _connectionManager.CreateConnection();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "DELETE FROM query_telemetry WHERE id NOT IN (SELECT id FROM query_telemetry ORDER BY id DESC LIMIT @max)";
+        cmd.Parameters.AddWithValue("@max", maxEntries);
+        cmd.ExecuteNonQuery();
+
+        return Task.CompletedTask;
+    }
 }

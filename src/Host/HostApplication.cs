@@ -89,6 +89,7 @@ public static class HostApplication
         });
         services.AddSingleton<KqlQueryExecutor>();
         services.AddHostedService<TtlCleanupService>();
+        services.AddHostedService<DataMaintenanceService>();
 
         services
             .AddControllers()

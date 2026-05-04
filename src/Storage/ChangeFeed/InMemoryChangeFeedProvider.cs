@@ -102,4 +102,23 @@ public class InMemoryChangeFeedProvider : IChangeFeedProvider
             ContinuationToken = lastLsn.ToString()
         });
     }
+
+    public Task TrimAsync(TimeSpan retention, CancellationToken ct = default)
+    {
+        var cutoff = DateTimeOffset.UtcNow - retention;
+        lock (_lock)
+        {
+            foreach (var key in _changeFeed.Keys.ToList())
+            {
+                if (_changeFeed.TryGetValue(key, out var items))
+                {
+                    items.RemoveAll(i => i.Timestamp < cutoff);
+                    if (items.Count == 0)
+                        _changeFeed.TryRemove(key, out _);
+                }
+            }
+        }
+
+        return Task.CompletedTask;
+    }
 }

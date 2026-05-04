@@ -1210,8 +1210,11 @@ public class SurrealDbDocumentStore : IDocumentStore
 
     private async Task<long> GetLatestLsnAsync(CancellationToken ct)
     {
-        var latest = await SelectTableRecordsAsync<DbDocumentRecord>(DocumentTable, ct);
-        return latest.OrderByDescending(record => record.Lsn).FirstOrDefault()?.Lsn ?? 0;
+        var records = await QueryRecordsAsync<DbDocumentRecord>(
+            $"SELECT * FROM {DocumentTable} ORDER BY lsn DESC LIMIT 1",
+            EmptyParameters,
+            ct);
+        return records.FirstOrDefault()?.Lsn ?? 0;
     }
 
     private async Task ExecuteAsync(string sql, IReadOnlyDictionary<string, object?>? parameters, CancellationToken ct)

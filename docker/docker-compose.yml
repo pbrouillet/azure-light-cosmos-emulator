@@ -11,6 +11,8 @@ services:
     environment:
       Emulator__DataDirectory: /data
       Emulator__EnableSsl: "false"
+      DOTNET_GCConserveMemory: "9"
+    mem_limit: 512m
 
 volumes:
   cosmos-data:
