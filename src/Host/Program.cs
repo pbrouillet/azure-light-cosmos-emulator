@@ -104,7 +104,10 @@ public static class Program
         var storageType = StorageServiceRegistration.ParseStorageType(emulatorOptions.Storage);
         builder.Services.AddEmulatorStorage(storageType, emulatorOptions.DataDirectory);
         builder.Services.AddSingleton<EmulatorRuntimeState>();
-        builder.Services.AddSingleton<EmulatorAdminSettingsStore>();
+        builder.Services.AddSingleton<EmulatorAdminSettingsStore>(sp =>
+            new EmulatorAdminSettingsStore(
+                sp.GetRequiredService<IOptions<EmulatorOptions>>(),
+                sp.GetService<Azure.Cosmos.LightEmulator.Storage.SurrealDb.SurrealDbConnectionManager>()));
         builder.Services.AddSingleton<IEmulatorInfoService, EmulatorInfoService>();
         builder.Services.AddSingleton<RuTracker>();
         builder.Services.AddSingleton<ThroughputManager>();
@@ -114,6 +117,13 @@ public static class Program
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.NoSql.Query.DmlCommandService>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
         builder.Services.AddSingleton<IAuthProvider, EmulatorAuthProvider>();
+        builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.IProgrammabilityRecordStore>(sp =>
+        {
+            var surrealManager = sp.GetService<Azure.Cosmos.LightEmulator.Storage.SurrealDb.SurrealDbConnectionManager>();
+            if (surrealManager is not null)
+                return new Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.SurrealDbProgrammabilityRecordStore(surrealManager);
+            return new Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.InMemoryProgrammabilityRecordStore();
+        });
         builder.Services.AddSingleton<IProgrammabilityEngine, Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.JintProgrammabilityEngine>();
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         builder.Services.AddSingleton<CosmosResponseHeaderService>();

@@ -31,8 +31,8 @@ The emulator supports three storage backends, configurable via a side config fil
 
 | Backend    | Persistence | Best For                        |
 |------------|-------------|---------------------------------|
-| `SurrealDb` | ✅ Persistent (RocksDB) | Production-like testing (default) |
-| `Sqlite`   | ✅ Persistent (single file) | Lightweight, portable storage   |
+| `Sqlite`   | ✅ Persistent (single file) | Lightweight, portable storage (default) |
+| `SurrealDb` | ✅ Persistent (RocksDB) | Production-like testing         |
 | `InMemory` | ❌ Ephemeral | Fast tests, CI/CD               |
 
 ### Config file (`emulator-config.json`)
@@ -55,7 +55,7 @@ CLI arguments take highest priority:
 ```bash
 cosmos-emulator start --storage sqlite --data-dir ./my-data
 cosmos-emulator start --storage inmemory
-cosmos-emulator start                    # uses config file or defaults to SurrealDb
+cosmos-emulator start                    # uses config file or defaults to Sqlite
 ```
 
 ### Priority order

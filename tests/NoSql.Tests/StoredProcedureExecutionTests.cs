@@ -215,7 +215,7 @@ public class StoredProcedureExecutionTests
             }
         }).GetAwaiter().GetResult();
 
-        return (store, new JintProgrammabilityEngine(store, new CosmosQueryEngine(store, new IndexValidationService()), connectionManager));
+        return (store, new JintProgrammabilityEngine(store, new CosmosQueryEngine(store, new IndexValidationService()), new SurrealDbProgrammabilityRecordStore(connectionManager)));
     }
 
     private static IDictionary<string, object?> AsDictionary(object? value)

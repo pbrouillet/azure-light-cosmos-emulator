@@ -4,12 +4,9 @@ using Acornima;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
-using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
 using Jint;
 using Jint.Native;
 using Jint.Runtime;
-using SurrealDb.Net;
-using SurrealDb.Net.Models;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.StoredProcedures;
 
@@ -105,13 +102,13 @@ public class JintProgrammabilityEngine : IProgrammabilityEngine
 
     private readonly IDocumentStore _store;
     private readonly IQueryEngine _queryEngine;
-    private readonly SurrealDbConnectionManager _connectionManager;
+    private readonly IProgrammabilityRecordStore _recordStore;
 
-    public JintProgrammabilityEngine(IDocumentStore store, IQueryEngine queryEngine, SurrealDbConnectionManager connectionManager)
+    public JintProgrammabilityEngine(IDocumentStore store, IQueryEngine queryEngine, IProgrammabilityRecordStore recordStore)
     {
         _store = store;
         _queryEngine = queryEngine;
-        _connectionManager = connectionManager;
+        _recordStore = recordStore;
     }
 
     public async Task<StoredProcedure> CreateStoredProcedureAsync(string databaseId, string containerId, StoredProcedure sproc, CancellationToken ct = default)
@@ -336,31 +333,15 @@ public class JintProgrammabilityEngine : IProgrammabilityEngine
         await DeleteRecordAsync(UdfTable, MakeRecordKey(databaseId, containerId, udfId), "UserDefinedFunction", udfId, ct);
     }
 
-    private async Task<List<T>> QueryRecordsAsync<T>(string sql, IReadOnlyDictionary<string, object?>? parameters, CancellationToken ct)
-    {
-        var client = await GetClientAsync(ct);
-        var response = await client.RawQuery(sql, parameters ?? EmptyParameters, ct);
-        response.EnsureAllOks();
-        return response.GetValues<T>(0).ToList();
-    }
-
     private async Task<List<T>> SelectTableRecordsAsync<T>(string table, CancellationToken ct)
     {
-        var client = await GetClientAsync(ct);
-        return (await client.Select<T>(table, ct)).ToList();
-    }
-
-    private async Task<ISurrealDbClient> GetClientAsync(CancellationToken ct)
-    {
-        await _connectionManager.InitializeAsync(ct);
-        return _connectionManager.Client;
+        return await _recordStore.SelectTableRecordsAsync<T>(table, ct);
     }
 
     private async Task<T?> SelectRecordAsync<T>(string table, string recordKey, CancellationToken ct)
         where T : class
     {
-        var client = await GetClientAsync(ct);
-        return await client.Select<T>(new RecordIdOfString(table, recordKey), ct);
+        return await _recordStore.SelectRecordAsync<T>(table, recordKey, ct);
     }
 
     private async Task<T> GetRequiredRecordAsync<T>(string table, string recordKey, string resourceType, string resourceId, CancellationToken ct)
@@ -372,42 +353,17 @@ public class JintProgrammabilityEngine : IProgrammabilityEngine
 
     private async Task CreateRecordAsync<T>(string table, string recordKey, T record, CancellationToken ct)
     {
-        var client = await GetClientAsync(ct);
-        var response = await client.RawQuery(
-            "CREATE $recordId CONTENT $data",
-            new Dictionary<string, object?>
-            {
-                ["recordId"] = new RecordIdOfString(table, recordKey),
-                ["data"] = record
-            },
-            ct);
-
-        response.EnsureAllOks();
+        await _recordStore.CreateRecordAsync(table, recordKey, record, ct);
     }
 
     private async Task UpsertRecordAsync<T>(string table, string recordKey, T record, CancellationToken ct)
     {
-        var client = await GetClientAsync(ct);
-        var response = await client.RawQuery(
-            "UPSERT $recordId CONTENT $data",
-            new Dictionary<string, object?>
-            {
-                ["recordId"] = new RecordIdOfString(table, recordKey),
-                ["data"] = record
-            },
-            ct);
-
-        response.EnsureAllOks();
+        await _recordStore.UpsertRecordAsync(table, recordKey, record, ct);
     }
 
     private async Task DeleteRecordAsync(string table, string recordKey, string resourceType, string resourceId, CancellationToken ct)
     {
-        var client = await GetClientAsync(ct);
-        var deleted = await client.Delete(new RecordIdOfString(table, recordKey), ct);
-        if (!deleted)
-        {
-            throw CosmosEmulatorException.NotFound(resourceType, resourceId);
-        }
+        await _recordStore.DeleteRecordAsync(table, recordKey, resourceType, resourceId, ct);
     }
 
     private static DbStoredProcedureRecord ToRecord(StoredProcedure sproc) => new()

@@ -13,6 +13,7 @@ public class SqliteConnectionManager
 
     public SqliteConnectionManager(string dataDirectory)
     {
+        Directory.CreateDirectory(dataDirectory);
         var dbPath = Path.Combine(dataDirectory, "emulator.db");
         _connectionString = $"Data Source={dbPath}";
     }

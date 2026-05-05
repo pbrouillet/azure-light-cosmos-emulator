@@ -10,8 +10,8 @@ The emulator supports three **pluggable storage backends**, selected via configu
 
 | Backend | Engine | Persistence | Use Case |
 |---|---|---|---|
-| **SurrealDb** (default) | SurrealDB embedded + RocksDB KV | ✅ Persistent | Production-like testing |
-| **Sqlite** | Microsoft.Data.Sqlite | ✅ Persistent (single file) | Lightweight, portable |
+| **Sqlite** (default) | Microsoft.Data.Sqlite | ✅ Persistent (single file) | Lightweight, portable |
+| **SurrealDb** | SurrealDB embedded + RocksDB KV | ✅ Persistent | Production-like testing |
 | **InMemory** | ConcurrentDictionary | ❌ Ephemeral | Fast tests, CI/CD |
 
 All backends implement the `IDocumentStore` interface (31 methods) and can be selected at startup:

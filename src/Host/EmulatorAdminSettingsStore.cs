@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json.Serialization;
 using Azure.Cosmos.LightEmulator.Host.Configuration;
 using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
@@ -7,20 +8,36 @@ using SurrealDb.Net.Models;
 
 namespace Azure.Cosmos.LightEmulator.Host;
 
-public sealed class EmulatorAdminSettingsStore(
-    SurrealDbConnectionManager connectionManager,
-    IOptions<EmulatorOptions> emulatorOptions)
+public sealed class EmulatorAdminSettingsStore
 {
     private const string TableName = "admin_settings";
     private const string RecordKey = "entra";
 
-    public async Task<EmulatorAdminSettings?> GetStoredSettingsAsync(CancellationToken ct = default) =>
-        await connectionManager.Client.Select<EmulatorAdminSettings>(new RecordIdOfString(TableName, RecordKey), ct);
+    private readonly SurrealDbConnectionManager? _connectionManager;
+    private readonly IOptions<EmulatorOptions> _emulatorOptions;
+    private readonly ConcurrentDictionary<string, EmulatorAdminSettings> _inMemoryStore = new();
+
+    public EmulatorAdminSettingsStore(
+        IOptions<EmulatorOptions> emulatorOptions,
+        SurrealDbConnectionManager? connectionManager = null)
+    {
+        _emulatorOptions = emulatorOptions;
+        _connectionManager = connectionManager;
+    }
+
+    public async Task<EmulatorAdminSettings?> GetStoredSettingsAsync(CancellationToken ct = default)
+    {
+        if (_connectionManager is not null)
+            return await _connectionManager.Client.Select<EmulatorAdminSettings>(new RecordIdOfString(TableName, RecordKey), ct);
+
+        _inMemoryStore.TryGetValue(RecordKey, out var settings);
+        return settings;
+    }
 
     public async Task<EmulatorAdminSettings> GetEffectiveSettingsAsync(CancellationToken ct = default)
     {
         var storedSettings = await GetStoredSettingsAsync(ct);
-        var options = emulatorOptions.Value;
+        var options = _emulatorOptions.Value;
 
         return new EmulatorAdminSettings
         {
@@ -43,16 +60,23 @@ public sealed class EmulatorAdminSettingsStore(
             ClientId = Normalize(clientId)
         };
 
-        var response = await connectionManager.Client.RawQuery(
-            "UPSERT $recordId CONTENT $data",
-            new Dictionary<string, object?>
-            {
-                ["recordId"] = new RecordIdOfString(TableName, RecordKey),
-                ["data"] = settings
-            },
-            ct);
+        if (_connectionManager is not null)
+        {
+            var response = await _connectionManager.Client.RawQuery(
+                "UPSERT $recordId CONTENT $data",
+                new Dictionary<string, object?>
+                {
+                    ["recordId"] = new RecordIdOfString(TableName, RecordKey),
+                    ["data"] = settings
+                },
+                ct);
+            response.EnsureAllOks();
+        }
+        else
+        {
+            _inMemoryStore[RecordKey] = settings;
+        }
 
-        response.EnsureAllOks();
         return settings;
     }
 

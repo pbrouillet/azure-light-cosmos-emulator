@@ -390,7 +390,7 @@ function ConfigurationCard({ info }: { info: EmulatorInfo }) {
       <div className={styles.infoList}>
         <InfoRow label="Port" value={info.configuration.port.toString()} />
         <InfoRow label="MongoDB port" value={info.configuration.mongoPort.toString()} />
-        <InfoRow label="Storage backend" value={info.configuration.storage ?? 'SurrealDb'} />
+        <InfoRow label="Storage backend" value={info.configuration.storage ?? 'Sqlite'} />
         <InfoRow label="Consistency level" value={info.configuration.consistencyLevel} />
         <InfoRow label="SSL enabled" value={info.configuration.enableSsl ? 'Yes' : 'No'} />
         <InfoRow label="Explorer enabled" value={info.configuration.enableExplorer ? 'Yes' : 'No'} />
@@ -400,7 +400,7 @@ function ConfigurationCard({ info }: { info: EmulatorInfo }) {
   )
 }
 
-const storageOptions = ['SurrealDb', 'Sqlite', 'InMemory'] as const
+const storageOptions = ['Sqlite', 'SurrealDb', 'InMemory'] as const
 
 function StorageConfigCard() {
   const styles = useStyles()
@@ -416,7 +416,7 @@ function StorageConfigCard() {
 
   const config = configQuery.data
   const current = draft ?? {
-    storage: config?.storage ?? 'SurrealDb',
+    storage: config?.storage ?? 'Sqlite',
     dataDirectory: config?.dataDirectory ?? '',
   }
 

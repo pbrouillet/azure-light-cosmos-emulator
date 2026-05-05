@@ -29,6 +29,7 @@ public static class HostApplication
     {
         var emulatorOptions = builder.Configuration.GetSection(EmulatorOptions.SectionName).Get<EmulatorOptions>() ?? new EmulatorOptions();
 
+        Directory.CreateDirectory(emulatorOptions.DataDirectory);
         ConfigureServices(builder.Services, emulatorOptions);
 
         var app = builder.Build();
@@ -43,10 +44,20 @@ public static class HostApplication
         var storageType = StorageServiceRegistration.ParseStorageType(emulatorOptions.Storage);
         services.AddEmulatorStorage(storageType, emulatorOptions.DataDirectory);
         services.AddSingleton<EmulatorRuntimeState>();
-        services.AddSingleton<EmulatorAdminSettingsStore>();
+        services.AddSingleton<EmulatorAdminSettingsStore>(sp =>
+            new EmulatorAdminSettingsStore(
+                sp.GetRequiredService<IOptions<EmulatorOptions>>(),
+                sp.GetService<Azure.Cosmos.LightEmulator.Storage.SurrealDb.SurrealDbConnectionManager>()));
         services.AddSingleton<IEmulatorInfoService, EmulatorInfoService>();
         services.AddSingleton<RuTracker>();
         services.AddSingleton<ThroughputManager>();
+        services.AddSingleton<Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.IProgrammabilityRecordStore>(sp =>
+        {
+            var surrealManager = sp.GetService<Azure.Cosmos.LightEmulator.Storage.SurrealDb.SurrealDbConnectionManager>();
+            if (surrealManager is not null)
+                return new Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.SurrealDbProgrammabilityRecordStore(surrealManager);
+            return new Azure.Cosmos.LightEmulator.NoSql.StoredProcedures.InMemoryProgrammabilityRecordStore();
+        });
         services.AddSingleton<IProgrammabilityEngine, JintProgrammabilityEngine>();
         services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
         services.AddSingleton<IndexValidationService>();

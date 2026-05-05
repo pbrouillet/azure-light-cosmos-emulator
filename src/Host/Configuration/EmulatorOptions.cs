@@ -16,7 +16,7 @@ public class EmulatorOptions
     public int MongoPort { get; set; } = 10255;
 
     /// <summary>Storage backend: SurrealDb (default), Sqlite, or InMemory.</summary>
-    public string Storage { get; set; } = "SurrealDb";
+    public string Storage { get; set; } = "Sqlite";
 
     /// <summary>Data directory for persistent storage backends.</summary>
     public string DataDirectory { get; set; } = Path.Combine(

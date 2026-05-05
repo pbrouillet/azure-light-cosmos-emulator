@@ -1,6 +1,6 @@
 {
   "Emulator": {
-    "Storage": "SurrealDb",
+    "Storage": "Sqlite",
     "DataDirectory": ""
   }
 }

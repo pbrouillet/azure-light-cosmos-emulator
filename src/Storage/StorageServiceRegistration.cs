@@ -20,12 +20,12 @@ public static class StorageServiceRegistration
     public static StorageType ParseStorageType(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
-            return StorageType.SurrealDb;
+            return StorageType.Sqlite;
 
         if (Enum.TryParse<StorageType>(value, ignoreCase: true, out var parsed))
             return parsed;
 
-        return StorageType.SurrealDb;
+        return StorageType.Sqlite;
     }
 
     /// <summary>
