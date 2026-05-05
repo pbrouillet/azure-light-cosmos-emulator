@@ -2,6 +2,7 @@ using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Host.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Azure.Cosmos.LightEmulator.Host;
 
@@ -13,7 +14,7 @@ public sealed class DataMaintenanceService(
     IActivityStore activityStore,
     IQueryTelemetryStore queryTelemetryStore,
     IChangeFeedProvider changeFeedProvider,
-    EmulatorOptions options,
+    IOptions<EmulatorOptions> options,
     ILogger<DataMaintenanceService> logger) : BackgroundService
 {
     private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromMinutes(5);
@@ -34,15 +35,16 @@ public sealed class DataMaintenanceService(
     {
         try
         {
-            await activityStore.TrimAsync(options.MaxActivityLogEntries, ct);
-            await queryTelemetryStore.TrimAsync(options.MaxQueryTelemetryEntries, ct);
-            await changeFeedProvider.TrimAsync(TimeSpan.FromMinutes(options.ChangeFeedRetentionMinutes), ct);
+            var opts = options.Value;
+            await activityStore.TrimAsync(opts.MaxActivityLogEntries, ct);
+            await queryTelemetryStore.TrimAsync(opts.MaxQueryTelemetryEntries, ct);
+            await changeFeedProvider.TrimAsync(TimeSpan.FromMinutes(opts.ChangeFeedRetentionMinutes), ct);
 
             logger.LogDebug(
                 "Data maintenance completed. Limits: activity={ActivityMax}, telemetry={TelemetryMax}, changeFeedRetention={RetentionMin}m",
-                options.MaxActivityLogEntries,
-                options.MaxQueryTelemetryEntries,
-                options.ChangeFeedRetentionMinutes);
+                opts.MaxActivityLogEntries,
+                opts.MaxQueryTelemetryEntries,
+                opts.ChangeFeedRetentionMinutes);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

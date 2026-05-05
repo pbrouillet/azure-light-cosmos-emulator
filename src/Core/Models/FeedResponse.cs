@@ -29,4 +29,11 @@ public class FeedResponse<T>
 
     /// <summary>RU cost multiplier applied when a scan was required.</summary>
     public double RuMultiplier { get; set; } = 1.0;
+
+    /// <summary>
+    /// When true, the query used SELECT VALUE projection and each resource
+    /// wraps a single scalar in a "$1" key that should be unwrapped before
+    /// returning to the caller over the REST API.
+    /// </summary>
+    public bool IsValueProjection { get; set; }
 }

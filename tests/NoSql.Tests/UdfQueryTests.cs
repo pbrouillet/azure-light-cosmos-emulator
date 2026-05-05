@@ -33,7 +33,7 @@ public class UdfQueryTests
         result["_count"]!.GetValue<int>().Should().Be(1);
 
         var documents = (result["Documents"] ?? result["documents"])!.AsArray();
-        documents[0]!["$1"]!.GetValue<double>().Should().Be(100);
+        documents[0]!.GetValue<double>().Should().Be(100);
     }
 
     [Fact]
@@ -60,7 +60,7 @@ public class UdfQueryTests
         result["_count"]!.GetValue<int>().Should().Be(1);
 
         var documents = (result["Documents"] ?? result["documents"])!.AsArray();
-        documents[0]!["$1"]!.GetValue<double>().Should().Be(115);
+        documents[0]!.GetValue<double>().Should().Be(115);
     }
 
     [Fact]

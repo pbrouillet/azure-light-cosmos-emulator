@@ -471,7 +471,9 @@ public class DocumentsController : CosmosControllerBase
             return Ok(new
             {
                 _rid = result.Rid,
-                Documents = result.Resources,
+                Documents = result.IsValueProjection
+                    ? result.Resources.Select(r => r["$1"]).ToList<object?>()
+                    : (object)result.Resources,
                 _count = result.Count
             });
         }

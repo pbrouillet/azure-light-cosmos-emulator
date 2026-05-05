@@ -157,7 +157,8 @@ public sealed class CosmosQueryEngine : IQueryEngine
             ContinuationToken = nextIndex < projectedResults.Count
                 ? nextIndex.ToString(CultureInfo.InvariantCulture)
                 : null,
-            RuMultiplier = validationResult.RuMultiplier
+            RuMultiplier = validationResult.RuMultiplier,
+            IsValueProjection = plan.Projection.Mode == ProjectionMode.Value
         };
     }
 
