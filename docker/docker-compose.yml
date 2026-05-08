@@ -1,8 +1,23 @@
 services:
+  # One-shot: ensure the cosmos-data named volume is owned by UID 1654
+  # (the APP_UID baked into the chiseled base image). Idempotent — if
+  # the ownership is already correct, chown is a no-op. The cosmos-emulator
+  # service waits for this to complete before starting.
+  cosmos-data-init:
+    image: busybox:stable
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 1654:1654 /data && chmod 0775 /data"]
+    volumes:
+      - cosmos-data:/data
+
   cosmos-emulator:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    user: "1654:1654"
+    depends_on:
+      cosmos-data-init:
+        condition: service_completed_successfully
     ports:
       - "8081:8081"
       - "10255:10255"

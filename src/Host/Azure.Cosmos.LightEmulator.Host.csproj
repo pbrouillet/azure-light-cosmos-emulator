@@ -39,8 +39,11 @@
     <EmbeddedResource Include="wwwroot\explorer\**" />
   </ItemGroup>
 
-  <!-- Copy explorer SPA to build output so it's accessible regardless of content root -->
-  <ItemGroup>
+  <!-- Copy explorer SPA to build output so it's accessible regardless of content root.
+       In Release configuration, the assets are embedded via the EmbeddedResource rule
+       above and Program.cs.ResolveExplorerFileProvider tries the embedded provider
+       first, so loose-copying them to the publish output is dead weight. -->
+  <ItemGroup Condition="'$(Configuration)' != 'Release'">
     <Content Update="wwwroot\explorer\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

@@ -1,10 +1,39 @@
-**/bin
-**/obj
-.git
+# Build outputs
+**/bin/
+**/obj/
+**/out/
+
+# Node artifacts
+**/node_modules/
+src/Explorer/node_modules/
+src/Explorer/dist/
+
+# Git, IDE, scratch
+.git/
 .gitignore
-.sdk-tests
-.vs
-TestResults
-coverage
-node_modules
-src/Explorer/node_modules
+.github/
+.vs/
+.vscode/
+*.user
+
+# Test outputs and source — test source isn't built in Docker
+TestResults/
+coverage/
+.sdk-tests/
+tests/
+
+# Docs and tooling not needed in the image
+docs/
+SurrealDbInspect/
+**/*.md
+
+# Docker files themselves
+docker/
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Misc
+*.log
+*.tmp
+emulator-config.json
