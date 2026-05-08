@@ -1,4 +1,4 @@
-FROM node:24-alpine AS spa-build
+FROM --platform=$BUILDPLATFORM node:24-alpine AS spa-build
 WORKDIR /spa
 
 COPY src/Explorer/package.json src/Explorer/package-lock.json ./
