@@ -79,7 +79,7 @@ public abstract class ParityTestBase : IAsyncLifetime
         var request = new HttpRequestMessage(method, resourcePath);
         var date = DateTime.UtcNow.ToString("R", CultureInfo.InvariantCulture);
         request.Headers.Add("x-ms-date", date);
-        request.Headers.Add(CosmosHeaders.Authorization, _authProvider.GenerateAuthHeader(method.Method, resourceType, resourceLink.ToLowerInvariant(), date));
+        request.Headers.Add(CosmosHeaders.Authorization, _authProvider.GenerateAuthHeader(method.Method, resourceType, resourceLink, date));
         request.Headers.Add("x-ms-version", CosmosHeaders.CurrentServiceVersion);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 

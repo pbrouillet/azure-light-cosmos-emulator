@@ -230,7 +230,7 @@ public sealed class TestServerFixture : IAsyncDisposable
             _ => string.Join('/', segments)
         };
 
-        return (resourceType.ToLowerInvariant(), resourceLink.ToLowerInvariant());
+        return (resourceType.ToLowerInvariant(), resourceLink);
     }
 
     public async ValueTask DisposeAsync()

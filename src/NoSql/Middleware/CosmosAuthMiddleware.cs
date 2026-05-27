@@ -122,7 +122,11 @@ public class CosmosAuthMiddleware
             _ => string.Join("/", segments)
         };
 
-        return (resourceType.ToLowerInvariant(), resourceLink.ToLowerInvariant());
+        // resourceType must be lowercased per the Cosmos DB auth spec.
+        // resourceLink must preserve its original casing — the Azure Cosmos DB SDK
+        // treats name-based resource links as case-sensitive when computing the
+        // HMAC signature (see AuthorizationHelper.SerializeMessagePayload in the SDK).
+        return (resourceType.ToLowerInvariant(), resourceLink);
     }
 
     /// <summary>

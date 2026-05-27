@@ -108,6 +108,24 @@ public class DatabaseTests
         body["code"]!.GetValue<string>().Should().Be("NotFound");
     }
 
+    [Fact]
+    public async Task CreateAndGetDatabase_WithMixedCaseName_AuthSucceeds()
+    {
+        await using var fixture = await TestServerFixture.CreateAsync();
+        var dbId = "MyDatabase-" + Guid.NewGuid().ToString("N")[..8];
+
+        using var createRequest = fixture.CreateRequest(HttpMethod.Post, "/dbs", new { id = dbId });
+        using var createResponse = await fixture.Client.SendAsync(createRequest);
+        createResponse.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        using var getRequest = fixture.CreateRequest(HttpMethod.Get, $"/dbs/{dbId}");
+        using var getResponse = await fixture.Client.SendAsync(getRequest);
+        getResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var body = await ReadBodyAsync(getResponse);
+        body["id"]!.GetValue<string>().Should().Be(dbId);
+    }
+
     private static async Task CreateDatabaseAsync(TestServerFixture fixture, string dbId)
     {
         using var request = fixture.CreateRequest(HttpMethod.Post, "/dbs", new { id = dbId });
