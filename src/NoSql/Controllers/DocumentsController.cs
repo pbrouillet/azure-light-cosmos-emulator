@@ -11,6 +11,7 @@ using Azure.Cosmos.LightEmulator.NoSql.Middleware;
 using Azure.Cosmos.LightEmulator.NoSql.Query;
 using Azure.Cosmos.LightEmulator.Triggers.Engine;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 
@@ -31,6 +32,7 @@ public class DocumentsController : CosmosControllerBase
     private readonly IConsistencyManager _consistencyManager;
     private readonly QueryExplainService _queryExplainService;
     private readonly DmlCommandService _dmlCommandService;
+    private readonly ILogger<DocumentsController> _logger;
 
     public DocumentsController(
         IDocumentStore store,
@@ -40,7 +42,8 @@ public class DocumentsController : CosmosControllerBase
         IConsistencyManager consistencyManager,
         QueryExplainService queryExplainService,
         DmlCommandService dmlCommandService,
-        CosmosResponseHeaderService responseHeaders)
+        CosmosResponseHeaderService responseHeaders,
+        ILogger<DocumentsController> logger)
         : base(responseHeaders)
     {
         _store = store;
@@ -48,6 +51,7 @@ public class DocumentsController : CosmosControllerBase
         _triggerEngine = triggerEngine;
         _telemetryStore = telemetryStore;
         _consistencyManager = consistencyManager;
+        _logger = logger;
         _queryExplainService = queryExplainService;
         _dmlCommandService = dmlCommandService;
     }
@@ -74,6 +78,9 @@ public class DocumentsController : CosmosControllerBase
     [HttpGet("{docId}")]
     public async Task<IActionResult> Read(string dbId, string collId, string docId, CancellationToken ct)
     {
+        var pkError = RequirePartitionKeyHeader();
+        if (pkError is not null) return pkError;
+
         var pkHeader = Request.Headers[CosmosHeaders.PartitionKey].FirstOrDefault();
         var partitionKey = ParsePartitionKey(pkHeader);
 
@@ -92,7 +99,7 @@ public class DocumentsController : CosmosControllerBase
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {
-            return NotFound(ErrorResponse(ex.ErrorCode, ex.Message));
+            return NotFound(ErrorResponse(ex.ErrorCode, await EnrichNotFoundMessageAsync(dbId, collId, docId, partitionKey, ex.Message, ct)));
         }
     }
 
@@ -141,8 +148,14 @@ public class DocumentsController : CosmosControllerBase
     [HttpDelete("{docId}")]
     public async Task<IActionResult> Delete(string dbId, string collId, string docId, CancellationToken ct)
     {
+        var pkError = RequirePartitionKeyHeader();
+        if (pkError is not null) return pkError;
+
         var pkHeader = Request.Headers[CosmosHeaders.PartitionKey].FirstOrDefault();
         var partitionKey = ParsePartitionKey(pkHeader);
+
+        _logger.LogInformation("DELETE doc {DocId} in {DbId}/{CollId} — PK header: {PkHeader}, parsed: {ParsedPk}",
+            docId, dbId, collId, pkHeader, partitionKey.ToHeaderString());
 
         var preTriggers = ParseTriggerHeader(CosmosHeaders.PreTriggerInclude);
         var postTriggers = ParseTriggerHeader(CosmosHeaders.PostTriggerInclude);
@@ -173,7 +186,9 @@ public class DocumentsController : CosmosControllerBase
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {
-            return NotFound(ErrorResponse(ex.ErrorCode, ex.Message));
+            var enrichedMessage = await EnrichNotFoundMessageAsync(dbId, collId, docId, partitionKey, ex.Message, ct);
+            _logger.LogWarning("DELETE {DbId}/{CollId}/{DocId} → 404: {Message}", dbId, collId, docId, enrichedMessage);
+            return NotFound(ErrorResponse(ex.ErrorCode, enrichedMessage));
         }
     }
 
@@ -204,6 +219,9 @@ public class DocumentsController : CosmosControllerBase
     [HttpPatch("{docId}")]
     public async Task<IActionResult> Patch(string dbId, string collId, string docId, CancellationToken ct)
     {
+        var pkError = RequirePartitionKeyHeader();
+        if (pkError is not null) return pkError;
+
         var pkHeader = Request.Headers[CosmosHeaders.PartitionKey].FirstOrDefault();
         var partitionKey = ParsePartitionKey(pkHeader);
         var ifMatch = Request.Headers[CosmosHeaders.IfMatch].FirstOrDefault();
@@ -264,7 +282,7 @@ public class DocumentsController : CosmosControllerBase
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {
-            return NotFound(ErrorResponse(ex.ErrorCode, ex.Message));
+            return NotFound(ErrorResponse(ex.ErrorCode, await EnrichNotFoundMessageAsync(dbId, collId, docId, partitionKey, ex.Message, ct)));
         }
         catch (CosmosEmulatorException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
         {
@@ -570,6 +588,74 @@ public class DocumentsController : CosmosControllerBase
     }
 
     private static object ErrorResponse(string code, string message) => new { code, message };
+
+    /// <summary>
+    /// When a document is not found by ID + partition key, checks whether the document exists
+    /// under a different partition key. Returns an enriched error message to help diagnose
+    /// partition key mismatches (common when the Explorer or SDK sends the wrong PK value).
+    /// </summary>
+    private async Task<string> EnrichNotFoundMessageAsync(
+        string dbId, string collId, string docId,
+        PartitionKeyValue searchedPk, string originalMessage, CancellationToken ct)
+    {
+        try
+        {
+            var allDocs = await _store.ListDocumentsAsync(dbId, collId, ct);
+            var totalCount = allDocs.Resources.Count;
+            var matches = allDocs.Resources
+                .Where(d => string.Equals(d.Id, docId, StringComparison.Ordinal))
+                .ToList();
+
+            _logger.LogWarning(
+                "DELETE 404 for doc '{DocId}' with PK {SearchedPk} in {DbId}/{CollId}. " +
+                "Container has {TotalDocs} document(s), {MatchCount} with this id.",
+                docId, searchedPk.ToHeaderString(), dbId, collId, totalCount, matches.Count);
+
+            // Log first few documents in the container for debugging
+            foreach (var d in allDocs.Resources.Take(10))
+            {
+                _logger.LogWarning("  → stored doc id='{Id}', pk={Pk}",
+                    d.Id, d.PartitionKey.ToHeaderString());
+            }
+            if (totalCount > 10)
+                _logger.LogWarning("  → ... and {Remaining} more", totalCount - 10);
+
+            if (matches.Count == 1)
+            {
+                return $"{originalMessage} The document exists with partition key " +
+                       $"{matches[0].PartitionKey.ToHeaderString()} but the request specified " +
+                       $"{searchedPk.ToHeaderString()}.";
+            }
+            if (matches.Count > 1)
+            {
+                var pks = string.Join(", ", matches.Select(d => d.PartitionKey.ToHeaderString()));
+                return $"{originalMessage} The document id exists under {matches.Count} " +
+                       $"partition keys ({pks}) but none matched the request value " +
+                       $"{searchedPk.ToHeaderString()}.";
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "EnrichNotFoundMessageAsync failed for {DbId}/{CollId}/{DocId}", dbId, collId, docId);
+        }
+
+        return originalMessage;
+    }
+
+    private IActionResult? RequirePartitionKeyHeader()
+    {
+        var pkHeader = Request.Headers[CosmosHeaders.PartitionKey].FirstOrDefault();
+        if (string.IsNullOrEmpty(pkHeader))
+            return BadRequest(ErrorResponse("BadRequest", "PartitionKey value must be supplied for this operation."));
+
+        var parsed = ParsePartitionKey(pkHeader);
+        if (parsed.Components.Count == 0)
+            return BadRequest(ErrorResponse("BadRequest",
+                $"PartitionKey extracted from header is empty. Ensure the '{CosmosHeaders.PartitionKey}' header " +
+                "is a valid JSON array with at least one element, e.g. [\"value\"]."));
+
+        return null;
+    }
 
     private string[] ParseTriggerHeader(string headerName)
     {

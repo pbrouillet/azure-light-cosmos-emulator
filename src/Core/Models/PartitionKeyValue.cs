@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 
 namespace Azure.Cosmos.LightEmulator.Core.Models;
@@ -35,7 +36,7 @@ public class PartitionKeyValue
             null => "null",
             string s => $"\"{JsonEncodedText.Encode(s)}\"",
             bool b => b ? "true" : "false",
-            _ => c.ToString() ?? "null"
+            _ => Convert.ToString(c, CultureInfo.InvariantCulture) ?? "null"
         });
 
         return $"[{string.Join(",", parts)}]";
