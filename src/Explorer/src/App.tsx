@@ -586,7 +586,7 @@ function App() {
             key={tab.id}
             collId={tab.collId}
             dbId={tab.dbId}
-            partitionKeyPaths={tab.partitionKeyPaths ?? ['/id']}
+            partitionKeyPaths={tab.partitionKeyPaths}
           />
         </WorkspacePanel>
       )
