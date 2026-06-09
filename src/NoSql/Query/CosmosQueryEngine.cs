@@ -303,12 +303,26 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         var top = ParseTop(ref selectClause, parameters);
+        var selectOffset = ParseSelectOffset(ref selectClause, parameters);
         var distinct = ParseDistinct(ref selectClause);
         var projection = ParseProjection(selectClause);
         var where = ParseWhere(whereClause);
         var groupBy = ParseGroupBy(groupByClause);
         var orderBy = ParseOrderBy(orderByClause);
         var (offset, limit) = ParseOffsetLimit(offsetLimitClause, parameters);
+
+        // SELECT TOP n OFFSET m → offset=m, limit=n (no separate top)
+        if (selectOffset is not null)
+        {
+            if (offset is not null || limit is not null)
+            {
+                throw CosmosEmulatorException.BadRequest("Cannot use OFFSET in the SELECT clause together with a trailing OFFSET … LIMIT clause.");
+            }
+
+            offset = selectOffset;
+            limit = top;
+            top = null;
+        }
 
         if (projection.Mode == ProjectionMode.All && (groupBy.Count > 0 || projection.ContainsAggregate))
         {
@@ -406,6 +420,18 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
         selectClause = topMatch.Groups["rest"].Value.Trim();
         return ResolveNonNegativeInteger(ParseScalarExpression(topMatch.Groups["value"].Value), parameters, "TOP");
+    }
+
+    private int? ParseSelectOffset(ref string selectClause, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        var offsetMatch = Regex.Match(selectClause, @"^OFFSET\s+(?<value>@?[A-Za-z0-9_\-\.]+)\s+(?<rest>.+)$", RegexOptions.IgnoreCase);
+        if (!offsetMatch.Success)
+        {
+            return null;
+        }
+
+        selectClause = offsetMatch.Groups["rest"].Value.Trim();
+        return ResolveNonNegativeInteger(ParseScalarExpression(offsetMatch.Groups["value"].Value), parameters, "OFFSET");
     }
 
     private static Projection ParseProjection(string selectClause)
@@ -982,6 +1008,31 @@ public sealed class CosmosQueryEngine : IQueryEngine
         return array;
     }
 
+    private object? EvaluateObjectLiteral(
+        QueryRow? row,
+        ObjectLiteralExpression objectLit,
+        IReadOnlyDictionary<string, object?>? parameters,
+        IReadOnlyList<QueryRow>? group = null,
+        string? databaseId = null,
+        string? containerId = null)
+    {
+        var obj = new JsonObject();
+        foreach (var property in objectLit.Properties)
+        {
+            var value = EvaluateScalarExpression(row, property.Value, parameters, group, databaseId, containerId);
+            // Per the Cosmos NoSQL spec, properties whose value is undefined are
+            // omitted from the resulting object.
+            if (ReferenceEquals(value, UndefinedValue))
+            {
+                continue;
+            }
+
+            obj[property.Key] = ConvertToJsonNode(value);
+        }
+
+        return obj;
+    }
+
     private object? EvaluateScalarSubquery(ScalarSubqueryExpression subquery, QueryRow? outerRow, IReadOnlyDictionary<string, object?>? parameters, string? databaseId, string? containerId)
     {
         if (databaseId is null || containerId is null)
@@ -1136,6 +1187,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             FunctionCallExpression function => EvaluateFunction(row, function, parameters, group, databaseId, containerId),
             ScalarSubqueryExpression subquery => EvaluateScalarSubquery(subquery, row, parameters, databaseId, containerId),
             ArrayLiteralExpression arrayLit => EvaluateArrayLiteral(row, arrayLit, parameters, group, databaseId, containerId),
+            ObjectLiteralExpression objectLit => EvaluateObjectLiteral(row, objectLit, parameters, group, databaseId, containerId),
             StarExpression => UndefinedValue,
             _ => throw CosmosEmulatorException.BadRequest("Unsupported expression.")
         };
@@ -2887,6 +2939,7 @@ public sealed class CosmosQueryEngine : IQueryEngine
             {
                 TokenType.OpenParen => ParseParenthesizedScalar(),
                 TokenType.OpenBracket => ParseArrayLiteral(),
+                TokenType.OpenBrace => ParseObjectLiteral(),
                 TokenType.Parameter => ConsumeParameter(),
                 TokenType.String => ConsumeString(),
                 TokenType.Number => ConsumeNumber(),
@@ -2916,6 +2969,38 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
             _index++; // consume ]
             return new ArrayLiteralExpression(elements);
+        }
+
+        private ScalarExpression ParseObjectLiteral()
+        {
+            _index++; // consume {
+            var properties = new List<KeyValuePair<string, ScalarExpression>>();
+            if (Current.Type != TokenType.CloseBrace)
+            {
+                do
+                {
+                    if (Current.Type != TokenType.String && Current.Type != TokenType.Identifier)
+                    {
+                        throw CosmosEmulatorException.BadRequest(
+                            "Expected property name in object literal.");
+                    }
+
+                    var key = Current.Text;
+                    _index++;
+                    Expect(TokenType.Colon, ":");
+                    var value = ParseScalarPrimary();
+                    properties.Add(new KeyValuePair<string, ScalarExpression>(key, value));
+                }
+                while (TryConsume(TokenType.Comma));
+            }
+
+            if (Current.Type != TokenType.CloseBrace)
+            {
+                throw CosmosEmulatorException.BadRequest("Expected '}'.");
+            }
+
+            _index++; // consume }
+            return new ObjectLiteralExpression(properties);
         }
 
         private ScalarExpression ParseParenthesizedScalar()
@@ -3155,6 +3240,18 @@ public sealed class CosmosQueryEngine : IQueryEngine
                         tokens.Add(new Token(TokenType.CloseBracket, "]"));
                         index++;
                         break;
+                    case '{':
+                        tokens.Add(new Token(TokenType.OpenBrace, "{"));
+                        index++;
+                        break;
+                    case '}':
+                        tokens.Add(new Token(TokenType.CloseBrace, "}"));
+                        index++;
+                        break;
+                    case ':':
+                        tokens.Add(new Token(TokenType.Colon, ":"));
+                        index++;
+                        break;
                     case '*':
                         tokens.Add(new Token(TokenType.Asterisk, "*"));
                         index++;
@@ -3319,6 +3416,8 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
     private sealed record ArrayLiteralExpression(IReadOnlyList<ScalarExpression> Elements) : ScalarExpression;
 
+    private sealed record ObjectLiteralExpression(IReadOnlyList<KeyValuePair<string, ScalarExpression>> Properties) : ScalarExpression;
+
     private enum TokenType
     {
         End,
@@ -3330,6 +3429,9 @@ public sealed class CosmosQueryEngine : IQueryEngine
         CloseParen,
         OpenBracket,
         CloseBracket,
+        OpenBrace,
+        CloseBrace,
+        Colon,
         Comma,
         Operator,
         Asterisk

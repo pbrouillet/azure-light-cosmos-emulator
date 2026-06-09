@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
 using Azure.Cosmos.LightEmulator.NoSql.Query;
@@ -110,6 +111,94 @@ public class CosmosQueryEngineTests
         secondPage.Resources.Should().ContainSingle();
         secondPage.Resources[0]["id"]!.GetValue<string>().Should().Be("doc-3");
         secondPage.ContinuationToken.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_SupportsSelectTopOffset()
+    {
+        var (store, engine) = CreateSut();
+        await SeedDocumentsAsync(store,
+            CreateDocument("doc-1", "tenant-1", "one", 1, 1, "a", ["tag1"], true),
+            CreateDocument("doc-2", "tenant-1", "two", 2, 2, "a", ["tag1"], true),
+            CreateDocument("doc-3", "tenant-1", "three", 3, 3, "a", ["tag1"], true),
+            CreateDocument("doc-4", "tenant-1", "four", 4, 4, "a", ["tag1"], true),
+            CreateDocument("doc-5", "tenant-1", "five", 5, 5, "a", ["tag1"], true));
+
+        var result = await engine.ExecuteQueryAsync("db", "coll",
+            "SELECT TOP 2 OFFSET 1 c.id, c.name FROM c ORDER BY c.rank ASC");
+
+        result.Resources.Should().HaveCount(2);
+        result.Resources[0]["id"]!.GetValue<string>().Should().Be("doc-2");
+        result.Resources[1]["id"]!.GetValue<string>().Should().Be("doc-3");
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_SupportsSelectTopOffsetWithParameters()
+    {
+        var (store, engine) = CreateSut();
+        await SeedDocumentsAsync(store,
+            CreateDocument("doc-1", "tenant-1", "one", 1, 1, "a", ["tag1"], true),
+            CreateDocument("doc-2", "tenant-1", "two", 2, 2, "a", ["tag1"], true),
+            CreateDocument("doc-3", "tenant-1", "three", 3, 3, "a", ["tag1"], true),
+            CreateDocument("doc-4", "tenant-1", "four", 4, 4, "a", ["tag1"], true));
+
+        var result = await engine.ExecuteQueryAsync("db", "coll",
+            "SELECT TOP @count OFFSET @skip c.id FROM c ORDER BY c.rank ASC",
+            new Dictionary<string, object?> { ["@count"] = 2, ["@skip"] = 1 });
+
+        result.Resources.Should().HaveCount(2);
+        result.Resources[0]["id"]!.GetValue<string>().Should().Be("doc-2");
+        result.Resources[1]["id"]!.GetValue<string>().Should().Be("doc-3");
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_SupportsSelectTopOffsetWithStar()
+    {
+        var (store, engine) = CreateSut();
+        await SeedDocumentsAsync(store,
+            CreateDocument("doc-1", "tenant-1", "one", 1, 1, "a", ["tag1"], true),
+            CreateDocument("doc-2", "tenant-1", "two", 2, 2, "a", ["tag1"], true),
+            CreateDocument("doc-3", "tenant-1", "three", 3, 3, "a", ["tag1"], true));
+
+        var result = await engine.ExecuteQueryAsync("db", "coll",
+            "SELECT TOP 1000 OFFSET 1 * FROM c ORDER BY c.rank ASC");
+
+        result.Resources.Should().HaveCount(2);
+        result.Resources[0]["id"]!.GetValue<string>().Should().Be("doc-2");
+        result.Resources[1]["id"]!.GetValue<string>().Should().Be("doc-3");
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_SelectTopOffsetWithWhereClause()
+    {
+        var (store, engine) = CreateSut();
+        await SeedDocumentsAsync(store,
+            CreateDocument("doc-1", "tenant-1", "one", 1, 1, "a", ["tag1"], true),
+            CreateDocument("doc-2", "tenant-1", "two", 2, 2, "b", ["tag1"], true),
+            CreateDocument("doc-3", "tenant-1", "three", 3, 3, "a", ["tag1"], true),
+            CreateDocument("doc-4", "tenant-1", "four", 4, 4, "a", ["tag1"], true),
+            CreateDocument("doc-5", "tenant-1", "five", 5, 5, "a", ["tag1"], true));
+
+        var result = await engine.ExecuteQueryAsync("db", "coll",
+            "SELECT TOP 2 OFFSET 1 c.id FROM c WHERE c.category = 'a' ORDER BY c.rank ASC");
+
+        result.Resources.Should().HaveCount(2);
+        result.Resources[0]["id"]!.GetValue<string>().Should().Be("doc-3");
+        result.Resources[1]["id"]!.GetValue<string>().Should().Be("doc-4");
+    }
+
+    [Fact]
+    public async Task ExecuteQueryAsync_RejectsSelectOffsetWithTrailingOffsetLimit()
+    {
+        var (store, engine) = CreateSut();
+        await SeedDocumentsAsync(store,
+            CreateDocument("doc-1", "tenant-1", "one", 1, 1, "a", ["tag1"], true));
+
+        var act = () => engine.ExecuteQueryAsync("db", "coll",
+            "SELECT TOP 10 OFFSET 5 * FROM c OFFSET 2 LIMIT 3");
+
+        await act.Should().ThrowAsync<CosmosEmulatorException>()
+            .WithMessage("*Cannot use OFFSET in the SELECT clause together with*");
     }
 
     private static async Task SeedDocumentsAsync(IDocumentStore store, params JsonObject[] documents)
