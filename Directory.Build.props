@@ -9,4 +9,15 @@
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
     <VersionPrefix>1.0.2</VersionPrefix>
   </PropertyGroup>
+  <ItemGroup>
+    <!--
+      NU1903: GHSA-2m69-gcr7-jv3q affects the native SQLite bundled by
+      SQLitePCLRaw.lib.e_sqlite3, pulled in transitively via
+      Microsoft.Data.Sqlite. As of now 2.1.11 is the latest published version
+      and no fixed release exists, so the advisory cannot be resolved by a
+      transitive pin. Suppress this single advisory (audit stays active for all
+      others) and remove this entry once a patched SQLitePCLRaw ships.
+    -->
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-2m69-gcr7-jv3q" />
+  </ItemGroup>
 </Project>

@@ -381,6 +381,52 @@ public class SystemFunctionTests
     }
 
     [Fact]
+    public async Task ArrayContains_PartialMatch_WithInlineObjectLiteral_FindsSubset()
+    {
+        // Regression: the SQL parser must accept `{'key': value}` object
+        // literals as expressions, in particular as the `search` argument to
+        // ARRAY_CONTAINS with partial-match enabled. This is the pattern used
+        // by client code such as `get_user_by_external_id`.
+        var (store, engine) = CreateSut();
+        var doc = new JsonObject
+        {
+            ["id"] = "user1",
+            ["tenantId"] = "t1",
+            ["identity_links"] = new JsonArray(
+                new JsonObject { ["provider"] = "aad", ["external_id"] = "abc-123" })
+        };
+        await store.CreateDocumentAsync("db", "coll", doc);
+        var result = await engine.ExecuteQueryAsync(
+            "db",
+            "coll",
+            "SELECT * FROM c WHERE ARRAY_CONTAINS(c.identity_links, {'external_id': @eid}, true)",
+            new Dictionary<string, object?> { ["@eid"] = "abc-123" });
+        result.Resources.Should().ContainSingle();
+        result.Resources[0]["id"]!.GetValue<string>().Should().Be("user1");
+    }
+
+    [Fact]
+    public async Task ObjectLiteral_InProjection_ReturnsConstructedObject()
+    {
+        var (store, engine) = CreateSut();
+        var doc = new JsonObject
+        {
+            ["id"] = "doc1",
+            ["tenantId"] = "t1",
+            ["name"] = "Alice"
+        };
+        await store.CreateDocumentAsync("db", "coll", doc);
+        var result = await engine.ExecuteQueryAsync(
+            "db",
+            "coll",
+            "SELECT VALUE {'who': c.name, 'tag': 'user'} FROM c");
+        result.Resources.Should().ContainSingle();
+        var value = result.Resources[0]["$1"]!.AsObject();
+        value["who"]!.GetValue<string>().Should().Be("Alice");
+        value["tag"]!.GetValue<string>().Should().Be("user");
+    }
+
+    [Fact]
     public async Task ArrayContains_PartialMatch_ReturnsFalseWhenNoMatch()
     {
         var (store, engine) = CreateSut();

@@ -556,6 +556,7 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
             StarExpression => "*",
             ScalarSubqueryExpression subquery => $"({subquery.InnerQuery})",
             ArrayLiteralExpression arrayLit => $"[{string.Join(", ", arrayLit.Elements.Select(FormatScalarExpression))}]",
+            ObjectLiteralExpression objectLit => $"{{{string.Join(", ", objectLit.Properties.Select(p => $"'{p.Key.Replace("'", "''", StringComparison.Ordinal)}': {FormatScalarExpression(p.Value)}"))}}}",
             _ => expression.ToString() ?? string.Empty
         };
     }
@@ -734,6 +735,8 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
     private sealed record ScalarSubqueryExpression(string InnerQuery) : ScalarExpression;
 
     private sealed record ArrayLiteralExpression(IReadOnlyList<ScalarExpression> Elements) : ScalarExpression;
+
+    private sealed record ObjectLiteralExpression(IReadOnlyList<KeyValuePair<string, ScalarExpression>> Properties) : ScalarExpression;
 
     private static class SqlParser
     {
@@ -1273,6 +1276,7 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
             {
                 TokenType.OpenParen => ParseParenthesizedScalar(),
                 TokenType.OpenBracket => ParseArrayLiteral(),
+                TokenType.OpenBrace => ParseObjectLiteral(),
                 TokenType.Parameter => ConsumeParameter(),
                 TokenType.String => ConsumeString(),
                 TokenType.Number => ConsumeNumber(),
@@ -1302,6 +1306,38 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
 
             _index++; // consume ]
             return new ArrayLiteralExpression(elements);
+        }
+
+        private ScalarExpression ParseObjectLiteral()
+        {
+            _index++; // consume {
+            var properties = new List<KeyValuePair<string, ScalarExpression>>();
+            if (Current.Type != TokenType.CloseBrace)
+            {
+                do
+                {
+                    if (Current.Type != TokenType.String && Current.Type != TokenType.Identifier)
+                    {
+                        throw CosmosEmulatorException.BadRequest(
+                            "Expected property name in object literal.");
+                    }
+
+                    var key = Current.Text;
+                    _index++;
+                    Expect(TokenType.Colon, ":");
+                    var value = ParseScalarPrimary();
+                    properties.Add(new KeyValuePair<string, ScalarExpression>(key, value));
+                }
+                while (TryConsume(TokenType.Comma));
+            }
+
+            if (Current.Type != TokenType.CloseBrace)
+            {
+                throw CosmosEmulatorException.BadRequest("Expected '}'.");
+            }
+
+            _index++; // consume }
+            return new ObjectLiteralExpression(properties);
         }
 
         private ScalarExpression ParseParenthesizedScalar()
@@ -1552,6 +1588,18 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
                         tokens.Add(new Token(TokenType.CloseBracket, "]"));
                         index++;
                         break;
+                    case '{':
+                        tokens.Add(new Token(TokenType.OpenBrace, "{"));
+                        index++;
+                        break;
+                    case '}':
+                        tokens.Add(new Token(TokenType.CloseBrace, "}"));
+                        index++;
+                        break;
+                    case ':':
+                        tokens.Add(new Token(TokenType.Colon, ":"));
+                        index++;
+                        break;
                     case '*':
                         tokens.Add(new Token(TokenType.Asterisk, "*"));
                         index++;
@@ -1595,6 +1643,9 @@ public sealed class QueryExplainService(IDocumentStore documentStore)
         CloseParen,
         OpenBracket,
         CloseBracket,
+        OpenBrace,
+        CloseBrace,
+        Colon,
         Comma,
         Operator,
         Asterisk

@@ -7,7 +7,13 @@
     <Nullable>enable</Nullable>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>cosmos-emulator</ToolCommandName>
+    <ApplicationIcon>..\..\assets\icon.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Track the icon so msbuild rebuilds the Win32 resource when it changes. -->
+    <None Include="..\..\assets\icon.ico" Link="icon.ico" />
+  </ItemGroup>
 
   <!-- Single-file publish settings.
        These properties only take effect during 'dotnet publish'.

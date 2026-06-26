@@ -1,0 +1,186 @@
+using System.Net;
+using System.Text.Json.Nodes;
+using FluentAssertions;
+
+namespace Azure.Cosmos.LightEmulator.NoSql.Tests;
+
+public class ProgrammabilityGetTests
+{
+    // Stored Procedures
+
+    [Fact]
+    public async Task GetSproc_ExistingSproc_Returns200WithBody()
+    {
+        await using var fixture = await TestServerFixture.CreateAsync();
+        var (dbId, collId) = await CreateContainerHierarchyAsync(fixture);
+        var sprocId = NewId("sproc");
+
+        await CreateSprocAsync(fixture, dbId, collId, sprocId, "function() { return true; }");
+
+        using var request = fixture.CreateRequest(HttpMethod.Get, $"/dbs/{dbId}/colls/{collId}/sprocs/{sprocId}");
+        using var response = await fixture.Client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ReadBodyAsync(response);
+        body["id"]!.GetValue<string>().Should().Be(sprocId);
+        body["body"]!.GetValue<string>().Should().Be("function() { return true; }");
+        body.Should().ContainKey("_rid");
+        body.Should().ContainKey("_ts");
+        body.Should().ContainKey("_self");
+        body.Should().ContainKey("_etag");
+    }
+
+    [Fact]
+    public async Task GetSproc_NonExistent_Returns404()
+    {
+        await using var fixture = await TestServerFixture.CreateAsync();
+        var (dbId, collId) = await CreateContainerHierarchyAsync(fixture);
+
+        using var request = fixture.CreateRequest(HttpMethod.Get, $"/dbs/{dbId}/colls/{collId}/sprocs/nonexistent");
+        using var response = await fixture.Client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    // Triggers
+
+    [Fact]
+    public async Task GetTrigger_ExistingTrigger_Returns200WithBody()
+    {
+        await using var fixture = await TestServerFixture.CreateAsync();
+        var (dbId, collId) = await CreateContainerHierarchyAsync(fixture);
+        var triggerId = NewId("trigger");
+
+        await CreateTriggerAsync(fixture, dbId, collId, triggerId, "function() { }");
+
+        using var request = fixture.CreateRequest(HttpMethod.Get, $"/dbs/{dbId}/colls/{collId}/triggers/{triggerId}");
+        using var response = await fixture.Client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ReadBodyAsync(response);
+        body["id"]!.GetValue<string>().Should().Be(triggerId);
+        body["body"]!.GetValue<string>().Should().Be("function() { }");
+        body.Should().ContainKey("_rid");
+        body.Should().ContainKey("_ts");
+        body.Should().ContainKey("_self");
+        body.Should().ContainKey("_etag");
+        body.Should().ContainKey("triggerType");
+        body.Should().ContainKey("triggerOperation");
+    }
+
+    [Fact]
+    public async Task GetTrigger_NonExistent_Returns404()
+    {
+        await using var fixture = await TestServerFixture.CreateAsync();
+        var (dbId, collId) = await CreateContainerHierarchyAsync(fixture);
+
+        using var request = fixture.CreateRequest(HttpMethod.Get, $"/dbs/{dbId}/colls/{collId}/triggers/nonexistent");
+        using var response = await fixture.Client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    // User-Defined Functions
+
+    [Fact]
+    public async Task GetUdf_ExistingUdf_Returns200WithBody()
+    {
+        await using var fixture = await TestServerFixture.CreateAsync();
+        var (dbId, collId) = await CreateContainerHierarchyAsync(fixture);
+        var udfId = NewId("udf");
+
+        await CreateUdfAsync(fixture, dbId, collId, udfId, "function(x) { return x; }");
+
+        using var request = fixture.CreateRequest(HttpMethod.Get, $"/dbs/{dbId}/colls/{collId}/udfs/{udfId}");
+        using var response = await fixture.Client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ReadBodyAsync(response);
+        body["id"]!.GetValue<string>().Should().Be(udfId);
+        body["body"]!.GetValue<string>().Should().Be("function(x) { return x; }");
+        body.Should().ContainKey("_rid");
+        body.Should().ContainKey("_ts");
+        body.Should().ContainKey("_self");
+        body.Should().ContainKey("_etag");
+    }
+
+    [Fact]
+    public async Task GetUdf_NonExistent_Returns404()
+    {
+        await using var fixture = await TestServerFixture.CreateAsync();
+        var (dbId, collId) = await CreateContainerHierarchyAsync(fixture);
+
+        using var request = fixture.CreateRequest(HttpMethod.Get, $"/dbs/{dbId}/colls/{collId}/udfs/nonexistent");
+        using var response = await fixture.Client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    // Helpers
+
+    private static async Task<(string DatabaseId, string ContainerId)> CreateContainerHierarchyAsync(TestServerFixture fixture)
+    {
+        var dbId = NewId("db");
+        var containerId = NewId("coll");
+
+        using (var dbRequest = fixture.CreateRequest(HttpMethod.Post, "/dbs", new { id = dbId }))
+        using (var dbResponse = await fixture.Client.SendAsync(dbRequest))
+        {
+            dbResponse.StatusCode.Should().Be(HttpStatusCode.Created);
+        }
+
+        using (var containerRequest = fixture.CreateRequest(HttpMethod.Post, $"/dbs/{dbId}/colls", new
+        {
+            id = containerId,
+            partitionKey = new
+            {
+                paths = new[] { "/tenantId" },
+                kind = "Hash",
+                version = 2
+            }
+        }))
+        using (var containerResponse = await fixture.Client.SendAsync(containerRequest))
+        {
+            containerResponse.StatusCode.Should().Be(HttpStatusCode.Created);
+        }
+
+        return (dbId, containerId);
+    }
+
+    private static async Task CreateSprocAsync(TestServerFixture fixture, string dbId, string collId, string sprocId, string body)
+    {
+        using var request = fixture.CreateRequest(HttpMethod.Post, $"/dbs/{dbId}/colls/{collId}/sprocs", new { id = sprocId, body });
+        using var response = await fixture.Client.SendAsync(request);
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+    }
+
+    private static async Task CreateTriggerAsync(TestServerFixture fixture, string dbId, string collId, string triggerId, string body)
+    {
+        using var request = fixture.CreateRequest(HttpMethod.Post, $"/dbs/{dbId}/colls/{collId}/triggers", new
+        {
+            id = triggerId,
+            body,
+            triggerType = "Pre",
+            triggerOperation = "All"
+        });
+        using var response = await fixture.Client.SendAsync(request);
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+    }
+
+    private static async Task CreateUdfAsync(TestServerFixture fixture, string dbId, string collId, string udfId, string body)
+    {
+        using var request = fixture.CreateRequest(HttpMethod.Post, $"/dbs/{dbId}/colls/{collId}/udfs", new { id = udfId, body });
+        using var response = await fixture.Client.SendAsync(request);
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+    }
+
+    private static async Task<JsonObject> ReadBodyAsync(HttpResponseMessage response)
+    {
+        var content = await response.Content.ReadAsStringAsync();
+        var body = JsonNode.Parse(content);
+        body.Should().NotBeNull();
+        return body!.AsObject();
+    }
+
+    private static string NewId(string prefix) => $"{prefix}-{Guid.NewGuid():N}";
+}
