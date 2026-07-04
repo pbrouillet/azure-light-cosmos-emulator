@@ -245,7 +245,7 @@ public class SqliteDocumentStore : IDocumentStore
             PartitionKey = partitionKey,
             Body = document.DeepClone().AsObject(),
             TimeToLive = ExtractTimeToLive(document),
-            Lsn = await GetNextLsnAsync(ct),
+            Lsn = GetNextLsn(connection),
             Self = $"dbs/{databaseId}/colls/{containerId}/docs/{id}/",
             IsIndexed = isIndexed ?? true
         };
@@ -291,7 +291,7 @@ public class SqliteDocumentStore : IDocumentStore
             PartitionKey = partitionKey,
             Body = document.DeepClone().AsObject(),
             TimeToLive = ExtractTimeToLive(document),
-            Lsn = await GetNextLsnAsync(ct),
+            Lsn = GetNextLsn(connection),
             Self = existing.Self,
             ETag = ETagGenerator.Generate(),
             Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -352,7 +352,7 @@ public class SqliteDocumentStore : IDocumentStore
             PartitionKey = partitionKey,
             Body = body,
             TimeToLive = ExtractTimeToLive(body),
-            Lsn = await GetNextLsnAsync(ct),
+            Lsn = GetNextLsn(connection),
             Self = existing.Self,
             ETag = ETagGenerator.Generate(),
             Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
@@ -370,7 +370,7 @@ public class SqliteDocumentStore : IDocumentStore
         var removed = ReadDocument(connection, databaseId, containerId, pkJson, documentId)
             ?? throw CosmosEmulatorException.NotFound("Document", documentId);
 
-        removed.Lsn = await GetNextLsnAsync(ct);
+        removed.Lsn = GetNextLsn(connection);
         removed.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         using var cmd = connection.CreateCommand();
@@ -393,7 +393,7 @@ public class SqliteDocumentStore : IDocumentStore
         var docs = ListDocumentsFromConnection(connection, databaseId, containerId);
         foreach (var doc in docs)
         {
-            doc.Lsn = await GetNextLsnAsync(ct);
+            doc.Lsn = GetNextLsn(connection);
             doc.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             await _changeFeed.RecordChangeAsync(databaseId, containerId, doc, ChangeType.Delete, ct: ct);
         }
@@ -547,7 +547,7 @@ public class SqliteDocumentStore : IDocumentStore
                     PartitionKey = docPk,
                     Body = body.DeepClone().AsObject(),
                     TimeToLive = ExtractTimeToLive(body),
-                    Lsn = await GetNextLsnAsync(ct),
+                    Lsn = GetNextLsn(connection),
                     Self = $"dbs/{databaseId}/colls/{containerId}/docs/{id}/"
                 };
 
@@ -607,7 +607,7 @@ public class SqliteDocumentStore : IDocumentStore
                     PartitionKey = docPk,
                     Body = body.DeepClone().AsObject(),
                     TimeToLive = ExtractTimeToLive(body),
-                    Lsn = await GetNextLsnAsync(ct),
+                    Lsn = GetNextLsn(connection),
                     Self = existing.Self,
                     ETag = ETagGenerator.Generate(),
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
@@ -653,7 +653,7 @@ public class SqliteDocumentStore : IDocumentStore
                         PartitionKey = docPk,
                         Body = body.DeepClone().AsObject(),
                         TimeToLive = ExtractTimeToLive(body),
-                        Lsn = await GetNextLsnAsync(ct),
+                        Lsn = GetNextLsn(connection),
                         Self = existingDoc.Self,
                         ETag = ETagGenerator.Generate(),
                         Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
@@ -681,7 +681,7 @@ public class SqliteDocumentStore : IDocumentStore
                         PartitionKey = docPk,
                         Body = body.DeepClone().AsObject(),
                         TimeToLive = ExtractTimeToLive(body),
-                        Lsn = await GetNextLsnAsync(ct),
+                        Lsn = GetNextLsn(connection),
                         Self = $"dbs/{databaseId}/colls/{containerId}/docs/{id}/"
                     };
 
@@ -707,7 +707,7 @@ public class SqliteDocumentStore : IDocumentStore
                 var existing = ReadDocument(connection, databaseId, containerId, pkJson, id)
                     ?? throw CosmosEmulatorException.NotFound("Document", id);
 
-                existing.Lsn = await GetNextLsnAsync(ct);
+                existing.Lsn = GetNextLsn(connection);
                 existing.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
                 using var delCmd = connection.CreateCommand();
@@ -775,7 +775,7 @@ public class SqliteDocumentStore : IDocumentStore
                     PartitionKey = partitionKey,
                     Body = body,
                     TimeToLive = ExtractTimeToLive(body),
-                    Lsn = await GetNextLsnAsync(ct),
+                    Lsn = GetNextLsn(connection),
                     Self = existing.Self,
                     ETag = ETagGenerator.Generate(),
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
@@ -1039,27 +1039,37 @@ public class SqliteDocumentStore : IDocumentStore
 
     // ─── LSN management ─────────────────────────────────────────────
 
-    private async Task<long> GetNextLsnAsync(CancellationToken ct)
+    /// <summary>
+    /// Allocates the next global LSN using an <em>existing</em> connection so the
+    /// write participates in that connection's active transaction. This avoids the
+    /// "database is locked" error that occurs when a batch holds an open write
+    /// transaction and a second connection tries to write the meta LSN row.
+    /// </summary>
+    private long GetNextLsn(SqliteConnection connection)
     {
-        await _lsnLock.WaitAsync(ct);
+        _lsnLock.Wait();
         try
         {
-            using var connection = _connectionManager.CreateConnection();
-            var current = ReadMetaLsn(connection) ?? GetLatestDocumentLsn(connection);
-            var next = current + 1;
-
-            using var cmd = connection.CreateCommand();
-            cmd.CommandText = "INSERT OR REPLACE INTO meta (key, value) VALUES (@key, @value)";
-            cmd.Parameters.AddWithValue("@key", GlobalLsnKey);
-            cmd.Parameters.AddWithValue("@value", next);
-            cmd.ExecuteNonQuery();
-
-            return next;
+            return AllocateNextLsn(connection);
         }
         finally
         {
             _lsnLock.Release();
         }
+    }
+
+    private static long AllocateNextLsn(SqliteConnection connection)
+    {
+        var current = ReadMetaLsn(connection) ?? GetLatestDocumentLsn(connection);
+        var next = current + 1;
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "INSERT OR REPLACE INTO meta (key, value) VALUES (@key, @value)";
+        cmd.Parameters.AddWithValue("@key", GlobalLsnKey);
+        cmd.Parameters.AddWithValue("@value", next);
+        cmd.ExecuteNonQuery();
+
+        return next;
     }
 
     private static long? ReadMetaLsn(SqliteConnection connection)
