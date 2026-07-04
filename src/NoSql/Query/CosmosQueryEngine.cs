@@ -18,12 +18,18 @@ public sealed class CosmosQueryEngine : IQueryEngine
 
     private readonly IDocumentStore _documentStore;
     private readonly IndexValidationService _indexValidation;
+    private readonly IVectorIndexProvider? _vectorIndexProvider;
     private readonly Lazy<IProgrammabilityEngine?> _programmabilityEngine;
 
-    public CosmosQueryEngine(IDocumentStore documentStore, IndexValidationService indexValidation, IServiceProvider? serviceProvider = null)
+    public CosmosQueryEngine(
+        IDocumentStore documentStore,
+        IndexValidationService indexValidation,
+        IServiceProvider? serviceProvider = null,
+        IVectorIndexProvider? vectorIndexProvider = null)
     {
         _documentStore = documentStore;
         _indexValidation = indexValidation;
+        _vectorIndexProvider = vectorIndexProvider;
         _programmabilityEngine = new Lazy<IProgrammabilityEngine?>(() =>
             serviceProvider?.GetService(typeof(IProgrammabilityEngine)) as IProgrammabilityEngine);
     }
@@ -61,6 +67,38 @@ public sealed class CosmosQueryEngine : IQueryEngine
         if (!validationResult.IsAllowed)
         {
             throw CosmosEmulatorException.BadRequest(validationResult.ErrorMessage!);
+        }
+
+        // Index-accelerated vector search: when the query is a single
+        // ORDER BY VectorDistance(...) with a result bound, use the ANN index to
+        // materialize only the top-K nearest documents instead of the full container.
+        var vectorRows = await TryBuildVectorSearchRowsAsync(databaseId, containerId, plan, container, parameters, options, ct);
+        if (vectorRows is not null)
+        {
+            var vectorWindowed = ApplyWindowing(vectorRows, plan.Top, plan.Offset, plan.Limit);
+            var vectorProjected = vectorWindowed
+                .Select(row => ProjectRow(row, plan, parameters, databaseId, containerId))
+                .ToList();
+
+            var vectorContinuation = ParseContinuationToken(options?.ContinuationToken);
+            var vectorTake = options?.MaxItemCount is > 0 ? options.MaxItemCount.Value : vectorProjected.Count;
+            var vectorPage = vectorProjected
+                .Skip(vectorContinuation)
+                .Take(vectorTake)
+                .Select(result => result.DeepClone().AsObject())
+                .ToList();
+            var vectorNext = vectorContinuation + vectorPage.Count;
+
+            return new FeedResponse<JsonObject>
+            {
+                Rid = $"{databaseId}/{containerId}",
+                Resources = vectorPage,
+                ContinuationToken = vectorNext < vectorProjected.Count
+                    ? vectorNext.ToString(CultureInfo.InvariantCulture)
+                    : null,
+                RuMultiplier = validationResult.RuMultiplier,
+                IsValueProjection = plan.Projection.Mode == ProjectionMode.Value
+            };
         }
 
         var allDocuments = await _documentStore.ListDocumentsAsync(databaseId, containerId, ct);
@@ -711,6 +749,62 @@ public sealed class CosmosQueryEngine : IQueryEngine
         }
 
         var first = plan.OrderBy[0];
+
+        // Ordering by VectorDistance excludes documents whose embedding is missing/
+        // undefined (Cosmos parity: such documents are not part of the vector result)
+        // and orders by *proximity*: ascending / no direction == nearest first,
+        // descending == farthest first — independent of the distance function's raw
+        // value (cosine/dot-product yield similarities, euclidean yields a distance).
+        if (first.Expression is FunctionCallExpression vectorFunc
+            && string.Equals(vectorFunc.Name, "VECTORDISTANCE", StringComparison.OrdinalIgnoreCase))
+        {
+            rows = rows
+                .Where(row =>
+                {
+                    var value = EvaluateScalarExpression(row, first.Expression, parameters, databaseId: databaseId, containerId: containerId);
+                    return !ReferenceEquals(value, UndefinedValue) && value is not null;
+                })
+                .ToList();
+
+            if (rows.Count == 0)
+            {
+                return rows;
+            }
+
+            var vectorFn = ResolveOrderingVectorFunction(vectorFunc, parameters, databaseId, containerId);
+
+            // Nearest-first key: lower == closer. Cosine/dot-product return a
+            // similarity (higher == closer) so negate; euclidean already returns a
+            // distance (lower == closer).
+            object? NearestFirstKey(QueryRow row)
+            {
+                var value = EvaluateScalarExpression(row, first.Expression, parameters, databaseId: databaseId, containerId: containerId);
+                if (!TryConvertToDouble(value, out var d))
+                {
+                    return double.PositiveInfinity;
+                }
+
+                return vectorFn == VectorDistanceFunction.Euclidean ? d : -d;
+            }
+
+            IOrderedEnumerable<QueryRow> orderedVector = first.Descending
+                ? rows.OrderByDescending(NearestFirstKey, QueryValueComparer.Instance)
+                : rows.OrderBy(NearestFirstKey, QueryValueComparer.Instance);
+
+            for (var i = 1; i < plan.OrderBy.Count; i++)
+            {
+                var clause = plan.OrderBy[i];
+                Func<QueryRow, object?> key = row => EvaluateScalarExpression(row, clause.Expression, parameters, databaseId: databaseId, containerId: containerId);
+                orderedVector = clause.Descending
+                    ? orderedVector.ThenByDescending(key, QueryValueComparer.Instance)
+                    : orderedVector.ThenBy(key, QueryValueComparer.Instance);
+            }
+
+            return orderedVector
+                .ThenBy(row => row.Document?.Id, StringComparer.Ordinal)
+                .ToList();
+        }
+
         Func<QueryRow, object?> firstKey = row => EvaluateScalarExpression(row, first.Expression, parameters, databaseId: databaseId, containerId: containerId);
         IOrderedEnumerable<QueryRow> orderedRows = first.Descending
             ? rows.OrderByDescending(firstKey, QueryValueComparer.Instance)
@@ -1250,6 +1344,246 @@ public sealed class CosmosQueryEngine : IQueryEngine
             Jint.Runtime.Types.Null => null,
             _ => NormalizeRuntimeValue(result.ToObject())
         };
+    }
+
+    private async Task<List<QueryRow>?> TryBuildVectorSearchRowsAsync(
+        string databaseId,
+        string containerId,
+        QueryPlan plan,
+        CosmosContainer container,
+        IReadOnlyDictionary<string, object?>? parameters,
+        QueryOptions? options,
+        CancellationToken ct)
+    {
+        if (_vectorIndexProvider is null || !_vectorIndexProvider.IsEnabled)
+        {
+            return null;
+        }
+
+        if (plan.RequiresAggregation || plan.GroupBy.Count > 0 || plan.Joins.Count > 0
+            || plan.FromSubquery is not null || plan.ArrayIterationSource is not null || plan.Distinct)
+        {
+            return null;
+        }
+
+        if (plan.OrderBy.Count != 1)
+        {
+            return null;
+        }
+
+        var clause = plan.OrderBy[0];
+        if (clause.Expression is not FunctionCallExpression func
+            || !string.Equals(func.Name, "VECTORDISTANCE", StringComparison.OrdinalIgnoreCase)
+            || func.Arguments.Count < 2
+            || func.Arguments[0] is not PathExpression pathExpr)
+        {
+            return null;
+        }
+
+        var path = IndexValidationService.ConvertToIndexPath(pathExpr.Path);
+        if (path is null)
+        {
+            return null;
+        }
+
+        var queryVector = ExtractVector(EvaluateScalarExpression(null, func.Arguments[1], parameters));
+        if (queryVector is null || queryVector.Length == 0)
+        {
+            return null;
+        }
+
+        // Honor the Cosmos DB boolean brute-force flag (3rd positional argument):
+        // VectorDistance(v1, v2, true[, options]) forces an exhaustive scan and must
+        // bypass the index fast path.
+        if (func.Arguments.Count >= 3)
+        {
+            var bruteForce = EvaluateScalarExpression(null, func.Arguments[2], parameters);
+            if (bruteForce is bool b && b)
+            {
+                return null;
+            }
+        }
+
+        var distanceFunction = ResolveVectorDistanceFunction(func, parameters, container);
+
+        // Azure Cosmos DB orders `ORDER BY VectorDistance(...)` by proximity:
+        // ascending / no direction == nearest first (regardless of distance function),
+        // descending == farthest first. The index returns candidates nearest-first,
+        // so only accelerate the nearest-first (ascending) case; a descending
+        // (farthest-first) request defers to the full-scan fallback.
+        var nearestFirstRequested = !clause.Descending;
+        if (!nearestFirstRequested)
+        {
+            return null;
+        }
+
+        var hasTop = plan.Top is int;
+        var hasLimit = plan.Limit is int;
+        if (!hasTop && !hasLimit)
+        {
+            // Unbounded vector scan: defer to the full-scan fallback (which still
+            // applies nearest-first ordering and undefined exclusion).
+            return null;
+        }
+
+        var bound = int.MaxValue;
+        if (hasTop)
+        {
+            bound = Math.Min(bound, plan.Top!.Value);
+        }
+
+        if (hasLimit)
+        {
+            bound = Math.Min(bound, (plan.Offset ?? 0) + plan.Limit!.Value);
+        }
+
+        if (bound <= 0)
+        {
+            return [];
+        }
+
+        var declaredType = container.IndexingPolicy.VectorIndexes?
+            .FirstOrDefault(vi => VectorPathsMatch(vi.Path, path))?.Type;
+        var indexType = declaredType ?? "quantizedFlat";
+
+        var ensured = await _vectorIndexProvider
+            .EnsureIndexAsync(databaseId, containerId, path, indexType, distanceFunction, ct)
+            .ConfigureAwait(false);
+        if (!ensured)
+        {
+            return null;
+        }
+
+        // Over-fetch when a WHERE clause may filter out candidates so we still
+        // have enough live results after post-filtering.
+        var fetchK = plan.Where is not null
+            ? (int)Math.Min(200_000L, (long)bound * 4 + 64)
+            : bound;
+
+        var request = new VectorSearchRequest
+        {
+            DatabaseId = databaseId,
+            ContainerId = containerId,
+            Path = path,
+            QueryVector = Array.ConvertAll(queryVector, static v => (float)v),
+            DistanceFunction = distanceFunction,
+            TopK = fetchK,
+            PartitionKey = options?.PartitionKey,
+            IndexType = indexType
+        };
+
+        var hits = await _vectorIndexProvider.SearchAsync(request, ct).ConfigureAwait(false);
+        if (hits.Count == 0)
+        {
+            return [];
+        }
+
+        var rows = new List<QueryRow>(hits.Count);
+        foreach (var hit in hits)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            CosmosDocument doc;
+            try
+            {
+                doc = await _documentStore
+                    .ReadDocumentAsync(databaseId, containerId, hit.DocumentId, hit.PartitionKey, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (CosmosEmulatorException)
+            {
+                // Document deleted concurrently with the index read; skip it.
+                continue;
+            }
+
+            if (!doc.IsIndexed)
+            {
+                continue;
+            }
+
+            var responseBody = doc.ToResponseBody();
+            var row = new QueryRow(
+                doc,
+                new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [plan.FromAlias] = responseBody
+                });
+
+            if (plan.Where is not null
+                && !EvaluateBooleanExpression(row, plan.Where, parameters, new SubqueryContext(databaseId, containerId)))
+            {
+                continue;
+            }
+
+            rows.Add(row);
+        }
+
+        return rows;
+    }
+
+    private VectorDistanceFunction ResolveVectorDistanceFunction(
+        FunctionCallExpression func,
+        IReadOnlyDictionary<string, object?>? parameters,
+        CosmosContainer container)
+    {
+        // 4th argument: options object with a distanceFunction override.
+        if (func.Arguments.Count >= 4
+            && EvaluateScalarExpression(null, func.Arguments[3], parameters) is JsonObject options
+            && options["distanceFunction"]?.GetValue<string>() is string df)
+        {
+            return VectorDistanceFunctions.Parse(df);
+        }
+
+        var embeddings = container.VectorEmbeddingPolicy?.VectorEmbeddings;
+        if (embeddings is { Count: > 0 })
+        {
+            var path = func.Arguments[0] is PathExpression pe
+                ? IndexValidationService.ConvertToIndexPath(pe.Path)
+                : null;
+            var match = path is not null
+                ? embeddings.FirstOrDefault(e => VectorPathsMatch(e.Path, path))
+                : null;
+            return VectorDistanceFunctions.Parse((match ?? embeddings[0]).DistanceFunction);
+        }
+
+        return VectorDistanceFunction.Cosine;
+    }
+
+    private VectorDistanceFunction ResolveOrderingVectorFunction(
+        FunctionCallExpression func,
+        IReadOnlyDictionary<string, object?>? parameters,
+        string? databaseId,
+        string? containerId)
+    {
+        // A 4th-argument options override takes precedence and needs no container.
+        if (func.Arguments.Count >= 4
+            && EvaluateScalarExpression(null, func.Arguments[3], parameters) is JsonObject options
+            && options["distanceFunction"]?.GetValue<string>() is string df)
+        {
+            return VectorDistanceFunctions.Parse(df);
+        }
+
+        if (databaseId is not null && containerId is not null)
+        {
+            try
+            {
+                var container = _documentStore.GetContainerAsync(databaseId, containerId)
+                    .GetAwaiter().GetResult();
+                return ResolveVectorDistanceFunction(func, parameters, container);
+            }
+            catch (CosmosEmulatorException)
+            {
+                // Container metadata unavailable; fall back to the default below.
+            }
+        }
+
+        return VectorDistanceFunction.Cosine;
+    }
+
+    private static bool VectorPathsMatch(string a, string b)
+    {
+        static string Normalize(string p) => "/" + p.Trim().TrimStart('/');
+        return string.Equals(Normalize(a), Normalize(b), StringComparison.Ordinal);
     }
 
     private object? EvaluateVectorDistance(IReadOnlyList<object?> arguments, string? databaseId, string? containerId)

@@ -4,6 +4,7 @@ using Azure.Cosmos.LightEmulator.Storage.ChangeFeed;
 using Azure.Cosmos.LightEmulator.Storage.InMemory;
 using Azure.Cosmos.LightEmulator.Storage.Sqlite;
 using Azure.Cosmos.LightEmulator.Storage.SurrealDb;
+using Azure.Cosmos.LightEmulator.Storage.Vector;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Azure.Cosmos.LightEmulator.Storage;
@@ -35,14 +36,18 @@ public static class StorageServiceRegistration
     public static IServiceCollection AddEmulatorStorage(
         this IServiceCollection services,
         StorageType storageType,
-        string dataDirectory)
+        string dataDirectory,
+        VectorIndexOptions? vectorIndexOptions = null)
     {
+        var vectorOptions = vectorIndexOptions ?? new VectorIndexOptions();
+
         switch (storageType)
         {
             case StorageType.InMemory:
                 services.AddSingleton<IChangeFeedProvider, InMemoryChangeFeedProvider>();
-                services.AddSingleton<IDocumentStore>(sp =>
+                services.AddSingleton(sp =>
                     new InMemoryDocumentStore(sp.GetRequiredService<IChangeFeedProvider>()));
+                AddVectorLayer<InMemoryDocumentStore>(services, vectorOptions);
                 services.AddSingleton<IActivityStore, InMemoryActivityStore>();
                 services.AddSingleton<IQueryTelemetryStore, InMemoryQueryTelemetryStore>();
                 break;
@@ -51,10 +56,11 @@ public static class StorageServiceRegistration
                 services.AddSingleton(new SqliteConnectionManager(dataDirectory));
                 services.AddSingleton<IChangeFeedProvider>(sp =>
                     new SqliteChangeFeedProvider(sp.GetRequiredService<SqliteConnectionManager>()));
-                services.AddSingleton<IDocumentStore>(sp =>
+                services.AddSingleton(sp =>
                     new SqliteDocumentStore(
                         sp.GetRequiredService<SqliteConnectionManager>(),
                         sp.GetRequiredService<IChangeFeedProvider>()));
+                AddVectorLayer<SqliteDocumentStore>(services, vectorOptions);
                 services.AddSingleton<IActivityStore>(sp =>
                     new SqliteActivityStore(sp.GetRequiredService<SqliteConnectionManager>()));
                 services.AddSingleton<IQueryTelemetryStore>(sp =>
@@ -69,7 +75,8 @@ public static class StorageServiceRegistration
                     manager.InitializeAsync().GetAwaiter().GetResult();
                     return manager;
                 });
-                services.AddSingleton<IDocumentStore, SurrealDbDocumentStore>();
+                services.AddSingleton<SurrealDbDocumentStore>();
+                AddVectorLayer<SurrealDbDocumentStore>(services, vectorOptions);
                 services.AddSingleton<IChangeFeedProvider, SurrealDbChangeFeedProvider>();
                 services.AddSingleton<IActivityStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbActivityStore>();
                 services.AddSingleton<IQueryTelemetryStore, Azure.Cosmos.LightEmulator.Storage.Telemetry.SurrealDbQueryTelemetryStore>();
@@ -77,5 +84,21 @@ public static class StorageServiceRegistration
         }
 
         return services;
+    }
+
+    /// <summary>
+    /// Registers the vector index provider and the indexing document-store decorator.
+    /// The provider depends on the <em>concrete</em> inner store (not <see cref="IDocumentStore"/>)
+    /// to avoid a provider → decorator → provider dependency cycle.
+    /// </summary>
+    private static void AddVectorLayer<TStore>(IServiceCollection services, VectorIndexOptions options)
+        where TStore : class, IDocumentStore
+    {
+        services.AddSingleton<IVectorIndexProvider>(sp =>
+            new HnswVectorIndexProvider(sp.GetRequiredService<TStore>(), options));
+        services.AddSingleton<IDocumentStore>(sp =>
+            new VectorIndexingDocumentStore(
+                sp.GetRequiredService<TStore>(),
+                sp.GetRequiredService<IVectorIndexProvider>()));
     }
 }

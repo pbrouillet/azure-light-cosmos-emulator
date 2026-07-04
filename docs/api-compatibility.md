@@ -86,6 +86,6 @@
 - **Request Units**: Always returns a fixed charge (not metered)
 - **Stored Procedure Context**: Limited `__` context object API
 - **Spatial Indexes**: Spatial index metadata is stored but not used for query optimization (spatial functions work via full scan)
-- **Vector Search**: VectorDistance (brute-force), vector embedding policy, vector indexes (flat/quantizedFlat/diskANN)
+- **Vector Search**: `VectorDistance` is **index-accelerated** via an in-memory HNSW ANN index (cosine/dot-product/euclidean). Embedding paths used in an `ORDER BY VectorDistance(...)` are auto-indexed (implicit indexing) and honored from a declared `vectorEmbeddingPolicy` / `VectorIndexes`. `flat` uses exact SIMD brute force; `quantizedFlat` / `diskANN` use HNSW. Ordering follows the Azure convention — `ORDER BY VectorDistance(...)` **ascending / no direction returns nearest first** (all functions); the boolean 3rd argument (`true`) forces a brute-force scan. Single-partition queries are index-accelerated per partition. Scales to 100K+ items with sub-second query latency. See [`vector-search.md`](vector-search.md).
 - **Cross-region replication**: Not applicable (single-node)
 - **Conflict resolution**: Simplified (single-node has no conflicts)

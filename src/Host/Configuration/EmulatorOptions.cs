@@ -1,4 +1,5 @@
 using Azure.Cosmos.LightEmulator.Auth.KeyAuth;
+using Azure.Cosmos.LightEmulator.Core.Models;
 
 namespace Azure.Cosmos.LightEmulator.Host.Configuration;
 
@@ -62,4 +63,7 @@ public class EmulatorOptions
     /// container in memory). Defaults to half the logical processor count (min 2).
     /// </summary>
     public int MaxConcurrentQueries { get; set; } = Math.Max(2, Environment.ProcessorCount / 2);
+
+    /// <summary>Vector index (HNSW) settings for index-accelerated vector search.</summary>
+    public VectorIndexOptions VectorIndex { get; set; } = new();
 }

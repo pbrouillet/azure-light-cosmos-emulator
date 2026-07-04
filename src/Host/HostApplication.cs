@@ -42,7 +42,7 @@ public static class HostApplication
         services.AddSingleton(emulatorOptions);
         services.AddSingleton<IOptions<EmulatorOptions>>(_ => Options.Create(emulatorOptions));
         var storageType = StorageServiceRegistration.ParseStorageType(emulatorOptions.Storage);
-        services.AddEmulatorStorage(storageType, emulatorOptions.DataDirectory);
+        services.AddEmulatorStorage(storageType, emulatorOptions.DataDirectory, emulatorOptions.VectorIndex);
         services.AddSingleton<EmulatorRuntimeState>();
         services.AddSingleton<EmulatorAdminSettingsStore>(sp =>
             new EmulatorAdminSettingsStore(

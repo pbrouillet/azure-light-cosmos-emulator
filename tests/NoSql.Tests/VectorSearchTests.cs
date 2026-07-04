@@ -118,8 +118,9 @@ public class VectorSearchTests
             CreateDocument("doc-2", "t1", d => d["embedding"] = new JsonArray(0, 1, 0)),
             CreateDocument("doc-3", "t1", d => d["embedding"] = new JsonArray(0.9, 0.1, 0)));
 
+        // Azure convention: ORDER BY VectorDistance ascending / no direction == nearest first.
         var result = await engine.ExecuteQueryAsync("db", "coll",
-            "SELECT TOP 2 c.id, VectorDistance(c.embedding, [1, 0, 0]) AS score FROM c ORDER BY VectorDistance(c.embedding, [1, 0, 0]) DESC");
+            "SELECT TOP 2 c.id, VectorDistance(c.embedding, [1, 0, 0]) AS score FROM c ORDER BY VectorDistance(c.embedding, [1, 0, 0])");
 
         result.Resources.Should().HaveCount(2);
         // Most similar first (highest cosine similarity)

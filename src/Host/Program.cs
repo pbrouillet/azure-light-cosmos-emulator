@@ -102,7 +102,7 @@ public static class Program
         });
 
         var storageType = StorageServiceRegistration.ParseStorageType(emulatorOptions.Storage);
-        builder.Services.AddEmulatorStorage(storageType, emulatorOptions.DataDirectory);
+        builder.Services.AddEmulatorStorage(storageType, emulatorOptions.DataDirectory, emulatorOptions.VectorIndex);
         builder.Services.AddSingleton<EmulatorRuntimeState>();
         builder.Services.AddSingleton<EmulatorAdminSettingsStore>(sp =>
             new EmulatorAdminSettingsStore(

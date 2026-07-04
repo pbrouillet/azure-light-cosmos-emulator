@@ -66,7 +66,7 @@ The Cosmos SQL query engine supports:
 - Cross-partition queries
 - Subqueries: EXISTS, IN (SELECT ...), scalar subqueries in SELECT/WHERE/FROM
 - AS aliases in SELECT projections
-- Vector search: VectorDistance (cosine, dotproduct, euclidean), vector embedding policy, vector indexes
+- Vector search: `VectorDistance` (cosine, dotproduct, euclidean), index-accelerated via an in-memory **HNSW ANN index** (see [`vector-search.md`](vector-search.md)); honors vector embedding policy and vector indexes
 - Spatial functions: ST_DISTANCE, ST_WITHIN, ST_INTERSECTS, ST_ISVALID, ST_ISVALIDDETAILED, ST_AREA (GeoJSON Point, Polygon, MultiPolygon, LineString)
 
 ## Change Feed

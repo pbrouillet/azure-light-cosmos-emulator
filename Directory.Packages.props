@@ -18,6 +18,10 @@
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.0" />
     <!-- Spatial / Geospatial -->
     <PackageVersion Include="NetTopologySuite" Version="2.6.0" />
+    <!-- Vector search (HNSW ANN) -->
+    <PackageVersion Include="HNSW" Version="26.6.1848" />
+    <!-- Transitive pin: HNSW pulls MessagePack 3.1.0 (NU1902, GHSA-wfr3-xj75-pfwh); 3.1.7 is patched -->
+    <PackageVersion Include="MessagePack" Version="3.1.7" />
     <!-- Authentication -->
     <PackageVersion Include="Microsoft.Identity.Web" Version="3.8.3" />
     <PackageVersion Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
