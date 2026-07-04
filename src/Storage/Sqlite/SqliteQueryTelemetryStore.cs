@@ -22,10 +22,10 @@ public class SqliteQueryTelemetryStore : IQueryTelemetryStore
         cmd.CommandText = """
             INSERT OR REPLACE INTO query_telemetry
                 (id, timestamp, database_id, container_id, sql_text, partition_key, consistency_level,
-                 request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition)
+                 request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition, query_plan)
             VALUES
                 (@id, @timestamp, @databaseId, @containerId, @sqlText, @partitionKey, @consistencyLevel,
-                 @requestCharge, @latencyMs, @itemCount, @statusCode, @activityId, @isCrossPartition)
+                 @requestCharge, @latencyMs, @itemCount, @statusCode, @activityId, @isCrossPartition, @queryPlan)
         """;
         cmd.Parameters.AddWithValue("@id", entry.Id);
         cmd.Parameters.AddWithValue("@timestamp", entry.Timestamp.ToString("O"));
@@ -40,6 +40,7 @@ public class SqliteQueryTelemetryStore : IQueryTelemetryStore
         cmd.Parameters.AddWithValue("@statusCode", entry.StatusCode);
         cmd.Parameters.AddWithValue("@activityId", entry.ActivityId);
         cmd.Parameters.AddWithValue("@isCrossPartition", entry.IsCrossPartition ? 1 : 0);
+        cmd.Parameters.AddWithValue("@queryPlan", (object?)entry.QueryPlan ?? DBNull.Value);
         cmd.ExecuteNonQuery();
 
         return Task.CompletedTask;
@@ -54,7 +55,7 @@ public class SqliteQueryTelemetryStore : IQueryTelemetryStore
         using var connection = _connectionManager.CreateConnection();
         using var cmd = connection.CreateCommand();
 
-        var sql = "SELECT id, timestamp, database_id, container_id, sql_text, partition_key, consistency_level, request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition FROM query_telemetry";
+        var sql = "SELECT id, timestamp, database_id, container_id, sql_text, partition_key, consistency_level, request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition, query_plan FROM query_telemetry";
         var conditions = new List<string>();
 
         if (!string.IsNullOrEmpty(databaseId))
@@ -95,7 +96,8 @@ public class SqliteQueryTelemetryStore : IQueryTelemetryStore
                 ItemCount = reader.GetInt32(9),
                 StatusCode = reader.GetInt32(10),
                 ActivityId = reader.GetString(11),
-                IsCrossPartition = reader.GetInt32(12) == 1
+                IsCrossPartition = reader.GetInt32(12) == 1,
+                QueryPlan = reader.IsDBNull(13) ? null : reader.GetString(13)
             });
         }
 

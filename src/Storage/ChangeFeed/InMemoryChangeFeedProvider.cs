@@ -9,6 +9,10 @@ namespace Azure.Cosmos.LightEmulator.Storage.ChangeFeed;
 /// </summary>
 public class InMemoryChangeFeedProvider : IChangeFeedProvider
 {
+    // Hard cap on retained changes per container to bound memory when the in-memory
+    // backend is used. Oldest entries are evicted first once the cap is exceeded.
+    private const int MaxItemsPerContainer = 100_000;
+
     private readonly ConcurrentDictionary<string, List<ChangeFeedItem>> _changeFeed = new();
     private readonly object _lock = new();
 
@@ -38,6 +42,14 @@ public class InMemoryChangeFeedProvider : IChangeFeedProvider
                 _changeFeed[key] = items;
             }
             items.Add(item);
+
+            // Evict the oldest entries once the per-container cap is exceeded so a
+            // long-running high-write workload cannot grow the feed without bound.
+            var overflow = items.Count - MaxItemsPerContainer;
+            if (overflow > 0)
+            {
+                items.RemoveRange(0, overflow);
+            }
         }
 
         return Task.CompletedTask;

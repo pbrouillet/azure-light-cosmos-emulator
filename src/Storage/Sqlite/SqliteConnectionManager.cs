@@ -167,7 +167,8 @@ public class SqliteConnectionManager
                 item_count INTEGER,
                 status_code INTEGER,
                 activity_id TEXT,
-                is_cross_partition INTEGER
+                is_cross_partition INTEGER,
+                query_plan TEXT
             );
         """;
         cmd.ExecuteNonQuery();

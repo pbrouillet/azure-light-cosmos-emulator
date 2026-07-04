@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Json.Serialization.Metadata;
 using Azure.Cosmos.LightEmulator.Core.Exceptions;
 using Azure.Cosmos.LightEmulator.Core.Interfaces;
 using Azure.Cosmos.LightEmulator.Core.Models;
@@ -23,14 +22,13 @@ namespace Azure.Cosmos.LightEmulator.NoSql.Controllers;
 public class DocumentsController : CosmosControllerBase
 {
     private const string RequestBodyLengthItemKey = "DocumentsController.RequestBodyLength";
-    private static readonly JsonSerializerOptions s_jsonOptions = new() { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
 
     private readonly IDocumentStore _store;
     private readonly IQueryEngine _queryEngine;
     private readonly TriggerEngine _triggerEngine;
-    private readonly IQueryTelemetryStore _telemetryStore;
+    private readonly IQueryTelemetryRecorder _telemetryRecorder;
+    private readonly IQueryExecutionLimiter _queryLimiter;
     private readonly IConsistencyManager _consistencyManager;
-    private readonly QueryExplainService _queryExplainService;
     private readonly DmlCommandService _dmlCommandService;
     private readonly ILogger<DocumentsController> _logger;
 
@@ -38,9 +36,9 @@ public class DocumentsController : CosmosControllerBase
         IDocumentStore store,
         IQueryEngine queryEngine,
         TriggerEngine triggerEngine,
-        IQueryTelemetryStore telemetryStore,
+        IQueryTelemetryRecorder telemetryRecorder,
+        IQueryExecutionLimiter queryLimiter,
         IConsistencyManager consistencyManager,
-        QueryExplainService queryExplainService,
         DmlCommandService dmlCommandService,
         CosmosResponseHeaderService responseHeaders,
         ILogger<DocumentsController> logger)
@@ -49,10 +47,10 @@ public class DocumentsController : CosmosControllerBase
         _store = store;
         _queryEngine = queryEngine;
         _triggerEngine = triggerEngine;
-        _telemetryStore = telemetryStore;
+        _telemetryRecorder = telemetryRecorder;
+        _queryLimiter = queryLimiter;
         _consistencyManager = consistencyManager;
         _logger = logger;
-        _queryExplainService = queryExplainService;
         _dmlCommandService = dmlCommandService;
     }
 
@@ -450,7 +448,11 @@ public class DocumentsController : CosmosControllerBase
         var sw = Stopwatch.StartNew();
         try
         {
-            var result = await _queryEngine.ExecuteQueryAsync(dbId, collId, queryText, parameters, options, ct);
+            FeedResponse<JsonObject> result;
+            using (await _queryLimiter.AcquireAsync(ct))
+            {
+                result = await _queryEngine.ExecuteQueryAsync(dbId, collId, queryText, parameters, options, ct);
+            }
             sw.Stop();
 
             var totalSize = result.Resources.Sum(document => document?.ToJsonString().Length ?? 0);
@@ -469,8 +471,8 @@ public class DocumentsController : CosmosControllerBase
             if (result.ContinuationToken != null)
                 Response.Headers[CosmosHeaders.Continuation] = result.ContinuationToken;
 
-            // Fire-and-forget telemetry recording with query plan
-            _ = RecordQueryTelemetryAsync(new QueryTelemetryEntry
+            // Queue telemetry for background persistence (bounded, best-effort).
+            _telemetryRecorder.Record(new QueryTelemetryEntry
             {
                 DatabaseId = dbId,
                 ContainerId = collId,
@@ -500,7 +502,7 @@ public class DocumentsController : CosmosControllerBase
             sw.Stop();
 
             // Record failed query telemetry (no plan for failed queries)
-            _ = _telemetryStore.RecordAsync(new QueryTelemetryEntry
+            _telemetryRecorder.Record(new QueryTelemetryEntry
             {
                 DatabaseId = dbId,
                 ContainerId = collId,
@@ -513,26 +515,10 @@ public class DocumentsController : CosmosControllerBase
                 StatusCode = 400,
                 ActivityId = Guid.NewGuid().ToString(),
                 IsCrossPartition = isCrossPartition
-            }, CancellationToken.None);
+            });
 
             return BadRequest(ErrorResponse(ex.ErrorCode, ex.Message));
         }
-    }
-
-    private async Task RecordQueryTelemetryAsync(QueryTelemetryEntry entry)
-    {
-        try
-        {
-            var explainResult = await _queryExplainService.ExplainAsync(
-                entry.DatabaseId, entry.ContainerId, entry.SqlText, CancellationToken.None);
-            entry.QueryPlan = JsonSerializer.Serialize(explainResult, s_jsonOptions);
-        }
-        catch
-        {
-            // Graceful degradation: record telemetry without a plan if explain fails
-        }
-
-        await _telemetryStore.RecordAsync(entry, CancellationToken.None);
     }
 
     private async Task<JsonObject> ReadRequestBodyAsync(CancellationToken ct)

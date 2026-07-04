@@ -55,4 +55,11 @@ public class EmulatorOptions
 
     /// <summary>Change feed retention in minutes (default: 60). Entries older than this are trimmed.</summary>
     public int ChangeFeedRetentionMinutes { get; set; } = 60;
+
+    /// <summary>
+    /// Maximum number of query executions allowed to materialize a container concurrently.
+    /// Bounds peak memory under high query concurrency (each query fully materializes the
+    /// container in memory). Defaults to half the logical processor count (min 2).
+    /// </summary>
+    public int MaxConcurrentQueries { get; set; } = Math.Max(2, Environment.ProcessorCount / 2);
 }

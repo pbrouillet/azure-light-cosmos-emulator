@@ -62,6 +62,8 @@ public static class HostApplication
         services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
         services.AddSingleton<IndexValidationService>();
         services.AddSingleton<QueryExplainService>();
+        services.AddSingleton<IQueryTelemetryRecorder, QueryTelemetryRecorder>();
+        services.AddSingleton<IQueryExecutionLimiter>(_ => new QueryExecutionLimiter(emulatorOptions.MaxConcurrentQueries));
         services.AddSingleton<DmlCommandService>();
         services.AddSingleton<Azure.Cosmos.LightEmulator.Triggers.Engine.TriggerEngine>();
         services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));

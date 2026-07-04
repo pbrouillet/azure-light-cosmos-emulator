@@ -113,6 +113,9 @@ public static class Program
         builder.Services.AddSingleton<ThroughputManager>();
         builder.Services.AddSingleton<IQueryEngine, CosmosQueryEngine>();
         builder.Services.AddSingleton<QueryExplainService>();
+        builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.NoSql.Query.IQueryTelemetryRecorder, Azure.Cosmos.LightEmulator.NoSql.Query.QueryTelemetryRecorder>();
+        builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.NoSql.Query.IQueryExecutionLimiter>(
+            _ => new Azure.Cosmos.LightEmulator.NoSql.Query.QueryExecutionLimiter(emulatorOptions.MaxConcurrentQueries));
         builder.Services.AddSingleton<IndexValidationService>();
         builder.Services.AddSingleton<Azure.Cosmos.LightEmulator.NoSql.Query.DmlCommandService>();
         builder.Services.AddSingleton<IConsistencyManager>(_ => new ConsistencyManager(ParseConsistencyLevel(emulatorOptions.ConsistencyLevel)));
