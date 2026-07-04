@@ -9,6 +9,11 @@ namespace Azure.Cosmos.LightEmulator.MongoDB.Server;
 /// </summary>
 public class MongoDbConnectionHandler
 {
+    // Matches the maxMessageSizeBytes advertised in the isMaster/hello response.
+    // Prevents a malformed or hostile frame from triggering an arbitrarily large
+    // (up to ~2 GB) buffer allocation off a single wire-supplied length field.
+    private const int MaxMessageLength = 48_000_000;
+
     private readonly ILogger<MongoDbConnectionHandler> _logger;
 
     public MongoDbConnectionHandler(ILogger<MongoDbConnectionHandler> logger)
@@ -35,24 +40,44 @@ public class MongoDbConnectionHandler
             _logger.LogDebug("MongoDB message: length={Length}, requestId={RequestId}, opCode={OpCode}",
                 messageLength, requestId, opCode);
 
+            // Validate the wire-supplied length before allocating. A message must be at
+            // least the header size and no larger than the advertised maximum. Anything
+            // else indicates a corrupt frame or a non-MongoDB client; close the connection.
+            if (messageLength < 16 || messageLength > MaxMessageLength)
+            {
+                _logger.LogWarning(
+                    "MongoDB message length {Length} is out of range (16..{Max}); closing connection.",
+                    messageLength, MaxMessageLength);
+                break;
+            }
+
             // Read the message body
             var bodyLength = messageLength - 16;
-            if (bodyLength <= 0) continue;
+            if (bodyLength == 0) continue;
 
-            var bodyBuffer = new byte[bodyLength];
-            await ReadExactAsync(stream, bodyBuffer, ct);
-
-            // Process based on opCode
-            var response = opCode switch
+            var bodyBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bodyLength);
+            try
             {
-                2013 => await HandleOpMsg(requestId, bodyBuffer, ct),   // OP_MSG
-                2004 => await HandleOpQuery(requestId, bodyBuffer, ct), // OP_QUERY (legacy)
-                _ => CreateErrorResponse(requestId, $"Unsupported opCode: {opCode}")
-            };
+                var bodySpan = bodyBuffer.AsMemory(0, bodyLength);
+                if (await ReadExactAsync(stream, bodySpan, ct) < bodyLength)
+                    break; // Connection closed mid-message
 
-            // Send response
-            await stream.WriteAsync(response, ct);
-            await stream.FlushAsync(ct);
+                // Process based on opCode
+                var response = opCode switch
+                {
+                    2013 => await HandleOpMsg(requestId, bodyBuffer, ct),   // OP_MSG
+                    2004 => await HandleOpQuery(requestId, bodyBuffer, ct), // OP_QUERY (legacy)
+                    _ => CreateErrorResponse(requestId, $"Unsupported opCode: {opCode}")
+                };
+
+                // Send response
+                await stream.WriteAsync(response, ct);
+                await stream.FlushAsync(ct);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(bodyBuffer);
+            }
         }
     }
 
@@ -154,12 +179,12 @@ public class MongoDbConnectionHandler
         return CreateOpMsgResponse(responseTo, $$"""{ "ok": 0, "errmsg": "{{error}}" }""");
     }
 
-    private static async Task<int> ReadExactAsync(NetworkStream stream, byte[] buffer, CancellationToken ct)
+    private static async Task<int> ReadExactAsync(NetworkStream stream, Memory<byte> buffer, CancellationToken ct)
     {
         var totalRead = 0;
         while (totalRead < buffer.Length)
         {
-            var read = await stream.ReadAsync(buffer.AsMemory(totalRead), ct);
+            var read = await stream.ReadAsync(buffer[totalRead..], ct);
             if (read == 0) return totalRead; // Connection closed
             totalRead += read;
         }
