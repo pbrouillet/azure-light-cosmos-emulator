@@ -28,7 +28,9 @@ docker compose -f docker\docker-compose.yml up
 
 ## Architecture
 
-The emulator implements the Azure Cosmos DB REST API (port 8081) and MongoDB wire protocol (port 10255), backed by SurrealDB/RocksDB storage.
+The emulator implements the Azure Cosmos DB REST API (port 8081) and MongoDB wire protocol (port 10255). The **default storage backend is Sqlite** (file-backed `emulator.db`); `InMemory` and `SurrealDb` are also selectable.
+
+> **Storage backend gotcha:** `StorageServiceRegistration.ParseStorageType` returns `StorageType.Sqlite` for null/empty/unrecognized values — Sqlite is the real default the CLI/`start` path uses, **not** SurrealDb (the doc comment on `EmulatorOptions.Storage` is stale). When debugging persistence, memory, or query behavior, assume `SqliteDocumentStore` (`src/Storage/Sqlite/`) unless a backend was explicitly configured.
 
 ### Project dependency graph
 
@@ -41,7 +43,7 @@ Cli → Host → NoSql  → Core
 ```
 
 - **Core** — Domain models, interfaces (`IDocumentStore`, `IQueryEngine`, `IAuthProvider`, `IChangeFeedProvider`, `IConsistencyManager`, `IProgrammabilityEngine`), and the `ConsistencyManager` implementation. Pure library with no external dependencies.
-- **Storage** — `SurrealDbDocumentStore` implements `IDocumentStore` using in-memory `ConcurrentDictionary` (SurrealDB/RocksDB wiring ready). `InMemoryChangeFeedProvider` tracks document changes with LSNs.
+- **Storage** — Multiple `IDocumentStore` implementations. **`SqliteDocumentStore` (default, file-backed `emulator.db`)** is the production path; `InMemoryDocumentStore` (ConcurrentDictionary) and `SurrealDbDocumentStore` are alternatives selected via `StorageType`. `InMemoryChangeFeedProvider` / `SqliteChangeFeedProvider` track document changes with LSNs.
 - **Auth** — Three `IAuthProvider` implementations: `MasterKeyAuthProvider` (HMAC-SHA256), `EntraIdAuthProvider` (OIDC/JWT), `ResourceTokenProvider`. `CompositeAuthProvider` chains them.
 - **NoSql** — ASP.NET controllers matching the Cosmos DB REST API, plus `CosmosAuthMiddleware`, `CosmosExceptionMiddleware`, `CosmosQueryEngine` (SQL parser), and `JintProgrammabilityEngine` (stored procedures via Jint).
 - **MongoDB** — TCP server (`MongoDbServer`) on port 10255 speaking MongoDB wire protocol (OP_MSG, OP_QUERY).
@@ -92,6 +94,8 @@ All data access goes through `IDocumentStore`. The implementation uses `Concurre
 
 Document writes increment a global LSN and record changes via `IChangeFeedProvider`.
 
+**Debugging point-operation 404s (delete / read / replace of a document that exists).** Point operations look up documents by the full composite key `{databaseId}/{containerId}/{partitionKeyValue}/{documentId}`. A 404 on a document you know exists almost always means the **partition-key value mismatches**: the `x-ms-documentdb-partitionkey` header value sent by the client differs from the value extracted from the document's PK-path field at write time. Check the container's partition-key path (e.g. `/vector_store_id`, not `/id`) and confirm the client sends that field's value — not the document id — as the partition key. Compare "stored PK" vs "requested PK" before assuming a routing or storage bug.
+
 ### Auth header format
 
 Master key auth uses the Cosmos DB signature format:
@@ -100,6 +104,10 @@ type=master&ver=1.0&sig={HMAC-SHA256 of "verb\nresourceType\nresourceLink\ndate\
 ```
 
 The known test master key is: `C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==`
+
+**Local auth bypass (`x-ms-cosmos-explorer`).** `CosmosAuthMiddleware.IsExplorerRequest` skips HMAC verification for requests that either have a `Referer` from `/explorer` **or** carry the `x-ms-cosmos-explorer` header (and no `Authorization` header). Set `x-ms-cosmos-explorer: 1` (plus `x-ms-version`) to drive the REST API from local scripts, load tests, or ad-hoc `curl` without computing signatures. Do **not** rely on this for anything testing the auth path itself.
+
+**Debugging `"Invalid master key signature"` (Unauthorized).** The HMAC payload is `"{verb}\n{resourceType}\n{resourceLink}\n{date}\n\n"`, all lowercased **except** `resourceLink`: name-based resource links are **case-sensitive** and must preserve their original casing (only `resourceType` is lowercased). This matches the real SDK (`AuthorizationHelper` lowercases resource IDs *only* for non-name-based paths). Lowercasing the resource link is a classic parity regression that breaks signatures for any db/container/doc whose name has uppercase characters — see the comment in `CosmosAuthMiddleware.ExtractResourceInfo`.
 
 ### Explorer (React)
 
@@ -221,7 +229,8 @@ var result = await engine.ExecuteQueryAsync("db", "coll",
 ### Known intentional limitations
 
 - **Request Units**: Formula-based estimation, not real metering (`RuCostCalculator.cs`)
-- **Indexing**: Metadata is stored and round-tripped but not used for query optimization — all queries scan all documents
+- **Indexing**: Range/composite index metadata is stored and round-tripped but not used for query optimization — most queries scan all documents. **Exception: vector indexes are real** — `ORDER BY VectorDistance(...)` is accelerated by an in-memory HNSW ANN index (`src/Storage/Vector/`), so vector search does **not** full-scan. See `docs/vector-search.md`.
+- **Query materializes the whole container per call**: `CosmosQueryEngine.ExecuteQueryAsync` loads and parses **every** document in the container into `JsonNode` graphs on every query (via `ListDocumentsAsync` + `.Where(IsIndexed).ToList()` + per-doc `ToResponseBody()`) before paging. Peak transient allocation ≈ `concurrency × containerSize × JsonNode-overhead`, so high query concurrency on a large container can saturate the GC (this was the ~23 GB "memory leak"). It is **bounded** by `QueryExecutionLimiter` (`IQueryExecutionLimiter`, a `SemaphoreSlim` gate acquired only around the top-level `ExecuteQueryAsync` in `DocumentsController` — subqueries call the engine directly to avoid recursion deadlock), configurable via `EmulatorOptions.MaxConcurrentQueries` (default `Max(2, ProcessorCount/2)`). Raise it to trade memory for parallelism. Register `IQueryExecutionLimiter` in all three DI surfaces.
 - **Consistency levels**: All five accepted; only Session tokens actually enforced (single-node emulator)
 - **Spatial indexes**: Stored on containers but not used for query acceleration
 - **Stored procedure context**: Limited `getContext()` API via Jint (no `collection.createDocument()`, etc.)
