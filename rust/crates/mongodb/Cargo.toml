@@ -14,4 +14,7 @@ cosmos-auth.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-# Future: bson crate for document (de)serialization and wire messages.
+bson = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
