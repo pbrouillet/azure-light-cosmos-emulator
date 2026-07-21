@@ -13,7 +13,8 @@ use cosmos_core::error::{CosmosError, CosmosResult};
 use cosmos_core::ids::etag;
 use cosmos_core::models::*;
 use cosmos_core::traits::DocumentStore;
-use serde_json::Value;
+
+use crate::common::{apply_patch, extract_partition_key, require_id};
 
 #[derive(Default)]
 struct State {
@@ -55,43 +56,6 @@ impl InMemoryDocumentStore {
 
     fn next_lsn(&self) -> i64 {
         self.global_lsn.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    /// Extracts the partition key value from a document body using the
-    /// container's partition key path(s).
-    fn extract_partition_key(container: &CosmosContainer, body: &JsonObject) -> PartitionKeyValue {
-        let components: Vec<Value> = container
-            .partition_key
-            .paths
-            .iter()
-            .map(|path| lookup_path(body, path).unwrap_or(Value::Null))
-            .collect();
-        if components.is_empty() {
-            PartitionKeyValue::undefined()
-        } else {
-            PartitionKeyValue::multi(components)
-        }
-    }
-}
-
-/// Resolves a JSON pointer-like path (e.g. `/tenantId` or `/a/b`) in a body.
-fn lookup_path(body: &JsonObject, path: &str) -> Option<Value> {
-    let mut current = Value::Object(body.clone());
-    for segment in path.trim_start_matches('/').split('/') {
-        if segment.is_empty() {
-            continue;
-        }
-        current = current.get(segment)?.clone();
-    }
-    Some(current)
-}
-
-fn require_id(body: &JsonObject) -> CosmosResult<String> {
-    match body.get("id") {
-        Some(Value::String(s)) if !s.is_empty() => Ok(s.clone()),
-        _ => Err(CosmosError::bad_request(
-            "Document must have a non-empty 'id'.",
-        )),
     }
 }
 
@@ -238,7 +202,7 @@ impl DocumentStore for InMemoryDocumentStore {
             .cloned()
             .ok_or_else(|| CosmosError::not_found("container", container_id))?;
         let id = require_id(&document)?;
-        let pk = Self::extract_partition_key(&container, &document);
+        let pk = extract_partition_key(&container, &document);
         let doc_key = Self::doc_key(&pk, &id);
         let coll = state.documents.entry(key).or_default();
         if coll.contains_key(&doc_key) {
@@ -285,7 +249,7 @@ impl DocumentStore for InMemoryDocumentStore {
             .get(&key)
             .cloned()
             .ok_or_else(|| CosmosError::not_found("container", container_id))?;
-        let pk = Self::extract_partition_key(&container, &document);
+        let pk = extract_partition_key(&container, &document);
         let doc_key = Self::doc_key(&pk, document_id);
         let coll = state
             .documents
@@ -680,39 +644,6 @@ impl DocumentStore for InMemoryDocumentStore {
         state.offers.insert(offer.id.clone(), offer.clone());
         Ok(offer)
     }
-}
-
-/// Applies a single patch operation to a document body. Supports the common
-/// operations; `move` and nested-path creation are simplified for the scaffold.
-fn apply_patch(body: &mut JsonObject, op: &PatchOperation) -> CosmosResult<()> {
-    let field = op.path.trim_start_matches('/').replace('/', ".");
-    match op.op.as_str() {
-        "add" | "set" | "replace" => {
-            let value = op
-                .value
-                .clone()
-                .ok_or_else(|| CosmosError::bad_request("Patch op requires a value."))?;
-            body.insert(field, value);
-        }
-        "remove" => {
-            body.remove(&field);
-        }
-        "incr" => {
-            let delta = op
-                .value
-                .as_ref()
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| CosmosError::bad_request("incr requires a numeric value."))?;
-            let current = body.get(&field).and_then(|v| v.as_f64()).unwrap_or(0.0);
-            body.insert(field, Value::from(current + delta));
-        }
-        other => {
-            return Err(CosmosError::bad_request(format!(
-                "Unsupported patch operation '{other}'."
-            )))
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
