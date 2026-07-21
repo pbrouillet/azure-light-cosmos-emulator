@@ -33,8 +33,12 @@ pub fn router(state: AppState) -> Router {
 async fn list_databases(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Json<serde_json::Value> {
-    let dbs = state.store.list_databases().await.unwrap_or_default();
-    let ids: Vec<_> = dbs.into_iter().map(|d| json!({ "id": d.id })).collect();
+    let feed = state.store.list_databases().await.unwrap_or_default();
+    let ids: Vec<_> = feed
+        .resources
+        .into_iter()
+        .map(|d| json!({ "id": d.id, "_rid": d.rid, "_etag": d.etag }))
+        .collect();
     let count = ids.len();
-    Json(json!({ "Databases": ids, "_count": count }))
+    Json(json!({ "_rid": "", "Databases": ids, "_count": count }))
 }

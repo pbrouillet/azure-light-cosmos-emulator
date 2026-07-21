@@ -8,12 +8,25 @@
 //! This is a pure library with no external service dependencies, mirroring the
 //! .NET Core project which sits at the bottom of the dependency graph.
 
+use serde::{Deserialize, Serialize};
+
+pub mod consistency;
+pub mod error;
+pub mod ids;
 pub mod models;
 pub mod traits;
 
-/// Cosmos DB consistency levels. All five are accepted; only Session tokens are
-/// actually enforced by the single-node emulator (parity with the .NET impl).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub use consistency::ConsistencyManager;
+pub use error::{CosmosError, CosmosResult};
+
+/// Cosmos DB consistency levels.
+///
+/// The variant order is significant: it defines the strength ordering used by
+/// [`traits::ConsistencyManager::is_valid_consistency_level`]. A *larger*
+/// discriminant is a *weaker* level (Strong is strongest, Eventual is weakest),
+/// matching the .NET enum ordinals. All five are accepted; only Session tokens
+/// are actually enforced by the single-node emulator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum ConsistencyLevel {
     Strong,
     BoundedStaleness,
@@ -21,4 +34,16 @@ pub enum ConsistencyLevel {
     Session,
     ConsistentPrefix,
     Eventual,
+}
+
+/// Storage backend types supported by the emulator. Ports `StorageType`.
+///
+/// Note: although `SurrealDb` is listed first (matching the .NET enum), the CLI
+/// default is **Sqlite** — the storage registration parses null/unknown values
+/// to `Sqlite`, not the first variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageType {
+    SurrealDb,
+    Sqlite,
+    InMemory,
 }
