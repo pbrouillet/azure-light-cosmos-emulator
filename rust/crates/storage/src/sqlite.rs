@@ -9,7 +9,7 @@
 //! in a `meta` key/value table.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cosmos_core::error::{CosmosError, CosmosResult};
@@ -18,6 +18,7 @@ use cosmos_core::models::*;
 use cosmos_core::traits::DocumentStore;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::changefeed::SqliteChangeFeedProvider;
 use crate::common::{apply_patch, extract_partition_key, require_id, serialize_partition_key};
 
 const GLOBAL_LSN_KEY: &str = "global_lsn";
@@ -98,19 +99,20 @@ CREATE TABLE IF NOT EXISTS changefeed (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     database_id TEXT NOT NULL,
     container_id TEXT NOT NULL,
-    lsn INTEGER NOT NULL,
-    change_type TEXT NOT NULL,
     document_id TEXT NOT NULL,
-    partition_key_json TEXT NOT NULL,
+    lsn INTEGER NOT NULL,
+    change_type INTEGER NOT NULL,
     body_json TEXT NOT NULL,
-    timestamp INTEGER NOT NULL
+    previous_image_json TEXT,
+    partition_key_json TEXT NOT NULL,
+    timestamp TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_changefeed_lsn ON changefeed (database_id, container_id, lsn);
 "#;
 
 /// SQLite (persistent) document store.
 pub struct SqliteDocumentStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteDocumentStore {
@@ -137,12 +139,18 @@ impl SqliteDocumentStore {
             .map_err(sqlite_err)?;
         conn.execute_batch(SCHEMA).map_err(sqlite_err)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("sqlite mutex poisoned")
+    }
+
+    /// Returns a change-feed provider sharing this store's connection, so it
+    /// reads the same `changefeed` table this store writes to.
+    pub fn change_feed(&self) -> SqliteChangeFeedProvider {
+        SqliteChangeFeedProvider::new(Arc::clone(&self.conn))
     }
 }
 
@@ -195,33 +203,67 @@ fn read_global_lsn(conn: &Connection) -> CosmosResult<i64> {
 
 // ─── Change feed recording ──────────────────────────────────────────────────
 
-fn record_change(
+/// Numeric discriminant for a change type, matching the .NET enum ordinals
+/// (Create=0, Replace=1, Delete=2).
+pub(crate) fn change_type_code(change_type: ChangeType) -> i64 {
+    match change_type {
+        ChangeType::Create => 0,
+        ChangeType::Replace => 1,
+        ChangeType::Delete => 2,
+    }
+}
+
+pub(crate) fn change_type_from_code(code: i64) -> ChangeType {
+    match code {
+        0 => ChangeType::Create,
+        2 => ChangeType::Delete,
+        _ => ChangeType::Replace,
+    }
+}
+
+/// Inserts a change event row into the `changefeed` table. Shared by the store
+/// (which records inline with each write) and [`SqliteChangeFeedProvider`].
+pub(crate) fn insert_change_row(
     conn: &Connection,
     doc: &CosmosDocument,
     change_type: ChangeType,
+    previous_image: Option<&CosmosDocument>,
 ) -> CosmosResult<()> {
-    let ct = match change_type {
-        ChangeType::Create => "Create",
-        ChangeType::Replace => "Replace",
-        ChangeType::Delete => "Delete",
-    };
+    let previous_json = previous_image.map(|p| {
+        serde_json::json!({
+            "id": p.id,
+            "bodyJson": serde_json::to_string(&p.body).unwrap_or_else(|_| "{}".into()),
+            "lsn": p.lsn,
+        })
+        .to_string()
+    });
     conn.execute(
         "INSERT INTO changefeed \
-         (database_id, container_id, lsn, change_type, document_id, partition_key_json, body_json, timestamp) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (database_id, container_id, document_id, lsn, change_type, body_json, previous_image_json, partition_key_json, timestamp) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             doc.database_id,
             doc.container_id,
-            doc.lsn,
-            ct,
             doc.id,
-            serialize_partition_key(&doc.partition_key),
+            doc.lsn,
+            change_type_code(change_type),
             serde_json::to_string(&doc.body).unwrap_or_else(|_| "{}".into()),
-            doc.timestamp,
+            previous_json,
+            serialize_partition_key(&doc.partition_key),
+            chrono::Utc::now().to_rfc3339(),
         ],
     )
     .map_err(sqlite_err)?;
     Ok(())
+}
+
+fn record_change(
+    conn: &Connection,
+    doc: &CosmosDocument,
+    change_type: ChangeType,
+    previous_image: Option<&CosmosDocument>,
+) -> CosmosResult<()> {
+    insert_change_row(conn, doc, change_type, previous_image)
 }
 
 // ─── Row mappers ─────────────────────────────────────────────────────────────
@@ -704,7 +746,7 @@ impl DocumentStore for SqliteDocumentStore {
         doc.lsn = allocate_next_lsn(&conn)?;
         doc.is_indexed = is_indexed.unwrap_or(true);
         insert_document(&conn, &doc)?;
-        record_change(&conn, &doc, ChangeType::Create)?;
+        record_change(&conn, &doc, ChangeType::Create, None)?;
         Ok(doc)
     }
 
@@ -767,12 +809,12 @@ impl DocumentStore for SqliteDocumentStore {
             }
         }
         let mut doc = CosmosDocument::new(database_id, container_id, document_id, pk, document);
-        doc.rid = existing.rid;
+        doc.rid = existing.rid.clone();
         doc.lsn = allocate_next_lsn(&conn)?;
         doc.etag = etag();
         doc.is_indexed = is_indexed.unwrap_or(true);
         insert_document(&conn, &doc)?;
-        record_change(&conn, &doc, ChangeType::Replace)?;
+        record_change(&conn, &doc, ChangeType::Replace, Some(&existing))?;
         Ok(doc)
     }
 
@@ -843,7 +885,7 @@ impl DocumentStore for SqliteDocumentStore {
         doc.lsn = allocate_next_lsn(&conn)?;
         doc.etag = etag();
         insert_document(&conn, &doc)?;
-        record_change(&conn, &doc, ChangeType::Replace)?;
+        record_change(&conn, &doc, ChangeType::Replace, Some(&existing))?;
         Ok(doc)
     }
 
@@ -872,7 +914,7 @@ impl DocumentStore for SqliteDocumentStore {
         )
         .map_err(sqlite_err)?;
         existing.lsn = allocate_next_lsn(&conn)?;
-        record_change(&conn, &existing, ChangeType::Delete)?;
+        record_change(&conn, &existing, ChangeType::Delete, None)?;
         Ok(())
     }
 

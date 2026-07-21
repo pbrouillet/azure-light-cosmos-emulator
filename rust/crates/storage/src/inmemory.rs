@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cosmos_core::error::{CosmosError, CosmosResult};
@@ -14,6 +14,7 @@ use cosmos_core::ids::etag;
 use cosmos_core::models::*;
 use cosmos_core::traits::DocumentStore;
 
+use crate::changefeed::{InMemoryChangeFeedProvider, InMemoryChangeLog};
 use crate::common::{apply_patch, extract_partition_key, require_id};
 
 #[derive(Default)]
@@ -30,6 +31,7 @@ struct State {
 pub struct InMemoryDocumentStore {
     state: Mutex<State>,
     global_lsn: AtomicI64,
+    change_log: Arc<InMemoryChangeLog>,
 }
 
 impl Default for InMemoryDocumentStore {
@@ -43,6 +45,7 @@ impl InMemoryDocumentStore {
         Self {
             state: Mutex::new(State::default()),
             global_lsn: AtomicI64::new(0),
+            change_log: Arc::new(InMemoryChangeLog::default()),
         }
     }
 
@@ -56,6 +59,11 @@ impl InMemoryDocumentStore {
 
     fn next_lsn(&self) -> i64 {
         self.global_lsn.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Returns a change-feed provider sharing this store's in-memory change log.
+    pub fn change_feed(&self) -> InMemoryChangeFeedProvider {
+        InMemoryChangeFeedProvider::new(Arc::clone(&self.change_log))
     }
 }
 
@@ -212,6 +220,13 @@ impl DocumentStore for InMemoryDocumentStore {
         doc.lsn = self.next_lsn();
         doc.is_indexed = is_indexed.unwrap_or(true);
         coll.insert(doc_key, doc.clone());
+        self.change_log.record(
+            database_id,
+            container_id,
+            doc.clone(),
+            ChangeType::Create,
+            None,
+        );
         Ok(doc)
     }
 
@@ -265,11 +280,19 @@ impl DocumentStore for InMemoryDocumentStore {
                 ));
             }
         }
+        let previous = existing.clone();
         let mut doc = CosmosDocument::new(database_id, container_id, document_id, pk, document);
         doc.lsn = self.next_lsn();
         doc.etag = etag();
         doc.is_indexed = is_indexed.unwrap_or(true);
         coll.insert(doc_key, doc.clone());
+        self.change_log.record(
+            database_id,
+            container_id,
+            doc.clone(),
+            ChangeType::Replace,
+            Some(previous),
+        );
         Ok(doc)
     }
 
@@ -334,11 +357,19 @@ impl DocumentStore for InMemoryDocumentStore {
         for op in operations {
             apply_patch(&mut body, op)?;
         }
+        let previous = existing.clone();
         let mut doc = existing.clone();
         doc.body = body;
         doc.lsn = self.next_lsn();
         doc.etag = etag();
         coll.insert(doc_key, doc.clone());
+        self.change_log.record(
+            database_id,
+            container_id,
+            doc.clone(),
+            ChangeType::Replace,
+            Some(previous),
+        );
         Ok(doc)
     }
 
@@ -356,9 +387,14 @@ impl DocumentStore for InMemoryDocumentStore {
             .documents
             .get_mut(&key)
             .ok_or_else(|| CosmosError::not_found("container", container_id))?;
-        if coll.remove(&doc_key).is_none() {
-            return Err(CosmosError::not_found("document", document_id));
-        }
+        let removed = match coll.remove(&doc_key) {
+            Some(doc) => doc,
+            None => return Err(CosmosError::not_found("document", document_id)),
+        };
+        let mut removed = removed;
+        removed.lsn = self.next_lsn();
+        self.change_log
+            .record(database_id, container_id, removed, ChangeType::Delete, None);
         Ok(())
     }
 
