@@ -1,19 +1,46 @@
 //! Query engines for the Cosmos DB light emulator.
 //!
-//! Ports the .NET `NoSql/Query` (Cosmos SQL) and `Kql` projects. The SQL engine
-//! is a hand-rolled parser/evaluator targeting API version `2024-11-30`.
+//! Ports the Cosmos SQL engine from `NoSql/Query/CosmosQueryEngine.cs`. This
+//! is a hand-rolled tokenizer + recursive-descent parser + tree-walking
+//! evaluator supporting the common SQL surface:
+//!
+//! * `SELECT * | VALUE <expr> | <items>` with aliases and `DISTINCT`
+//! * `FROM <alias>` with optional root/alias forms
+//! * `WHERE` with comparison, logical (three-valued), arithmetic, `IN`,
+//!   `BETWEEN`, and member/index access
+//! * `ORDER BY` (multi-key, ASC/DESC) using the Cosmos total ordering
+//! * `TOP`, `OFFSET ... LIMIT ...`
+//! * parameters (`@name`), array/object literals
+//! * scalar functions (string, type-check, math, array, conditional) and the
+//!   `COUNT/SUM/AVG/MIN/MAX` aggregates
 //!
 //! Design note: the .NET engine materializes the whole container per query
-//! (bounded by a semaphore). The Rust port should use bounded/streaming
-//! execution from the start to avoid the historical memory blow-up.
+//! (bounded by a semaphore). This port keeps that materialization model for
+//! now; streaming/bounded execution is a future refinement.
 
-/// Placeholder query result. Filled in during the `query-crate` phase.
-#[derive(Debug, Default)]
-pub struct QueryResult {
-    pub documents: Vec<serde_json::Value>,
-}
+mod ast;
+mod engine;
+mod eval;
+mod functions;
+mod lexer;
+mod parser;
+mod value;
 
-/// Entry point for executing a Cosmos SQL query (stub).
-pub fn execute_sql(_query: &str) -> Result<QueryResult, anyhow::Error> {
-    Ok(QueryResult::default())
+pub use engine::SqlQueryEngine;
+pub use parser::parse;
+
+/// Convenience: parse and execute a query against in-memory JSON documents,
+/// returning the projected rows. Primarily used by tests and tooling.
+pub fn run_query(
+    query: &str,
+    docs: &[serde_json::Value],
+    params: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let stmt = parser::parse(query)?;
+    let result = eval::execute(&stmt, docs, params)?;
+    Ok(result
+        .rows
+        .into_iter()
+        .map(serde_json::Value::Object)
+        .collect())
 }
