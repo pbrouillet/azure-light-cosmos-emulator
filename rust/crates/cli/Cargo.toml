@@ -1,0 +1,20 @@
+[package]
+name = "cosmos-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cosmos-emulator command-line interface (ports the .NET Cli project)."
+
+[[bin]]
+name = "cosmos-emulator"
+path = "src/main.rs"
+
+[dependencies]
+cosmos-host.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

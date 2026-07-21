@@ -1,0 +1,18 @@
+[package]
+name = "cosmos-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authentication providers (master key HMAC, EntraID JWT, resource tokens) for the emulator."
+
+[dependencies]
+cosmos-core.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+base64.workspace = true
+# Future: jsonwebtoken / openidconnect for EntraID

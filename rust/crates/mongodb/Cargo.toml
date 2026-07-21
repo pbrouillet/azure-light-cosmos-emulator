@@ -1,0 +1,17 @@
+[package]
+name = "cosmos-mongodb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MongoDB wire-protocol server (port 10255) for the Cosmos DB light emulator."
+
+[dependencies]
+cosmos-core.workspace = true
+cosmos-storage.workspace = true
+cosmos-auth.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# Future: bson crate for document (de)serialization and wire messages.

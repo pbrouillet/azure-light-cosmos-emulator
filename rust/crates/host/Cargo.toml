@@ -1,0 +1,30 @@
+[package]
+name = "cosmos-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Axum application host: assembles services, middleware, and serves the Explorer SPA."
+
+[dependencies]
+cosmos-core.workspace = true
+cosmos-storage.workspace = true
+cosmos-auth.workspace = true
+cosmos-query.workspace = true
+cosmos-nosql.workspace = true
+cosmos-mongodb.workspace = true
+cosmos-triggers.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tower = { workspace = true, features = ["util"] }

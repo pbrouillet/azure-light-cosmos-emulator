@@ -1,0 +1,22 @@
+[package]
+name = "cosmos-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pluggable storage backends (InMemory/Sqlite/SurrealDb) for the Cosmos DB light emulator."
+
+[dependencies]
+cosmos-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Future backends (add as each is ported):
+#   rusqlite / sqlx   -> Sqlite (default) backend
+#   surrealdb         -> SurrealDb (RocksDB) backend
+#   instant-distance  -> HNSW vector index
