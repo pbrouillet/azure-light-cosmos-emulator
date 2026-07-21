@@ -1,0 +1,19 @@
+[package]
+name = "cosmos-parity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Black-box parity harness driving the Rust Cosmos emulator host over a real socket with master-key-signed HTTP requests."
+
+[dependencies]
+cosmos-core.workspace = true
+cosmos-host.workspace = true
+cosmos-auth.workspace = true
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true

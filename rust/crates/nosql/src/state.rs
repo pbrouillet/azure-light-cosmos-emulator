@@ -73,4 +73,11 @@ impl AppState {
         self.auth = Some(auth);
         self
     }
+
+    /// Overrides the default consistency level used for session-token issuance
+    /// and validation.
+    pub fn with_consistency(mut self, level: cosmos_core::ConsistencyLevel) -> Self {
+        self.consistency = Arc::new(ConsistencyManager::new(level));
+        self
+    }
 }

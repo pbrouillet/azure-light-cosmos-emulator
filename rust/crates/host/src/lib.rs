@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::{routing::get, Json, Router};
 use cosmos_core::models::VectorIndexOptions;
 use cosmos_core::traits::{DocumentStore, VectorIndexProvider};
-use cosmos_core::StorageType;
+use cosmos_core::{ConsistencyLevel, StorageType};
 use cosmos_nosql::AppState;
 use cosmos_storage::{
     FlatVectorIndexProvider, InMemoryDocumentStore, SqliteDocumentStore, SurrealDbDocumentStore,
@@ -32,6 +32,12 @@ pub struct HostOptions {
     pub data_dir: Option<PathBuf>,
     /// Optional directory containing the built Explorer SPA to serve at `/explorer`.
     pub explorer_dir: Option<std::path::PathBuf>,
+    /// Master key for HMAC authentication. When `Some`, the NoSQL API enforces
+    /// signed `Authorization` headers; when `None`, authentication is skipped
+    /// (dev/bring-up mode).
+    pub master_key: Option<String>,
+    /// Default consistency level for session-token issuance/validation.
+    pub consistency: ConsistencyLevel,
 }
 
 impl Default for HostOptions {
@@ -41,6 +47,8 @@ impl Default for HostOptions {
             storage: StorageType::Sqlite,
             data_dir: None,
             explorer_dir: None,
+            master_key: None,
+            consistency: ConsistencyLevel::Session,
         }
     }
 }
@@ -81,7 +89,15 @@ pub async fn build_store(opts: &HostOptions) -> Result<Arc<dyn DocumentStore>, a
 /// around an already-constructed store.
 pub fn build_router(opts: &HostOptions, store: Arc<dyn DocumentStore>) -> Router {
     let query_engine = Arc::new(cosmos_query::SqlQueryEngine::new(store.clone()));
-    let state = AppState::new(store).with_query_engine(query_engine);
+    let mut state = AppState::new(store)
+        .with_query_engine(query_engine)
+        .with_consistency(opts.consistency);
+
+    if let Some(key) = opts.master_key.as_ref().filter(|k| !k.is_empty()) {
+        state = state.with_auth(Arc::new(cosmos_auth::MasterKeyAuthProvider::new(
+            key.clone(),
+        )));
+    }
 
     let mut app = Router::new()
         .route("/health", get(health))

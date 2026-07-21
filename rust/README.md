@@ -63,12 +63,22 @@ docker compose -f docker/docker-compose.yml up --build
 build, and a Docker image build. It is path-filtered to `rust/**` so it runs
 independently of the .NET CI workflow.
 
+## Parity
+
+`crates/parity` (`cargo test -p cosmos-parity`) is a black-box harness that boots
+the real host on an ephemeral socket and drives it with master-key–signed HTTP,
+mirroring the .NET `Parity.Tests` smoke suite (database/container/document CRUD +
+auth enforcement). An opt-in official-SDK layer (Node/Python) lives under
+`crates/parity/sdk/`. See [`PARITY.md`](PARITY.md) for the full feature-parity
+map and remaining gaps.
+
 ## Status
 
 Ported and tested (see `plan.md` for details): `core`, `storage` (InMemory /
 Sqlite / SurrealDb + change feed + vector), `auth`, `query` (Cosmos SQL engine),
 `nosql` (full REST surface), `triggers` (boa-based sprocs/triggers/UDFs),
-`mongodb` (wire-protocol handshake), `host`, and the `cosmos-emulator` `cli`.
-Remaining: black-box SDK parity harness, plus documented per-crate gaps
-(programmability REST wiring, MongoDB document CRUD, host wiring of the Mongo
-listener).
+`mongodb` (wire-protocol handshake), `host` (with auth + consistency enforced),
+the `cosmos-emulator` `cli`, Docker/CI, and the `parity` harness. Remaining
+per-crate gaps are documented in [`PARITY.md`](PARITY.md) (programmability REST
+wiring + persistence, MongoDB document CRUD + host wiring of the Mongo listener,
+UDF-in-query, EntraID enforcement, query JOIN/GROUP BY/spatial/vector/KQL, TLS).

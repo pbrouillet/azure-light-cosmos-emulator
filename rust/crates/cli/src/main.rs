@@ -228,6 +228,8 @@ async fn start(args: StartArgs, run_host_internal: bool) -> Result<i32, anyhow::
         storage: args.storage.into(),
         data_dir: Some(data_dir),
         explorer_dir: args.explorer_dir.clone(),
+        master_key: Some(state.master_key.clone()),
+        consistency: cosmos_core::ConsistencyLevel::parse(&state.consistency_level),
     })
     .await;
     cleanup_state_files(&data_directory);

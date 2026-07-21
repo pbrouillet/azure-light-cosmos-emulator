@@ -36,6 +36,26 @@ pub enum ConsistencyLevel {
     Eventual,
 }
 
+impl ConsistencyLevel {
+    /// Parses a consistency level from its name (case-insensitive, ignoring
+    /// spaces), mirroring the .NET emulator's tolerant `--consistency` parsing.
+    /// Unknown values fall back to [`ConsistencyLevel::Session`].
+    pub fn parse(value: &str) -> Self {
+        match value
+            .trim()
+            .replace([' ', '-', '_'], "")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "strong" => ConsistencyLevel::Strong,
+            "boundedstaleness" => ConsistencyLevel::BoundedStaleness,
+            "consistentprefix" => ConsistencyLevel::ConsistentPrefix,
+            "eventual" => ConsistencyLevel::Eventual,
+            _ => ConsistencyLevel::Session,
+        }
+    }
+}
+
 /// Storage backend types supported by the emulator. Ports `StorageType`.
 ///
 /// Note: although `SurrealDb` is listed first (matching the .NET enum), the CLI

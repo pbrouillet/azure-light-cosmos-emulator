@@ -1149,6 +1149,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmos-parity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "cosmos-auth",
+ "cosmos-core",
+ "cosmos-host",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cosmos-query"
 version = "0.1.0"
 dependencies = [
