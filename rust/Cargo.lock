@@ -889,9 +889,15 @@ name = "cosmos-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "cosmos-auth",
  "cosmos-core",
  "cosmos-host",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
