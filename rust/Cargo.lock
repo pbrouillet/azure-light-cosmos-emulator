@@ -952,6 +952,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chrono",
  "cosmos-auth",
  "cosmos-core",
  "cosmos-query",
@@ -963,6 +964,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -22,6 +22,9 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+cosmos-storage.workspace = true

@@ -80,7 +80,7 @@ pub async fn build_store(opts: &HostOptions) -> Result<Arc<dyn DocumentStore>, a
 /// Builds the top-level Axum router (health + NoSQL API + optional Explorer)
 /// around an already-constructed store.
 pub fn build_router(opts: &HostOptions, store: Arc<dyn DocumentStore>) -> Router {
-    let state = AppState { store };
+    let state = AppState::new(store);
 
     let mut app = Router::new()
         .route("/health", get(health))

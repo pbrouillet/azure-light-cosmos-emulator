@@ -2,43 +2,96 @@
 //! middleware to Axum routers and tower layers.
 //!
 //! URL structure mirrors the Cosmos REST API:
-//! `/dbs`, `/dbs/{dbId}/colls`, `/dbs/{dbId}/colls/{collId}/docs`,
-//! `.../sprocs`, `.../triggers`, `.../udfs`.
+//! `/dbs`, `/dbs/{dbId}/colls`, `/dbs/{dbId}/colls/{collId}/docs`, `/offers`, etc.
 //!
-//! Middleware order (parity with .NET): exception → auth → handlers.
+//! Middleware order (parity with .NET): exception mapping (via [`response::ApiError`]
+//! `IntoResponse`) → auth ([`auth_mw`]) → handlers. The stored-procedure/trigger/UDF
+//! programmability surface and the full SQL query engine are ported in the
+//! `triggers-crate` and `query-crate` phases respectively.
 
-use std::sync::Arc;
+mod auth_mw;
+mod batch;
+mod changefeed;
+mod containers;
+mod databases;
+mod documents;
+mod format;
+mod offers;
+mod parse;
+mod permissions;
+mod pkranges;
+mod response;
+mod ru;
+mod state;
+mod users;
 
-use axum::{routing::get, Json, Router};
-use cosmos_core::traits::DocumentStore;
-use serde_json::json;
+pub use response::ApiError;
+pub use state::{AppState, RuntimeState};
 
-/// Shared application state passed to handlers.
-///
-/// Centralizing service construction here avoids the .NET "three DI surfaces"
-/// synchronization trap (`Program.cs` / `HostApplication.cs` / test fixture).
-#[derive(Clone)]
-pub struct AppState {
-    pub store: Arc<dyn DocumentStore>,
-}
+use axum::routing::{get, post};
+use axum::Router;
 
-/// Builds the NoSQL REST router. Handlers are added during the `nosql-crate`
-/// phase; this scaffold wires the databases listing as a first vertical slice.
+/// Builds the NoSQL REST router with all controllers wired and the auth layer
+/// applied (a no-op when `state.auth` is `None`).
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/dbs", get(list_databases))
-        .with_state(state)
-}
+    let api = Router::new()
+        // Databases
+        .route("/dbs", post(databases::create).get(databases::list))
+        .route("/dbs/:dbId", get(databases::get).delete(databases::delete))
+        // Containers (+ transactional batch on the container path via POST)
+        .route(
+            "/dbs/:dbId/colls",
+            post(containers::create).get(containers::list),
+        )
+        .route(
+            "/dbs/:dbId/colls/:collId",
+            get(containers::get)
+                .put(containers::replace)
+                .delete(containers::delete)
+                .post(batch::execute),
+        )
+        // Partition key ranges
+        .route("/dbs/:dbId/colls/:collId/pkranges", get(pkranges::list))
+        // Documents
+        .route(
+            "/dbs/:dbId/colls/:collId/docs",
+            post(documents::create_or_query).delete(documents::delete_all),
+        )
+        .route(
+            "/dbs/:dbId/colls/:collId/docs/changefeed",
+            get(changefeed::read),
+        )
+        .route(
+            "/dbs/:dbId/colls/:collId/docs/:docId",
+            get(documents::read)
+                .put(documents::replace)
+                .delete(documents::delete)
+                .patch(documents::patch),
+        )
+        // Users
+        .route("/dbs/:dbId/users", post(users::create).get(users::list))
+        .route(
+            "/dbs/:dbId/users/:userId",
+            get(users::get).put(users::replace).delete(users::delete),
+        )
+        // Permissions
+        .route(
+            "/dbs/:dbId/users/:userId/permissions",
+            post(permissions::create).get(permissions::list),
+        )
+        .route(
+            "/dbs/:dbId/users/:userId/permissions/:permissionId",
+            get(permissions::get)
+                .put(permissions::replace)
+                .delete(permissions::delete),
+        )
+        // Offers
+        .route("/offers", get(offers::list).post(offers::query))
+        .route("/offers/:offerId", get(offers::get).put(offers::replace));
 
-async fn list_databases(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> Json<serde_json::Value> {
-    let feed = state.store.list_databases().await.unwrap_or_default();
-    let ids: Vec<_> = feed
-        .resources
-        .into_iter()
-        .map(|d| json!({ "id": d.id, "_rid": d.rid, "_etag": d.etag }))
-        .collect();
-    let count = ids.len();
-    Json(json!({ "_rid": "", "Databases": ids, "_count": count }))
+    api.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth_mw::authenticate,
+    ))
+    .with_state(state)
 }
