@@ -5,11 +5,14 @@
 //! is served statically under `/explorer` via `tower-http`'s `ServeDir`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{routing::get, Json, Router};
+use cosmos_core::traits::DocumentStore;
+use cosmos_core::StorageType;
 use cosmos_nosql::AppState;
-use cosmos_storage::InMemoryDocumentStore;
+use cosmos_storage::{InMemoryDocumentStore, SqliteDocumentStore};
 use serde_json::json;
 
 /// Default NoSQL REST API port, matching the .NET emulator.
@@ -18,6 +21,11 @@ pub const DEFAULT_PORT: u16 = 8081;
 /// Options controlling how the host is built.
 pub struct HostOptions {
     pub port: u16,
+    /// Storage backend to use. Defaults to [`StorageType::Sqlite`] (the real
+    /// default), matching the .NET emulator.
+    pub storage: StorageType,
+    /// Directory for persistent data (used by the Sqlite/SurrealDb backends).
+    pub data_dir: Option<PathBuf>,
     /// Optional directory containing the built Explorer SPA to serve at `/explorer`.
     pub explorer_dir: Option<std::path::PathBuf>,
 }
@@ -26,14 +34,36 @@ impl Default for HostOptions {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
+            storage: StorageType::Sqlite,
+            data_dir: None,
             explorer_dir: None,
         }
     }
 }
 
-/// Builds the top-level Axum router (health + NoSQL API + optional Explorer).
-pub fn build_router(opts: &HostOptions) -> Router {
-    let store = Arc::new(InMemoryDocumentStore::new());
+/// Constructs the storage backend selected by [`HostOptions`].
+pub fn build_store(opts: &HostOptions) -> Result<Arc<dyn DocumentStore>, anyhow::Error> {
+    let store: Arc<dyn DocumentStore> = match opts.storage {
+        StorageType::InMemory => Arc::new(InMemoryDocumentStore::new()),
+        StorageType::Sqlite => {
+            let dir = opts
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("./cosmos-data"));
+            Arc::new(SqliteDocumentStore::open(dir)?)
+        }
+        StorageType::SurrealDb => {
+            anyhow::bail!(
+                "The SurrealDb backend is not yet ported; use --storage sqlite or in-memory."
+            )
+        }
+    };
+    Ok(store)
+}
+
+/// Builds the top-level Axum router (health + NoSQL API + optional Explorer)
+/// around an already-constructed store.
+pub fn build_router(opts: &HostOptions, store: Arc<dyn DocumentStore>) -> Router {
     let state = AppState { store };
 
     let mut app = Router::new()
@@ -53,9 +83,14 @@ async fn health() -> Json<serde_json::Value> {
 
 /// Boots the host and serves until shutdown.
 pub async fn run(opts: HostOptions) -> Result<(), anyhow::Error> {
-    let app = build_router(&opts);
+    let store = build_store(&opts)?;
+    let app = build_router(&opts, store);
     let addr = SocketAddr::from(([0, 0, 0, 0], opts.port));
-    tracing::info!("NoSQL Endpoint: http://localhost:{}", opts.port);
+    tracing::info!(
+        "NoSQL Endpoint: http://localhost:{} (storage: {:?})",
+        opts.port,
+        opts.storage
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -70,7 +105,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
-        let app = build_router(&HostOptions::default());
+        let store = Arc::new(InMemoryDocumentStore::new());
+        let app = build_router(&HostOptions::default(), store);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -85,7 +121,8 @@ mod tests {
 
     #[tokio::test]
     async fn dbs_endpoint_is_wired() {
-        let app = build_router(&HostOptions::default());
+        let store = Arc::new(InMemoryDocumentStore::new());
+        let app = build_router(&HostOptions::default(), store);
         let resp = app
             .oneshot(Request::builder().uri("/dbs").body(Body::empty()).unwrap())
             .await

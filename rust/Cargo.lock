@@ -300,6 +300,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cosmos-core",
  "cosmos-host",
  "tokio",
  "tracing",

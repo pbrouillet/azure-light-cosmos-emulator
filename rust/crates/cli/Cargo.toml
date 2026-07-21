@@ -12,6 +12,7 @@ name = "cosmos-emulator"
 path = "src/main.rs"
 
 [dependencies]
+cosmos-core.workspace = true
 cosmos-host.workspace = true
 clap.workspace = true
 tokio.workspace = true

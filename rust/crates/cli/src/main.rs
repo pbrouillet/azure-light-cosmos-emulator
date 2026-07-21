@@ -63,6 +63,16 @@ enum Storage {
     InMemory,
 }
 
+impl From<Storage> for cosmos_core::StorageType {
+    fn from(value: Storage) -> Self {
+        match value {
+            Storage::Sqlite => cosmos_core::StorageType::Sqlite,
+            Storage::SurrealDb => cosmos_core::StorageType::SurrealDb,
+            Storage::InMemory => cosmos_core::StorageType::InMemory,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt()
@@ -74,12 +84,18 @@ async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
     match cli.command {
         Command::Start {
-            storage: _,
-            data_dir: _,
+            storage,
+            data_dir,
             port,
             explorer_dir,
         } => {
-            cosmos_host::run(HostOptions { port, explorer_dir }).await?;
+            cosmos_host::run(HostOptions {
+                port,
+                storage: storage.into(),
+                data_dir,
+                explorer_dir,
+            })
+            .await?;
         }
         Command::Stop => println!("stop: not yet implemented"),
         Command::Reset => println!("reset: not yet implemented"),
