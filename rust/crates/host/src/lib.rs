@@ -14,7 +14,7 @@ use cosmos_core::traits::{DocumentStore, VectorIndexProvider};
 use cosmos_core::StorageType;
 use cosmos_nosql::AppState;
 use cosmos_storage::{
-    FlatVectorIndexProvider, InMemoryDocumentStore, SqliteDocumentStore,
+    FlatVectorIndexProvider, InMemoryDocumentStore, SqliteDocumentStore, SurrealDbDocumentStore,
     VectorIndexingDocumentStore,
 };
 use serde_json::json;
@@ -48,7 +48,7 @@ impl Default for HostOptions {
 /// Constructs the storage backend selected by [`HostOptions`], wrapped in the
 /// vector-indexing decorator (mirroring the .NET DI composition:
 /// concrete store → vector index provider → `VectorIndexingDocumentStore`).
-pub fn build_store(opts: &HostOptions) -> Result<Arc<dyn DocumentStore>, anyhow::Error> {
+pub async fn build_store(opts: &HostOptions) -> Result<Arc<dyn DocumentStore>, anyhow::Error> {
     let inner: Arc<dyn DocumentStore> = match opts.storage {
         StorageType::InMemory => Arc::new(InMemoryDocumentStore::new()),
         StorageType::Sqlite => {
@@ -59,9 +59,11 @@ pub fn build_store(opts: &HostOptions) -> Result<Arc<dyn DocumentStore>, anyhow:
             Arc::new(SqliteDocumentStore::open(dir)?)
         }
         StorageType::SurrealDb => {
-            anyhow::bail!(
-                "The SurrealDb backend is not yet ported; use --storage sqlite or in-memory."
-            )
+            let dir = opts
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("./cosmos-data"));
+            Arc::new(SurrealDbDocumentStore::open(dir).await?)
         }
     };
     let index = Arc::new(FlatVectorIndexProvider::new(
@@ -97,7 +99,7 @@ async fn health() -> Json<serde_json::Value> {
 
 /// Boots the host and serves until shutdown.
 pub async fn run(opts: HostOptions) -> Result<(), anyhow::Error> {
-    let store = build_store(&opts)?;
+    let store = build_store(&opts).await?;
     let app = build_router(&opts, store);
     let addr = SocketAddr::from(([0, 0, 0, 0], opts.port));
     tracing::info!(

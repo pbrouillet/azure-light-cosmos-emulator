@@ -8,9 +8,11 @@ pub mod changefeed;
 pub mod common;
 pub mod inmemory;
 pub mod sqlite;
+pub mod surreal;
 pub mod vector;
 
 pub use changefeed::{InMemoryChangeFeedProvider, InMemoryChangeLog, SqliteChangeFeedProvider};
 pub use inmemory::InMemoryDocumentStore;
 pub use sqlite::SqliteDocumentStore;
+pub use surreal::{SurrealDbChangeFeedProvider, SurrealDbDocumentStore};
 pub use vector::{FlatVectorIndexProvider, VectorIndexingDocumentStore};

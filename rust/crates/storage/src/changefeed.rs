@@ -33,7 +33,7 @@ fn feed_key(database_id: &str, container_id: &str) -> String {
 /// Applies the shared post-fetch filtering (`start_lsn`, partition key,
 /// full-fidelity, max item count) over an ordered slice of change items,
 /// returning the page and the last LSN to use as the next continuation token.
-fn page_items(
+pub(crate) fn page_items(
     items: &[ChangeFeedItem],
     start_lsn: i64,
     options: &ChangeFeedOptions,

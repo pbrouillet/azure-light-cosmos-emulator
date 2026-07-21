@@ -18,6 +18,5 @@ tokio.workspace = true
 tracing.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono.workspace = true
-# Future backends (add as each is ported):
-#   surrealdb         -> SurrealDb (RocksDB) backend
-#   instant-distance  -> HNSW vector index
+base64.workspace = true
+surrealdb = { version = "2", features = ["kv-surrealkv"] }
