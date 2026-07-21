@@ -9,10 +9,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{routing::get, Json, Router};
-use cosmos_core::traits::DocumentStore;
+use cosmos_core::models::VectorIndexOptions;
+use cosmos_core::traits::{DocumentStore, VectorIndexProvider};
 use cosmos_core::StorageType;
 use cosmos_nosql::AppState;
-use cosmos_storage::{InMemoryDocumentStore, SqliteDocumentStore};
+use cosmos_storage::{
+    FlatVectorIndexProvider, InMemoryDocumentStore, SqliteDocumentStore,
+    VectorIndexingDocumentStore,
+};
 use serde_json::json;
 
 /// Default NoSQL REST API port, matching the .NET emulator.
@@ -41,9 +45,11 @@ impl Default for HostOptions {
     }
 }
 
-/// Constructs the storage backend selected by [`HostOptions`].
+/// Constructs the storage backend selected by [`HostOptions`], wrapped in the
+/// vector-indexing decorator (mirroring the .NET DI composition:
+/// concrete store → vector index provider → `VectorIndexingDocumentStore`).
 pub fn build_store(opts: &HostOptions) -> Result<Arc<dyn DocumentStore>, anyhow::Error> {
-    let store: Arc<dyn DocumentStore> = match opts.storage {
+    let inner: Arc<dyn DocumentStore> = match opts.storage {
         StorageType::InMemory => Arc::new(InMemoryDocumentStore::new()),
         StorageType::Sqlite => {
             let dir = opts
@@ -58,6 +64,14 @@ pub fn build_store(opts: &HostOptions) -> Result<Arc<dyn DocumentStore>, anyhow:
             )
         }
     };
+    let index = Arc::new(FlatVectorIndexProvider::new(
+        inner.clone(),
+        VectorIndexOptions::default(),
+    ));
+    let store: Arc<dyn DocumentStore> = Arc::new(VectorIndexingDocumentStore::new(
+        inner,
+        index as Arc<dyn VectorIndexProvider>,
+    ));
     Ok(store)
 }
 

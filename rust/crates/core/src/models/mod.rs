@@ -9,6 +9,7 @@ pub mod patch;
 pub mod policies;
 pub mod programmability;
 pub mod resources;
+pub mod vector;
 
 pub use batch::{BatchOperationRequest, BatchOperationResponse, BatchOperationType};
 pub use change_feed::{ChangeFeedItem, ChangeType};
@@ -26,4 +27,7 @@ pub use programmability::{
 pub use resources::{
     CosmosContainer, CosmosDatabase, CosmosDocument, CosmosOffer, CosmosPermission, CosmosUser,
     JsonObject, OfferContent, PermissionMode,
+};
+pub use vector::{
+    vector_math, VectorDistanceFunction, VectorHit, VectorIndexOptions, VectorSearchRequest,
 };

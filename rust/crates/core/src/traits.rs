@@ -329,3 +329,45 @@ pub trait ProgrammabilityEngine: Send + Sync {
         container_id: &str,
     ) -> CosmosResult<FeedResponse<UserDefinedFunction>>;
 }
+
+/// Vector index provider. Ports `IVectorIndexProvider`. Maintenance hooks
+/// (`on_upsert`, `on_delete`, `on_container_cleared`, `on_container_dropped`)
+/// are synchronous and invoked by the storage layer as documents change.
+#[async_trait]
+pub trait VectorIndexProvider: Send + Sync {
+    /// Whether index-accelerated vector search is enabled.
+    fn is_enabled(&self) -> bool;
+
+    /// Ensures a vector index shard exists for the given container path, building
+    /// it from existing documents on first use. Returns `false` when indexing is
+    /// disabled or the path cannot be indexed.
+    async fn ensure_index(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        path: &str,
+        index_type: &str,
+        distance_function: VectorDistanceFunction,
+    ) -> CosmosResult<bool>;
+
+    /// Returns the nearest neighbours for the request, ordered nearest-first.
+    async fn search(&self, request: VectorSearchRequest) -> CosmosResult<Vec<VectorHit>>;
+
+    /// Records a document insert/update in all shards for its container.
+    fn on_upsert(&self, database_id: &str, container_id: &str, document: &CosmosDocument);
+
+    /// Records a document deletion in all shards for its container.
+    fn on_delete(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        document_id: &str,
+        partition_key: &PartitionKeyValue,
+    );
+
+    /// Clears all shard contents for a container (e.g. after emptying it).
+    fn on_container_cleared(&self, database_id: &str, container_id: &str);
+
+    /// Drops all shards for a container (e.g. after deleting it).
+    fn on_container_dropped(&self, database_id: &str, container_id: &str);
+}
