@@ -14,4 +14,10 @@ serde_json.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-# Future: tokio-cron-scheduler for scheduling; boa_engine/rquickjs for JS.
+tokio.workspace = true
+chrono.workspace = true
+boa_engine = "0.20"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+cosmos-query.workspace = true

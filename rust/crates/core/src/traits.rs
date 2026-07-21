@@ -291,11 +291,29 @@ pub trait ProgrammabilityEngine: Send + Sync {
         container_id: &str,
         sproc: StoredProcedure,
     ) -> CosmosResult<StoredProcedure>;
+    async fn get_stored_procedure(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        sproc_id: &str,
+    ) -> CosmosResult<StoredProcedure>;
     async fn list_stored_procedures(
         &self,
         database_id: &str,
         container_id: &str,
     ) -> CosmosResult<FeedResponse<StoredProcedure>>;
+    async fn replace_stored_procedure(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        sproc: StoredProcedure,
+    ) -> CosmosResult<StoredProcedure>;
+    async fn delete_stored_procedure(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        sproc_id: &str,
+    ) -> CosmosResult<()>;
     async fn execute_stored_procedure(
         &self,
         database_id: &str,
@@ -311,11 +329,29 @@ pub trait ProgrammabilityEngine: Send + Sync {
         container_id: &str,
         trigger: Trigger,
     ) -> CosmosResult<Trigger>;
+    async fn get_trigger(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        trigger_id: &str,
+    ) -> CosmosResult<Trigger>;
     async fn list_triggers(
         &self,
         database_id: &str,
         container_id: &str,
     ) -> CosmosResult<FeedResponse<Trigger>>;
+    async fn replace_trigger(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        trigger: Trigger,
+    ) -> CosmosResult<Trigger>;
+    async fn delete_trigger(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        trigger_id: &str,
+    ) -> CosmosResult<()>;
 
     async fn create_udf(
         &self,
@@ -323,11 +359,29 @@ pub trait ProgrammabilityEngine: Send + Sync {
         container_id: &str,
         udf: UserDefinedFunction,
     ) -> CosmosResult<UserDefinedFunction>;
+    async fn get_udf(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        udf_id: &str,
+    ) -> CosmosResult<UserDefinedFunction>;
     async fn list_udfs(
         &self,
         database_id: &str,
         container_id: &str,
     ) -> CosmosResult<FeedResponse<UserDefinedFunction>>;
+    async fn replace_udf(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        udf: UserDefinedFunction,
+    ) -> CosmosResult<UserDefinedFunction>;
+    async fn delete_udf(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        udf_id: &str,
+    ) -> CosmosResult<()>;
 }
 
 /// Vector index provider. Ports `IVectorIndexProvider`. Maintenance hooks

@@ -60,7 +60,72 @@ pub struct UserDefinedFunction {
     pub body: String,
 }
 
+impl TriggerType {
+    pub fn as_int(self) -> i32 {
+        match self {
+            TriggerType::Pre => 0,
+            TriggerType::Post => 1,
+        }
+    }
+}
+
+impl TriggerOperation {
+    pub fn as_int(self) -> i32 {
+        match self {
+            TriggerOperation::All => 0,
+            TriggerOperation::Create => 1,
+            TriggerOperation::Replace => 2,
+            TriggerOperation::Delete => 3,
+        }
+    }
+}
+
 impl StoredProcedure {
+    pub fn new(
+        database_id: impl Into<String>,
+        container_id: impl Into<String>,
+        id: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            rid: resource_id(),
+            self_link: String::new(),
+            etag: etag(),
+            timestamp: now_ts(),
+            database_id: database_id.into(),
+            container_id: container_id.into(),
+            body: body.into(),
+        }
+    }
+}
+
+impl Trigger {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        database_id: impl Into<String>,
+        container_id: impl Into<String>,
+        id: impl Into<String>,
+        body: impl Into<String>,
+        trigger_type: TriggerType,
+        trigger_operation: TriggerOperation,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            rid: resource_id(),
+            self_link: String::new(),
+            etag: etag(),
+            timestamp: now_ts(),
+            database_id: database_id.into(),
+            container_id: container_id.into(),
+            body: body.into(),
+            trigger_type,
+            trigger_operation,
+        }
+    }
+}
+
+impl UserDefinedFunction {
     pub fn new(
         database_id: impl Into<String>,
         container_id: impl Into<String>,
