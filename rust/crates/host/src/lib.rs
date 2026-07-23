@@ -2,7 +2,10 @@
 //! services, builds the middleware pipeline, and serves the Explorer SPA.
 //!
 //! The Explorer React app is NOT ported — its committed build (`wwwroot/explorer/`)
-//! is served statically under `/explorer` via `tower-http`'s `ServeDir`.
+//! is embedded into the host binary via [`rust_embed`] and served under
+//! `/explorer` with an SPA fallback (parity with the .NET
+//! `ManifestEmbeddedFileProvider`). An explicit `--explorer-dir` overrides this
+//! to serve from a physical directory.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,6 +26,7 @@ use cosmos_storage::{
 use serde_json::json;
 
 mod admin;
+mod explorer;
 mod info;
 mod maintenance;
 mod monitoring;
@@ -181,7 +185,12 @@ pub fn build_router(opts: &HostOptions, store: Arc<dyn DocumentStore>) -> Router
         .merge(cosmos_nosql::router(state));
 
     if let Some(dir) = &opts.explorer_dir {
+        // Explicit override: serve the SPA from a physical directory.
         app = app.nest_service("/explorer", tower_http::services::ServeDir::new(dir));
+    } else if explorer::is_available() {
+        // Default: serve the Explorer SPA embedded in the binary (parity with
+        // the .NET host's ManifestEmbeddedFileProvider).
+        app = app.merge(explorer::router());
     }
 
     if opts.enable_throughput_enforcement {
@@ -227,6 +236,13 @@ pub async fn run(opts: HostOptions) -> Result<(), anyhow::Error> {
         opts.port,
         opts.storage
     );
+    if opts.explorer_dir.is_none() && explorer::is_available() {
+        tracing::info!(
+            "Explorer: {}://localhost:{}/explorer (embedded)",
+            if opts.enable_ssl { "https" } else { "http" },
+            opts.port
+        );
+    }
     if opts.enable_ssl {
         let config = tls_config(&opts).await?;
         axum_server::bind_rustls(addr, config)

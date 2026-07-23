@@ -30,6 +30,8 @@ rcgen.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

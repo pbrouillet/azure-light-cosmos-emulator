@@ -31,6 +31,10 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 hyper = "1"
 
+# Embedded static assets (Explorer SPA embedded into the host binary)
+rust-embed = "8"
+mime_guess = "2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
