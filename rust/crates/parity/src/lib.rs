@@ -46,10 +46,16 @@ impl ParityHarness {
         let master_key = MasterKeyAuthProvider::generate_master_key();
         let opts = HostOptions {
             port: 0,
+            mongo_port: None,
+            enable_ssl: false,
             storage: StorageType::InMemory,
             data_dir: None,
             explorer_dir: None,
             master_key: Some(master_key.clone()),
+            enable_entra: false,
+            enable_throughput_enforcement: false,
+            enable_maintenance: false,
+            enable_request_tracking: false,
             consistency: ConsistencyLevel::Session,
         };
 

@@ -9,6 +9,7 @@ description = "Trigger scheduling and JavaScript execution (sprocs/triggers/UDFs
 
 [dependencies]
 cosmos-core.workspace = true
+cosmos-query.workspace = true
 cosmos-storage.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
@@ -20,4 +21,3 @@ boa_engine = "0.20"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-cosmos-query.workspace = true

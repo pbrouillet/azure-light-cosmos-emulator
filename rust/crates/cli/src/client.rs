@@ -26,7 +26,7 @@ async fn send(
     body: Option<&Value>,
     extra_headers: &[(&str, &str)],
 ) -> Result<Response> {
-    let client = Client::new();
+    let client = http_client(state)?;
     let url = format!("{}/{}", state.endpoint().trim_end_matches('/'), path);
     let date = http_date();
     let auth = MasterKeyAuthProvider::new(state.master_key.clone());
@@ -248,8 +248,19 @@ async fn create_if_missing(
 /// Checks whether the emulator's `/health` endpoint responds successfully.
 pub async fn is_endpoint_healthy(state: &EmulatorInstanceState) -> bool {
     let url = format!("{}/health", state.endpoint().trim_end_matches('/'));
-    match Client::new().get(&url).send().await {
+    let Ok(client) = http_client(state) else {
+        return false;
+    };
+    match client.get(&url).send().await {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
+}
+
+fn http_client(state: &EmulatorInstanceState) -> Result<Client> {
+    let mut builder = Client::builder();
+    if state.enable_ssl {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    Ok(builder.build()?)
 }

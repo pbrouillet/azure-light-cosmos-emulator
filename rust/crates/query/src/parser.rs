@@ -69,8 +69,13 @@ impl Parser {
 
         // FROM (optional; default alias is `c`).
         let mut from_alias = "c".to_string();
+        let mut from_in = None;
+        let mut joins = Vec::new();
         if self.eat_keyword("FROM") {
-            from_alias = self.parse_from()?;
+            let parsed_from = self.parse_from()?;
+            from_alias = parsed_from.0;
+            from_in = parsed_from.1;
+            joins = parsed_from.2;
         }
 
         let where_clause = if self.eat_keyword("WHERE") {
@@ -78,6 +83,20 @@ impl Parser {
         } else {
             None
         };
+
+        let mut group_by = Vec::new();
+        if self.eat_keyword("GROUP") {
+            if !self.eat_keyword("BY") {
+                return Err("Expected BY after GROUP".into());
+            }
+            loop {
+                group_by.push(self.parse_expr()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+        }
 
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
@@ -117,7 +136,10 @@ impl Parser {
             top,
             projection,
             from_alias,
+            from_in,
+            joins,
             where_clause,
+            group_by,
             order_by,
             offset,
             limit,
@@ -162,48 +184,37 @@ impl Parser {
         }
     }
 
-    fn parse_from(&mut self) -> Result<String, String> {
-        // Supports `FROM c`, `FROM root c`, `FROM c IN root` (aliasing only;
-        // subquery/JOIN sources are not yet supported).
+    fn parse_from(&mut self) -> Result<(String, Option<Expr>, Vec<JoinClause>), String> {
+        // Supports `FROM c`, `FROM root c`, `FROM alias IN source`, and
+        // Cosmos self joins: `JOIN alias IN arrayExpr`.
         let first = match self.next() {
             Token::Ident(name) => name,
             other => return Err(format!("Expected FROM source, found {other:?}")),
         };
+        let mut from_alias = first;
+        let mut from_in = None;
         if self.is_keyword("IN") {
             self.next();
-            // `FROM alias IN source` — bind alias; ignore source path for now.
-            self.parse_postfix_after_identifier_skip()?;
-            return Ok(first);
-        }
-        // Optional alias: `FROM root c`.
-        if let Token::Ident(alias) = self.peek().clone() {
+            from_in = Some(self.parse_expr()?);
+        } else if let Token::Ident(alias) = self.peek().clone() {
+            // Optional alias: `FROM root c`.
             self.next();
-            return Ok(alias);
+            from_alias = alias;
         }
-        Ok(first)
-    }
 
-    fn parse_postfix_after_identifier_skip(&mut self) -> Result<(), String> {
-        // Consume a path like `c.items` used as an IN source; value ignored.
-        match self.next() {
-            Token::Ident(_) => {}
-            other => return Err(format!("Expected source path, found {other:?}")),
-        }
-        loop {
-            match self.peek() {
-                Token::Dot => {
-                    self.next();
-                    self.next();
-                }
-                Token::LBracket => {
-                    self.next();
-                    let _ = self.parse_expr()?;
-                    self.expect(Token::RBracket)?;
-                }
-                _ => break,
+        let mut joins = Vec::new();
+        while self.eat_keyword("JOIN") {
+            let alias = match self.next() {
+                Token::Ident(name) => name,
+                other => return Err(format!("JOIN requires an alias, found {other:?}")),
+            };
+            if !self.eat_keyword("IN") {
+                return Err("JOIN must use the 'IN' syntax".into());
             }
+            let source = self.parse_expr()?;
+            joins.push(JoinClause { alias, source });
         }
-        Ok(())
+        Ok((from_alias, from_in, joins))
     }
 
     // ---- expression precedence climbing ----
@@ -372,6 +383,23 @@ impl Parser {
                     self.expect(Token::RBracket)?;
                     expr = Expr::Index(Box::new(expr), Box::new(idx));
                 }
+                Token::LParen => {
+                    let name = call_name(&expr)
+                        .ok_or_else(|| "Only identifiers can be called as functions".to_string())?;
+                    self.next();
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), Token::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if !matches!(self.peek(), Token::Comma) {
+                                break;
+                            }
+                            self.next();
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    expr = Expr::Call { name, args };
+                }
                 _ => break,
             }
         }
@@ -387,6 +415,11 @@ impl Parser {
             Token::Keyword(k) if k == "TRUE" => Ok(Expr::Lit(Value::Bool(true))),
             Token::Keyword(k) if k == "FALSE" => Ok(Expr::Lit(Value::Bool(false))),
             Token::LParen => {
+                if self.is_keyword("SELECT") {
+                    let stmt = self.parse_select()?;
+                    self.expect(Token::RParen)?;
+                    return Ok(Expr::Subquery(Box::new(stmt)));
+                }
                 let e = self.parse_expr()?;
                 self.expect(Token::RParen)?;
                 Ok(e)
@@ -446,7 +479,16 @@ impl Parser {
                     Ok(Expr::Identifier(name))
                 }
             }
+            Token::Star => Ok(Expr::Star),
             other => Err(format!("Unexpected token in expression: {other:?}")),
         }
+    }
+}
+
+fn call_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(name) => Some(name.clone()),
+        Expr::Member(base, name) => call_name(base).map(|prefix| format!("{prefix}.{name}")),
+        _ => None,
     }
 }

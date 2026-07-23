@@ -14,6 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use cosmos_core::models::headers as h;
+use cosmos_core::models::programmability::TriggerOperation;
 use cosmos_core::models::{JsonObject, PartitionKeyValue, PatchOperation};
 use cosmos_core::traits::QueryOptions;
 use serde_json::{json, Value};
@@ -47,12 +48,33 @@ async fn create(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<Response, ApiError> {
-    let (obj, request_len) = parse_body_object(body)?;
+    let (mut obj, _) = parse_body_object(body)?;
+    let pre_triggers = trigger_ids(headers, h::PRE_TRIGGER_INCLUDE);
+    let post_triggers = trigger_ids(headers, h::POST_TRIGGER_INCLUDE);
+    if !pre_triggers.is_empty() {
+        obj = state
+            .programmability
+            .execute_pre_triggers(db_id, coll_id, obj, TriggerOperation::Create, &pre_triggers)
+            .await?;
+    }
+    let request_len = json_len(&obj);
     let is_indexed = parse_indexing_directive(headers);
     let doc = state
         .store
         .create_document(db_id, coll_id, obj, is_indexed)
         .await?;
+    if !post_triggers.is_empty() {
+        state
+            .programmability
+            .execute_post_triggers(
+                db_id,
+                coll_id,
+                doc.to_response_body(),
+                TriggerOperation::Create,
+                &post_triggers,
+            )
+            .await?;
+    }
     let options = doc_write_options(db_id, coll_id, ru::create(request_len), doc.lsn, &doc.etag);
     Ok(json_response(state, StatusCode::CREATED, options, doc_body(&doc)).await)
 }
@@ -64,13 +86,33 @@ async fn upsert(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<Response, ApiError> {
-    let (obj, _) = parse_body_object(body)?;
+    let (mut obj, _) = parse_body_object(body)?;
+    let pre_triggers = trigger_ids(headers, h::PRE_TRIGGER_INCLUDE);
+    let post_triggers = trigger_ids(headers, h::POST_TRIGGER_INCLUDE);
+    if !pre_triggers.is_empty() {
+        obj = state
+            .programmability
+            .execute_pre_triggers(db_id, coll_id, obj, TriggerOperation::Create, &pre_triggers)
+            .await?;
+    }
     let is_indexed = parse_indexing_directive(headers);
     let charge = ru::upsert(json_len(&obj));
     let doc = state
         .store
         .upsert_document(db_id, coll_id, obj, is_indexed)
         .await?;
+    if !post_triggers.is_empty() {
+        state
+            .programmability
+            .execute_post_triggers(
+                db_id,
+                coll_id,
+                doc.to_response_body(),
+                TriggerOperation::Create,
+                &post_triggers,
+            )
+            .await?;
+    }
     let options = doc_write_options(db_id, coll_id, charge, doc.lsn, &doc.etag);
     Ok(json_response(state, StatusCode::OK, options, doc_body(&doc)).await)
 }
@@ -104,7 +146,21 @@ pub async fn replace(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (obj, _) = parse_body_object(&body)?;
+    let (mut obj, _) = parse_body_object(&body)?;
+    let pre_triggers = trigger_ids(&headers, h::PRE_TRIGGER_INCLUDE);
+    let post_triggers = trigger_ids(&headers, h::POST_TRIGGER_INCLUDE);
+    if !pre_triggers.is_empty() {
+        obj = state
+            .programmability
+            .execute_pre_triggers(
+                &db_id,
+                &coll_id,
+                obj,
+                TriggerOperation::Replace,
+                &pre_triggers,
+            )
+            .await?;
+    }
     let if_match = header_str(&headers, h::IF_MATCH);
     let is_indexed = parse_indexing_directive(&headers);
     let charge = ru::replace(json_len(&obj));
@@ -119,6 +175,18 @@ pub async fn replace(
             is_indexed,
         )
         .await?;
+    if !post_triggers.is_empty() {
+        state
+            .programmability
+            .execute_post_triggers(
+                &db_id,
+                &coll_id,
+                doc.to_response_body(),
+                TriggerOperation::Replace,
+                &post_triggers,
+            )
+            .await?;
+    }
     let options = doc_write_options(&db_id, &coll_id, charge, doc.lsn, &doc.etag);
     Ok(json_response(&state, StatusCode::OK, options, doc_body(&doc)).await)
 }
@@ -130,10 +198,52 @@ pub async fn delete(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let pk = require_partition_key(&headers)?;
+    let pre_triggers = trigger_ids(&headers, h::PRE_TRIGGER_INCLUDE);
+    let post_triggers = trigger_ids(&headers, h::POST_TRIGGER_INCLUDE);
+    let existing_doc = if pre_triggers.is_empty() && post_triggers.is_empty() {
+        None
+    } else {
+        Some(
+            state
+                .store
+                .read_document(&db_id, &coll_id, &doc_id, &pk)
+                .await?,
+        )
+    };
+    if !pre_triggers.is_empty() {
+        state
+            .programmability
+            .execute_pre_triggers(
+                &db_id,
+                &coll_id,
+                existing_doc
+                    .as_ref()
+                    .expect("existing document loaded for triggers")
+                    .to_response_body(),
+                TriggerOperation::Delete,
+                &pre_triggers,
+            )
+            .await?;
+    }
     state
         .store
         .delete_document(&db_id, &coll_id, &doc_id, &pk)
         .await?;
+    if !post_triggers.is_empty() {
+        state
+            .programmability
+            .execute_post_triggers(
+                &db_id,
+                &coll_id,
+                existing_doc
+                    .as_ref()
+                    .expect("existing document loaded for triggers")
+                    .to_response_body(),
+                TriggerOperation::Delete,
+                &post_triggers,
+            )
+            .await?;
+    }
     let session_lsn = state.store.get_global_lsn().await.unwrap_or(0);
     let options = HeaderOptions {
         request_charge: ru::delete(),
@@ -382,6 +492,19 @@ fn header_is_true(headers: &HeaderMap, name: &str) -> bool {
     header_str(headers, name)
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn trigger_ids(headers: &HeaderMap, name: &str) -> Vec<String> {
+    header_str(headers, name)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_indexing_directive(headers: &HeaderMap) -> Option<bool> {

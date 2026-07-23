@@ -7,12 +7,25 @@
 pub mod changefeed;
 pub mod common;
 pub mod inmemory;
+pub mod programmability;
 pub mod sqlite;
 pub mod surreal;
 pub mod vector;
 
 pub use changefeed::{InMemoryChangeFeedProvider, InMemoryChangeLog, SqliteChangeFeedProvider};
-pub use inmemory::InMemoryDocumentStore;
-pub use sqlite::SqliteDocumentStore;
-pub use surreal::{SurrealDbChangeFeedProvider, SurrealDbDocumentStore};
-pub use vector::{FlatVectorIndexProvider, VectorIndexingDocumentStore};
+pub use inmemory::{
+    InMemoryActivityStore, InMemoryDocumentStore, InMemoryProgrammabilityRecordStore,
+    InMemoryQueryTelemetryStore,
+};
+pub use programmability::{
+    make_record_key, ProgrammabilityRecord, ProgrammabilityRecordStore, ProgrammabilityTable,
+};
+pub use sqlite::{
+    SqliteActivityStore, SqliteDocumentStore, SqliteProgrammabilityRecordStore,
+    SqliteQueryTelemetryStore,
+};
+pub use surreal::{
+    SurrealDbActivityStore, SurrealDbChangeFeedProvider, SurrealDbDocumentStore,
+    SurrealDbProgrammabilityRecordStore, SurrealDbQueryTelemetryStore,
+};
+pub use vector::{FlatVectorIndexProvider, HnswVectorIndexProvider, VectorIndexingDocumentStore};

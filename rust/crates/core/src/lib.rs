@@ -2,7 +2,8 @@
 //!
 //! Ports the .NET `Azure.Cosmos.LightEmulator.Core` project: domain models
 //! (databases, containers, documents, headers, consistency, vector/spatial) and
-//! the core traits (`DocumentStore`, `QueryEngine`, `AuthProvider`,
+//! the core traits (`DocumentStore`, `QueryEngine`, `ActivityStore`,
+//! `QueryTelemetryStore`, `EmulatorInfoService`, `AuthProvider`,
 //! `ChangeFeedProvider`, `ConsistencyManager`, `ProgrammabilityEngine`).
 //!
 //! This is a pure library with no external service dependencies, mirroring the

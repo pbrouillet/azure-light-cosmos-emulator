@@ -12,6 +12,7 @@ cosmos-core.workspace = true
 cosmos-storage.workspace = true
 cosmos-auth.workspace = true
 cosmos-query.workspace = true
+cosmos-triggers.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true

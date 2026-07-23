@@ -39,6 +39,8 @@ pub enum Expr {
     Lit(Value),
     /// An `@parameter` reference (key includes the leading `@`).
     Param(String),
+    /// `*` when used as a function argument (`COUNT(*)`).
+    Star,
     /// A bare identifier (typically the FROM alias / root document).
     Identifier(String),
     /// Property access (`base.name`).
@@ -65,10 +67,19 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// A scalar subquery: `(SELECT ...)`.
+    Subquery(Box<SelectStmt>),
     /// An array literal `[a, b, ...]`.
     Array(Vec<Expr>),
     /// An object literal `{ "k": v, ... }`.
     Object(Vec<(String, Expr)>),
+}
+
+/// `JOIN alias IN source`.
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub alias: String,
+    pub source: Expr,
 }
 
 /// A single `SELECT` output item.
@@ -97,7 +108,14 @@ pub struct SelectStmt {
     pub projection: Projection,
     /// Root alias bound to each document (defaults to `c` / the FROM source).
     pub from_alias: String,
+    /// Optional `FROM alias IN <expr>` array source. For top-level queries the
+    /// expression is evaluated against each root document; inside scalar
+    /// subqueries it can also reference outer aliases.
+    pub from_in: Option<Expr>,
+    /// Cosmos intra-document self-joins over array expressions.
+    pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
+    pub group_by: Vec<Expr>,
     /// Sort keys with a descending flag.
     pub order_by: Vec<(Expr, bool)>,
     pub offset: Option<Expr>,

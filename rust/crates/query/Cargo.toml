@@ -14,5 +14,6 @@ serde_json.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 # Future: chumsky/nom/pest for the hand-rolled SQL & KQL parsers;
 #         geo/geojson for spatial; the vector index lives in cosmos-storage.

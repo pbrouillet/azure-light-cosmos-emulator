@@ -12,14 +12,18 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
 use cosmos_core::error::{CosmosError, CosmosResult};
 use cosmos_core::ids::etag;
 use cosmos_core::models::*;
-use cosmos_core::traits::DocumentStore;
+use cosmos_core::traits::{ActivityStore, DocumentStore, QueryTelemetryStore};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::changefeed::SqliteChangeFeedProvider;
 use crate::common::{apply_patch, extract_partition_key, require_id, serialize_partition_key};
+use crate::programmability::{
+    ProgrammabilityRecord, ProgrammabilityRecordStore, ProgrammabilityTable,
+};
 
 const GLOBAL_LSN_KEY: &str = "global_lsn";
 
@@ -108,6 +112,65 @@ CREATE TABLE IF NOT EXISTS changefeed (
     timestamp TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_changefeed_lsn ON changefeed (database_id, container_id, lsn);
+CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    method TEXT,
+    path TEXT,
+    status_code INTEGER,
+    request_charge REAL,
+    latency_ms REAL,
+    database_id TEXT,
+    container_id TEXT
+);
+CREATE TABLE IF NOT EXISTS query_telemetry (
+    id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    database_id TEXT,
+    container_id TEXT,
+    sql_text TEXT,
+    partition_key TEXT,
+    consistency_level TEXT,
+    request_charge REAL,
+    latency_ms INTEGER,
+    item_count INTEGER,
+    status_code INTEGER,
+    activity_id TEXT,
+    is_cross_partition INTEGER,
+    query_plan TEXT
+);
+CREATE TABLE IF NOT EXISTS cosmos_sprocs (
+    record_key TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
+    databaseId TEXT NOT NULL,
+    containerId TEXT NOT NULL,
+    rid TEXT NOT NULL,
+    eTag TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    body TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cosmos_triggers (
+    record_key TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
+    databaseId TEXT NOT NULL,
+    containerId TEXT NOT NULL,
+    rid TEXT NOT NULL,
+    eTag TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    triggerType INTEGER NOT NULL,
+    triggerOperation INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cosmos_udfs (
+    record_key TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
+    databaseId TEXT NOT NULL,
+    containerId TEXT NOT NULL,
+    rid TEXT NOT NULL,
+    eTag TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    body TEXT NOT NULL
+);
 "#;
 
 /// SQLite (persistent) document store.
@@ -151,6 +214,138 @@ impl SqliteDocumentStore {
     /// reads the same `changefeed` table this store writes to.
     pub fn change_feed(&self) -> SqliteChangeFeedProvider {
         SqliteChangeFeedProvider::new(Arc::clone(&self.conn))
+    }
+
+    /// Returns an activity store sharing this store's connection.
+    pub fn activity_store(&self) -> SqliteActivityStore {
+        SqliteActivityStore::from_shared(Arc::clone(&self.conn))
+    }
+
+    /// Returns a query telemetry store sharing this store's connection.
+    pub fn query_telemetry_store(&self) -> SqliteQueryTelemetryStore {
+        SqliteQueryTelemetryStore::from_shared(Arc::clone(&self.conn))
+    }
+
+    /// Returns a programmability record store sharing this SQLite connection.
+    pub fn programmability_store(&self) -> SqliteProgrammabilityRecordStore {
+        SqliteProgrammabilityRecordStore::from_shared(Arc::clone(&self.conn))
+    }
+}
+
+/// SQLite-backed programmability record store.
+pub struct SqliteProgrammabilityRecordStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteProgrammabilityRecordStore {
+    pub fn open(data_dir: impl AsRef<Path>) -> CosmosResult<Self> {
+        let dir = data_dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CosmosError::internal_server_error(e.to_string()))?;
+        let path = dir.join("emulator.db");
+        let conn = Connection::open(path).map_err(sqlite_err)?;
+        Self::from_connection(conn)
+    }
+
+    pub fn in_memory() -> CosmosResult<Self> {
+        Self::from_connection(Connection::open_in_memory().map_err(sqlite_err)?)
+    }
+
+    pub(crate) fn from_shared(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    fn from_connection(conn: Connection) -> CosmosResult<Self> {
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(sqlite_err)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(sqlite_err)?;
+        conn.execute_batch(SCHEMA).map_err(sqlite_err)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("sqlite mutex poisoned")
+    }
+}
+
+/// SQLite-backed activity log store.
+pub struct SqliteActivityStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteActivityStore {
+    pub fn open(data_dir: impl AsRef<Path>) -> CosmosResult<Self> {
+        let dir = data_dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CosmosError::internal_server_error(e.to_string()))?;
+        let path = dir.join("emulator.db");
+        let conn = Connection::open(path).map_err(sqlite_err)?;
+        Self::from_connection(conn)
+    }
+
+    pub fn in_memory() -> CosmosResult<Self> {
+        Self::from_connection(Connection::open_in_memory().map_err(sqlite_err)?)
+    }
+
+    pub(crate) fn from_shared(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    fn from_connection(conn: Connection) -> CosmosResult<Self> {
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(sqlite_err)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(sqlite_err)?;
+        conn.execute_batch(SCHEMA).map_err(sqlite_err)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("sqlite mutex poisoned")
+    }
+}
+
+/// SQLite-backed query telemetry store.
+pub struct SqliteQueryTelemetryStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteQueryTelemetryStore {
+    pub fn open(data_dir: impl AsRef<Path>) -> CosmosResult<Self> {
+        let dir = data_dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CosmosError::internal_server_error(e.to_string()))?;
+        let path = dir.join("emulator.db");
+        let conn = Connection::open(path).map_err(sqlite_err)?;
+        Self::from_connection(conn)
+    }
+
+    pub fn in_memory() -> CosmosResult<Self> {
+        Self::from_connection(Connection::open_in_memory().map_err(sqlite_err)?)
+    }
+
+    pub(crate) fn from_shared(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    fn from_connection(conn: Connection) -> CosmosResult<Self> {
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(sqlite_err)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(sqlite_err)?;
+        conn.execute_batch(SCHEMA).map_err(sqlite_err)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("sqlite mutex poisoned")
     }
 }
 
@@ -373,6 +568,79 @@ fn row_to_offer(row: &Row) -> rusqlite::Result<CosmosOffer> {
     })
 }
 
+fn row_to_programmability_record(
+    table: ProgrammabilityTable,
+    row: &Row,
+) -> rusqlite::Result<ProgrammabilityRecord> {
+    match table {
+        ProgrammabilityTable::StoredProcedures => {
+            let database_id: String = row.get("databaseId")?;
+            let container_id: String = row.get("containerId")?;
+            let id: String = row.get("id")?;
+            Ok(ProgrammabilityRecord::StoredProcedure(StoredProcedure {
+                self_link: format!("dbs/{database_id}/colls/{container_id}/sprocs/{id}/"),
+                id,
+                database_id,
+                container_id,
+                rid: row.get("rid")?,
+                etag: row.get("eTag")?,
+                timestamp: row.get("timestamp")?,
+                body: row.get("body")?,
+            }))
+        }
+        ProgrammabilityTable::Triggers => {
+            let database_id: String = row.get("databaseId")?;
+            let container_id: String = row.get("containerId")?;
+            let id: String = row.get("id")?;
+            Ok(ProgrammabilityRecord::Trigger(Trigger {
+                self_link: format!("dbs/{database_id}/colls/{container_id}/triggers/{id}/"),
+                id,
+                database_id,
+                container_id,
+                rid: row.get("rid")?,
+                etag: row.get("eTag")?,
+                timestamp: row.get("timestamp")?,
+                body: row.get("body")?,
+                trigger_type: trigger_type_from_int(row.get("triggerType")?),
+                trigger_operation: trigger_operation_from_int(row.get("triggerOperation")?),
+            }))
+        }
+        ProgrammabilityTable::UserDefinedFunctions => {
+            let database_id: String = row.get("databaseId")?;
+            let container_id: String = row.get("containerId")?;
+            let id: String = row.get("id")?;
+            Ok(ProgrammabilityRecord::UserDefinedFunction(
+                UserDefinedFunction {
+                    self_link: format!("dbs/{database_id}/colls/{container_id}/udfs/{id}/"),
+                    id,
+                    database_id,
+                    container_id,
+                    rid: row.get("rid")?,
+                    etag: row.get("eTag")?,
+                    timestamp: row.get("timestamp")?,
+                    body: row.get("body")?,
+                },
+            ))
+        }
+    }
+}
+
+fn trigger_type_from_int(value: i32) -> TriggerType {
+    match value {
+        1 => TriggerType::Post,
+        _ => TriggerType::Pre,
+    }
+}
+
+fn trigger_operation_from_int(value: i32) -> TriggerOperation {
+    match value {
+        1 => TriggerOperation::Create,
+        2 => TriggerOperation::Replace,
+        3 => TriggerOperation::Delete,
+        _ => TriggerOperation::All,
+    }
+}
+
 // ─── JSON helpers ────────────────────────────────────────────────────────────
 
 fn to_json<T: serde::Serialize>(value: &T) -> String {
@@ -393,6 +661,16 @@ fn from_json_opt<T: serde::de::DeserializeOwned>(json: Option<String>) -> Cosmos
 
 fn sqlite_err(e: rusqlite::Error) -> CosmosError {
     CosmosError::internal_server_error(format!("sqlite error: {e}"))
+}
+
+fn format_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn parse_timestamp(value: &str) -> CosmosResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| CosmosError::internal_server_error(format!("invalid timestamp: {e}")))
 }
 
 fn permission_mode_str(mode: PermissionMode) -> &'static str {
@@ -423,6 +701,355 @@ fn insert_document(conn: &Connection, doc: &CosmosDocument) -> CosmosResult<()> 
     )
     .map_err(sqlite_err)?;
     Ok(())
+}
+
+#[async_trait]
+impl ActivityStore for SqliteActivityStore {
+    async fn record(&self, entry: ActivityEntry) -> CosmosResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO activity \
+             (timestamp, method, path, status_code, request_charge, latency_ms, database_id, container_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                format_timestamp(entry.timestamp),
+                entry.method,
+                entry.path,
+                entry.status_code,
+                entry.request_charge,
+                entry.latency_ms,
+                entry.database_id,
+                entry.container_id,
+            ],
+        )
+        .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    async fn list(&self, max_items: i32) -> CosmosResult<Vec<ActivityEntry>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT timestamp, method, path, status_code, request_charge, latency_ms, database_id, container_id \
+                 FROM activity ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![max_items.max(0)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i32>>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                    row.get::<_, Option<f64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (
+                timestamp,
+                method,
+                path,
+                status_code,
+                request_charge,
+                latency_ms,
+                database_id,
+                container_id,
+            ) = row.map_err(sqlite_err)?;
+            entries.push(ActivityEntry {
+                timestamp: parse_timestamp(&timestamp)?,
+                method: method.unwrap_or_default(),
+                path: path.unwrap_or_default(),
+                status_code: status_code.unwrap_or_default(),
+                request_charge: request_charge.unwrap_or_default(),
+                latency_ms: latency_ms.unwrap_or_default(),
+                database_id,
+                container_id,
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn clear(&self) -> CosmosResult<()> {
+        self.lock()
+            .execute("DELETE FROM activity", [])
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    async fn trim(&self, max_entries: i32) -> CosmosResult<()> {
+        self.lock()
+            .execute(
+                "DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT ?1)",
+                params![max_entries.max(0)],
+            )
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl QueryTelemetryStore for SqliteQueryTelemetryStore {
+    async fn record(&self, entry: QueryTelemetryEntry) -> CosmosResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO query_telemetry \
+             (id, timestamp, database_id, container_id, sql_text, partition_key, consistency_level, \
+              request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition, query_plan) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                entry.id,
+                format_timestamp(entry.timestamp),
+                entry.database_id,
+                entry.container_id,
+                entry.sql_text,
+                entry.partition_key,
+                entry.consistency_level,
+                entry.request_charge,
+                entry.latency_ms,
+                entry.item_count,
+                entry.status_code,
+                entry.activity_id,
+                if entry.is_cross_partition { 1 } else { 0 },
+                entry.query_plan,
+            ],
+        )
+        .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        database_id: Option<&str>,
+        container_id: Option<&str>,
+        max_items: i32,
+    ) -> CosmosResult<Vec<QueryTelemetryEntry>> {
+        let conn = self.lock();
+        let (sql, db_param, container_param) = match (database_id, container_id) {
+            (Some(_), Some(_)) => (
+                "SELECT id, timestamp, database_id, container_id, sql_text, partition_key, consistency_level, \
+                 request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition, query_plan \
+                 FROM query_telemetry WHERE database_id = ?1 AND container_id = ?2 ORDER BY timestamp DESC LIMIT ?3",
+                database_id,
+                container_id,
+            ),
+            (Some(_), None) => (
+                "SELECT id, timestamp, database_id, container_id, sql_text, partition_key, consistency_level, \
+                 request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition, query_plan \
+                 FROM query_telemetry WHERE database_id = ?1 ORDER BY timestamp DESC LIMIT ?3",
+                database_id,
+                None,
+            ),
+            (None, Some(_)) => (
+                "SELECT id, timestamp, database_id, container_id, sql_text, partition_key, consistency_level, \
+                 request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition, query_plan \
+                 FROM query_telemetry WHERE container_id = ?2 ORDER BY timestamp DESC LIMIT ?3",
+                None,
+                container_id,
+            ),
+            (None, None) => (
+                "SELECT id, timestamp, database_id, container_id, sql_text, partition_key, consistency_level, \
+                 request_charge, latency_ms, item_count, status_code, activity_id, is_cross_partition, query_plan \
+                 FROM query_telemetry ORDER BY timestamp DESC LIMIT ?3",
+                None,
+                None,
+            ),
+        };
+        let mut stmt = conn.prepare(sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(
+                params![db_param, container_param, max_items.max(0)],
+                query_telemetry_from_row,
+            )
+            .map_err(sqlite_err)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row.map_err(sqlite_err)?);
+        }
+        Ok(entries)
+    }
+
+    async fn clear(&self) -> CosmosResult<()> {
+        self.lock()
+            .execute("DELETE FROM query_telemetry", [])
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    async fn trim(&self, max_entries: i32) -> CosmosResult<()> {
+        self.lock()
+            .execute(
+                "DELETE FROM query_telemetry WHERE id NOT IN (SELECT id FROM query_telemetry ORDER BY id DESC LIMIT ?1)",
+                params![max_entries.max(0)],
+            )
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+}
+
+fn query_telemetry_from_row(row: &Row<'_>) -> rusqlite::Result<QueryTelemetryEntry> {
+    let timestamp: String = row.get(1)?;
+    let parsed = parse_timestamp(&timestamp).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(QueryTelemetryEntry {
+        id: row.get(0)?,
+        timestamp: parsed,
+        database_id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        container_id: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        sql_text: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        partition_key: row.get(5)?,
+        consistency_level: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        request_charge: row.get::<_, Option<f64>>(7)?.unwrap_or_default(),
+        latency_ms: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
+        item_count: row.get::<_, Option<i32>>(9)?.unwrap_or_default(),
+        status_code: row.get::<_, Option<i32>>(10)?.unwrap_or_default(),
+        activity_id: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+        continuation_token: None,
+        is_cross_partition: row.get::<_, Option<i32>>(12)?.unwrap_or_default() == 1,
+        query_plan: row.get(13)?,
+    })
+}
+
+#[async_trait]
+impl ProgrammabilityRecordStore for SqliteProgrammabilityRecordStore {
+    async fn select_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+    ) -> CosmosResult<Option<ProgrammabilityRecord>> {
+        let conn = self.lock();
+        let sql = format!("SELECT * FROM {} WHERE record_key = ?1", table.name());
+        conn.query_row(&sql, params![record_key], |row| {
+            row_to_programmability_record(table, row)
+        })
+        .optional()
+        .map_err(sqlite_err)
+    }
+
+    async fn select_table_records(
+        &self,
+        table: ProgrammabilityTable,
+    ) -> CosmosResult<Vec<ProgrammabilityRecord>> {
+        let conn = self.lock();
+        let sql = format!("SELECT * FROM {} ORDER BY id ASC", table.name());
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| row_to_programmability_record(table, row))
+            .map_err(sqlite_err)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(sqlite_err)?);
+        }
+        Ok(records)
+    }
+
+    async fn create_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        record: ProgrammabilityRecord,
+    ) -> CosmosResult<()> {
+        self.upsert_record(table, record_key, record).await
+    }
+
+    async fn upsert_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        record: ProgrammabilityRecord,
+    ) -> CosmosResult<()> {
+        let conn = self.lock();
+        match (table, record) {
+            (ProgrammabilityTable::StoredProcedures, ProgrammabilityRecord::StoredProcedure(s)) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO cosmos_sprocs \
+                     (record_key, id, databaseId, containerId, rid, eTag, timestamp, body) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        record_key,
+                        s.id,
+                        s.database_id,
+                        s.container_id,
+                        s.rid,
+                        s.etag,
+                        s.timestamp,
+                        s.body
+                    ],
+                )
+                .map_err(sqlite_err)?;
+            }
+            (ProgrammabilityTable::Triggers, ProgrammabilityRecord::Trigger(t)) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO cosmos_triggers \
+                     (record_key, id, databaseId, containerId, rid, eTag, timestamp, body, triggerType, triggerOperation) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        record_key,
+                        t.id,
+                        t.database_id,
+                        t.container_id,
+                        t.rid,
+                        t.etag,
+                        t.timestamp,
+                        t.body,
+                        t.trigger_type.as_int(),
+                        t.trigger_operation.as_int()
+                    ],
+                )
+                .map_err(sqlite_err)?;
+            }
+            (
+                ProgrammabilityTable::UserDefinedFunctions,
+                ProgrammabilityRecord::UserDefinedFunction(u),
+            ) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO cosmos_udfs \
+                     (record_key, id, databaseId, containerId, rid, eTag, timestamp, body) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        record_key,
+                        u.id,
+                        u.database_id,
+                        u.container_id,
+                        u.rid,
+                        u.etag,
+                        u.timestamp,
+                        u.body
+                    ],
+                )
+                .map_err(sqlite_err)?;
+            }
+            _ => {
+                return Err(CosmosError::internal_server_error(
+                    "programmability table/record mismatch",
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> CosmosResult<()> {
+        let conn = self.lock();
+        let sql = format!("DELETE FROM {} WHERE record_key = ?1", table.name());
+        let deleted = conn
+            .execute(&sql, params![record_key])
+            .map_err(sqlite_err)?;
+        if deleted == 0 {
+            return Err(CosmosError::not_found(resource_type, resource_id));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1353,6 +1980,7 @@ impl DocumentStore for SqliteDocumentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
     use cosmos_core::ids::resource_id;
     use cosmos_core::models::PartitionKeyDefinition;
     use serde_json::json;
@@ -1462,7 +2090,11 @@ mod tests {
 
     #[tokio::test]
     async fn persistence_across_reopen() {
-        let dir = std::env::temp_dir().join(format!("cosmos-sqlite-test-{}", uuid_like()));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("cosmos-sqlite-tests")
+            .join(uuid_like());
         {
             let store = SqliteDocumentStore::open(&dir).unwrap();
             seed(&store).await;
@@ -1481,6 +2113,81 @@ mod tests {
             assert_eq!(read.id, "doc1");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sqlite_activity_store_roundtrips_and_trims() {
+        let store = SqliteActivityStore::in_memory().unwrap();
+        store
+            .record(ActivityEntry {
+                timestamp: Utc::now() - Duration::seconds(1),
+                method: "GET".into(),
+                path: "/dbs".into(),
+                status_code: 200,
+                request_charge: 1.25,
+                latency_ms: 2.5,
+                database_id: None,
+                container_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .record(ActivityEntry {
+                timestamp: Utc::now(),
+                method: "POST".into(),
+                path: "/dbs/db1/colls".into(),
+                status_code: 201,
+                request_charge: 3.5,
+                latency_ms: 4.5,
+                database_id: Some("db1".into()),
+                container_id: Some("c1".into()),
+            })
+            .await
+            .unwrap();
+
+        let entries = store.list(10).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].method, "POST");
+        assert_eq!(entries[0].database_id.as_deref(), Some("db1"));
+
+        store.trim(1).await.unwrap();
+        assert_eq!(store.list(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_query_telemetry_filters_and_replaces() {
+        let store = SqliteQueryTelemetryStore::in_memory().unwrap();
+        let first = QueryTelemetryEntry {
+            id: "same".into(),
+            timestamp: Utc::now() - Duration::seconds(1),
+            database_id: "db1".into(),
+            container_id: "c1".into(),
+            sql_text: "SELECT * FROM c".into(),
+            request_charge: 2.0,
+            latency_ms: 7,
+            item_count: 3,
+            status_code: 200,
+            activity_id: "activity-1".into(),
+            is_cross_partition: true,
+            query_plan: Some("plan".into()),
+            ..Default::default()
+        };
+        let replacement = QueryTelemetryEntry {
+            sql_text: "SELECT VALUE 1".into(),
+            timestamp: Utc::now(),
+            ..first.clone()
+        };
+        store.record(first).await.unwrap();
+        store.record(replacement).await.unwrap();
+
+        let entries = store.list(Some("db1"), Some("c1"), 10).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "same");
+        assert_eq!(entries[0].sql_text, "SELECT VALUE 1");
+        assert!(entries[0].is_cross_partition);
+
+        store.clear().await.unwrap();
+        assert!(store.list(None, None, 10).await.unwrap().is_empty());
     }
 
     fn uuid_like() -> String {

@@ -2,15 +2,14 @@
 //!
 //! Ports `HnswVectorIndexProvider` and `VectorIndexingDocumentStore`.
 //!
-//! The .NET provider uses HNSW.Net for approximate search on large shards and
-//! falls back to an **exact ("flat") scan** for small partitions and while the
-//! graph builds. This Rust port implements the exact-scan path only, which
-//! yields identical (fully correct) results; the approximate HNSW graph is a
-//! deferred optimization. Because search is exact, the tombstone/rebuild/
-//! background-build machinery is unnecessary — entries are stored in a map and
-//! removed directly.
+//! The provider maintains one in-memory shard per container embedding path. For
+//! declared `flat` indexes it uses exact scan. For `quantizedFlat`/`diskANN` (and
+//! other non-flat types) it builds a real HNSW small-world graph and searches it,
+//! falling back to exact scan for graph-less shards and small partition-scoped
+//! queries, mirroring the .NET provider's public behaviour.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -20,34 +19,383 @@ use cosmos_core::models::*;
 use cosmos_core::traits::{DocumentStore, VectorIndexProvider};
 use serde_json::Value;
 
-/// A single indexed embedding.
 #[derive(Clone)]
 struct Entry {
     doc_id: String,
     pk: PartitionKeyValue,
+    pk_header: String,
     vector: Vec<f32>,
+    deleted: bool,
 }
 
-/// An index for one container embedding path.
 struct Shard {
     path: String,
     distance_function: VectorDistanceFunction,
-    /// Vector length; `0` until the first embedding is seen.
+    index_type: String,
     dimensions: usize,
-    /// Keyed by `DocKey` = `{pkHeader}\0{docId}`.
-    entries: HashMap<String, Entry>,
+    entries: Vec<Entry>,
+    key_to_id: HashMap<String, usize>,
+    partition_entries: HashMap<String, Vec<usize>>,
+    tombstones: usize,
+    graph: Option<HnswGraph>,
 }
 
-/// In-memory exact ("flat") vector index provider. Shards are built lazily from
-/// the backing store on first use and kept current via the maintenance hooks
-/// invoked by [`VectorIndexingDocumentStore`].
-pub struct FlatVectorIndexProvider {
+impl Shard {
+    fn live_count(&self) -> usize {
+        self.entries.len().saturating_sub(self.tombstones)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScoredId {
+    distance: f64,
+    id: usize,
+}
+
+impl Eq for ScoredId {}
+
+impl Ord for ScoredId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .partial_cmp(&other.distance)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for ScoredId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A compact in-memory HNSW graph. Node ids are aligned with `Shard.entries`.
+struct HnswGraph {
+    layers: Vec<Vec<Vec<usize>>>,
+    levels: Vec<usize>,
+    entry_point: Option<usize>,
+    max_level: usize,
+    m: usize,
+    ef_construction: usize,
+    ef_search: usize,
+    distance_function: VectorDistanceFunction,
+}
+
+impl HnswGraph {
+    fn new(options: &VectorIndexOptions, distance_function: VectorDistanceFunction) -> Self {
+        Self {
+            layers: Vec::new(),
+            levels: Vec::new(),
+            entry_point: None,
+            max_level: 0,
+            m: options.m.max(2),
+            ef_construction: options.ef_construction.max(options.m.max(2)),
+            ef_search: options.ef_search.max(1),
+            distance_function,
+        }
+    }
+
+    fn build(
+        entries: &[Entry],
+        options: &VectorIndexOptions,
+        distance_function: VectorDistanceFunction,
+    ) -> Self {
+        let mut graph = Self::new(options, distance_function);
+        for id in 0..entries.len() {
+            if !entries[id].deleted {
+                graph.insert(id, entries);
+            }
+        }
+        graph
+    }
+
+    fn insert(&mut self, id: usize, entries: &[Entry]) {
+        let level = Self::random_level(id, self.m);
+        self.ensure_node(id, level);
+
+        let Some(mut current) = self.entry_point else {
+            self.entry_point = Some(id);
+            self.max_level = level;
+            return;
+        };
+        if entries[current].deleted {
+            current = entries
+                .iter()
+                .enumerate()
+                .find(|(entry_id, entry)| *entry_id != id && !entry.deleted)
+                .map(|(entry_id, _)| entry_id)
+                .unwrap_or(id);
+        }
+
+        let query = &entries[id].vector;
+        for layer in ((level + 1)..=self.max_level).rev() {
+            current = self.greedy_search_layer(query, current, layer, entries);
+        }
+
+        let top = level.min(self.max_level);
+        for layer in (0..=top).rev() {
+            let candidates =
+                self.search_layer(query, current, self.ef_construction, layer, entries);
+            self.connect(id, candidates, layer, entries);
+            if let Some(best) = self.nearest_in_layer(query, id, layer, entries) {
+                current = best;
+            }
+        }
+
+        if level > self.max_level {
+            self.entry_point = Some(id);
+            self.max_level = level;
+        }
+    }
+
+    fn search(&self, query: &[f32], k: usize, entries: &[Entry]) -> Vec<ScoredId> {
+        let Some(mut current) = self.entry_point else {
+            return Vec::new();
+        };
+        if entries[current].deleted {
+            let Some((live_id, _)) = entries.iter().enumerate().find(|(_, entry)| !entry.deleted)
+            else {
+                return Vec::new();
+            };
+            current = live_id;
+        }
+        if k == 0 {
+            return Vec::new();
+        }
+        for layer in (1..=self.max_level).rev() {
+            current = self.greedy_search_layer(query, current, layer, entries);
+        }
+        let ef = self.ef_search.max(k);
+        let mut found = self.search_layer(query, current, ef, 0, entries);
+        found.retain(|c| !entries[c.id].deleted);
+        found.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
+        found.truncate(k);
+        found
+    }
+
+    fn ensure_node(&mut self, id: usize, level: usize) {
+        while self.layers.len() <= level {
+            self.layers.push(Vec::new());
+        }
+        for layer in &mut self.layers {
+            while layer.len() <= id {
+                layer.push(Vec::new());
+            }
+        }
+        while self.levels.len() <= id {
+            self.levels.push(0);
+        }
+        self.levels[id] = level;
+    }
+
+    fn greedy_search_layer(
+        &self,
+        query: &[f32],
+        entry: usize,
+        layer: usize,
+        entries: &[Entry],
+    ) -> usize {
+        let mut current = entry;
+        let mut current_dist = self.distance(query, &entries[current].vector);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &neighbor in self.neighbors(current, layer) {
+                if entries[neighbor].deleted {
+                    continue;
+                }
+                let dist = self.distance(query, &entries[neighbor].vector);
+                if dist < current_dist {
+                    current = neighbor;
+                    current_dist = dist;
+                    changed = true;
+                }
+            }
+        }
+        current
+    }
+
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry: usize,
+        ef: usize,
+        layer: usize,
+        entries: &[Entry],
+    ) -> Vec<ScoredId> {
+        if entries[entry].deleted {
+            return Vec::new();
+        }
+
+        let start = ScoredId {
+            distance: self.distance(query, &entries[entry].vector),
+            id: entry,
+        };
+        let mut visited = HashSet::from([entry]);
+        let mut candidates = BinaryHeap::new();
+        let mut results = BinaryHeap::new();
+        candidates.push(ReverseScored(start));
+        results.push(start);
+
+        while let Some(ReverseScored(candidate)) = candidates.pop() {
+            let worst = results.peek().map(|s| s.distance).unwrap_or(f64::INFINITY);
+            if candidate.distance > worst && results.len() >= ef {
+                break;
+            }
+
+            for &neighbor in self.neighbors(candidate.id, layer) {
+                if !visited.insert(neighbor) || entries[neighbor].deleted {
+                    continue;
+                }
+                let scored = ScoredId {
+                    distance: self.distance(query, &entries[neighbor].vector),
+                    id: neighbor,
+                };
+                let worst = results.peek().map(|s| s.distance).unwrap_or(f64::INFINITY);
+                if results.len() < ef || scored.distance < worst {
+                    candidates.push(ReverseScored(scored));
+                    results.push(scored);
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+
+        results.into_vec()
+    }
+
+    fn connect(&mut self, id: usize, candidates: Vec<ScoredId>, layer: usize, entries: &[Entry]) {
+        let mut selected: Vec<usize> = candidates
+            .into_iter()
+            .filter(|c| c.id != id && !entries[c.id].deleted)
+            .map(|c| c.id)
+            .collect();
+        selected.sort_by(|a, b| {
+            self.distance(&entries[id].vector, &entries[*a].vector)
+                .partial_cmp(&self.distance(&entries[id].vector, &entries[*b].vector))
+                .unwrap_or(Ordering::Equal)
+        });
+        selected.dedup();
+        selected.truncate(self.m);
+
+        for &neighbor in &selected {
+            self.add_edge(id, neighbor, layer, entries);
+        }
+        self.prune_neighbors(id, layer, entries);
+    }
+
+    fn add_edge(&mut self, a: usize, b: usize, layer: usize, entries: &[Entry]) {
+        if !self.layers[layer][a].contains(&b) {
+            self.layers[layer][a].push(b);
+        }
+        if !self.layers[layer][b].contains(&a) {
+            self.layers[layer][b].push(a);
+        }
+        self.prune_neighbors(b, layer, entries);
+    }
+
+    fn prune_neighbors(&mut self, id: usize, layer: usize, entries: &[Entry]) {
+        let dist_fn = self.distance_function;
+        let neighbors = &mut self.layers[layer][id];
+        neighbors.sort_by(|a, b| {
+            vector_math::nearest_first_distance(&entries[id].vector, &entries[*a].vector, dist_fn)
+                .partial_cmp(&vector_math::nearest_first_distance(
+                    &entries[id].vector,
+                    &entries[*b].vector,
+                    dist_fn,
+                ))
+                .unwrap_or(Ordering::Equal)
+        });
+        neighbors.dedup();
+        neighbors.truncate(self.m);
+    }
+
+    fn nearest_in_layer(
+        &self,
+        query: &[f32],
+        id: usize,
+        layer: usize,
+        entries: &[Entry],
+    ) -> Option<usize> {
+        self.neighbors(id, layer)
+            .iter()
+            .copied()
+            .filter(|n| !entries[*n].deleted)
+            .min_by(|a, b| {
+                self.distance(query, &entries[*a].vector)
+                    .partial_cmp(&self.distance(query, &entries[*b].vector))
+                    .unwrap_or(Ordering::Equal)
+            })
+    }
+
+    fn neighbors(&self, id: usize, layer: usize) -> &[usize] {
+        self.layers
+            .get(layer)
+            .and_then(|l| l.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn distance(&self, a: &[f32], b: &[f32]) -> f64 {
+        vector_math::nearest_first_distance(a, b, self.distance_function)
+    }
+
+    fn random_level(id: usize, m: usize) -> usize {
+        let mut x = splitmix64(id as u64 + 0x9E37_79B9_7F4A_7C15);
+        let lambda = 1.0 / (m.max(2) as f64).ln();
+        let unit = ((x >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 1.0);
+        let mut level = (-unit.ln() * lambda).floor() as usize;
+        level = level.min(32);
+        x = splitmix64(x);
+        if x == 0 {
+            level = level.saturating_add(1).min(32);
+        }
+        level
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReverseScored(ScoredId);
+
+impl Ord for ReverseScored {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.0.cmp(&self.0)
+    }
+}
+
+impl PartialOrd for ReverseScored {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// In-memory HNSW vector index provider. Shards are built lazily from the
+/// backing store on first use and kept current via the maintenance hooks invoked
+/// by [`VectorIndexingDocumentStore`].
+pub struct HnswVectorIndexProvider {
     store: Arc<dyn DocumentStore>,
     options: VectorIndexOptions,
     shards: Mutex<HashMap<String, Shard>>,
 }
 
-impl FlatVectorIndexProvider {
+/// Backward-compatible name used by the host wiring. It now provides the real
+/// HNSW implementation for non-flat index types.
+pub type FlatVectorIndexProvider = HnswVectorIndexProvider;
+
+impl HnswVectorIndexProvider {
     pub fn new(store: Arc<dyn DocumentStore>, options: VectorIndexOptions) -> Self {
         Self {
             store,
@@ -72,12 +420,14 @@ impl FlatVectorIndexProvider {
         format!("{}\0{doc_id}", pk.to_header_string())
     }
 
+    fn is_flat(index_type: &str) -> bool {
+        index_type.eq_ignore_ascii_case("flat")
+    }
+
     fn paths_match(a: &str, b: &str) -> bool {
         Self::normalize_path(a) == Self::normalize_path(b)
     }
 
-    /// Extracts a float embedding from `body` at `path`. Returns `None` when the
-    /// path is missing, is not a non-empty array, or contains a non-numeric item.
     fn extract_vector(body: &JsonObject, path: &str) -> Option<Vec<f32>> {
         let mut node = Value::Object(body.clone());
         for segment in path.split('/').filter(|s| !s.is_empty()) {
@@ -94,14 +444,12 @@ impl FlatVectorIndexProvider {
         Some(vector)
     }
 
-    /// Builds a shard from the store's current documents. Returns `None` when the
-    /// path is not indexable (no declared policy and implicit indexing disabled).
     async fn build_shard(
         &self,
         database_id: &str,
         container_id: &str,
         path: &str,
-        _index_type: &str,
+        index_type: &str,
         distance_function: VectorDistanceFunction,
     ) -> CosmosResult<Option<Shard>> {
         let container = self.store.get_container(database_id, container_id).await?;
@@ -115,9 +463,9 @@ impl FlatVectorIndexProvider {
             return Ok(None);
         }
 
-        // Prefer an explicitly declared embedding policy's distance function. Only
-        // the exact ("flat") path is implemented, so the declared index type does
-        // not affect search behavior.
+        let effective_type = declared
+            .map(|vi| vi.index_type.clone())
+            .unwrap_or_else(|| index_type.to_string());
         let mut effective_function = distance_function;
         if let Some(policy) = container.vector_embedding_policy.as_ref() {
             if let Some(embedding) = policy
@@ -133,8 +481,13 @@ impl FlatVectorIndexProvider {
         let mut shard = Shard {
             path: path.to_string(),
             distance_function: effective_function,
+            index_type: effective_type,
             dimensions: 0,
-            entries: HashMap::new(),
+            entries: Vec::new(),
+            key_to_id: HashMap::new(),
+            partition_entries: HashMap::new(),
+            tombstones: 0,
+            graph: None,
         };
 
         let docs = self.store.list_documents(database_id, container_id).await?;
@@ -147,39 +500,163 @@ impl FlatVectorIndexProvider {
             } else if vector.len() != shard.dimensions {
                 continue;
             }
-            let key = Self::doc_key(&doc.id, &doc.partition_key);
-            shard.entries.insert(
-                key,
-                Entry {
-                    doc_id: doc.id.clone(),
-                    pk: doc.partition_key.clone(),
-                    vector,
-                },
-            );
+            Self::append_entry_without_graph(&mut shard, doc.id, doc.partition_key, vector);
         }
 
+        Self::rebuild_graph_if_needed(&mut shard, &self.options);
         Ok(Some(shard))
     }
 
-    /// Applies a mutation to every built shard of a container under the lock.
+    fn exact_rank<'a>(
+        entries: impl Iterator<Item = (usize, &'a Entry)>,
+        query: &[f32],
+        distance_function: VectorDistanceFunction,
+        top_k: usize,
+    ) -> Vec<(usize, f64)> {
+        let mut ranked: Vec<_> = entries
+            .filter(|(_, e)| !e.deleted)
+            .map(|(id, e)| {
+                (
+                    id,
+                    vector_math::nearest_first_distance(&e.vector, query, distance_function),
+                )
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        ranked.truncate(top_k);
+        ranked
+    }
+
+    fn partition_filtered_graph_search(
+        shard: &Shard,
+        query: &[f32],
+        pk_header: &str,
+        top_k: usize,
+    ) -> Vec<(usize, f64)> {
+        let Some(graph) = shard.graph.as_ref() else {
+            return Vec::new();
+        };
+        let total = shard.entries.len();
+        let need = top_k.max(1);
+        let mut k = total.min((need * 4).max(64));
+        loop {
+            let mut matches: Vec<_> = graph
+                .search(query, k, &shard.entries)
+                .into_iter()
+                .filter(|s| shard.entries[s.id].pk_header == pk_header)
+                .map(|s| (s.id, s.distance))
+                .collect();
+            matches.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            if matches.len() >= need || k >= total {
+                matches.truncate(top_k);
+                return matches;
+            }
+            k = total.min(k.saturating_mul(4));
+        }
+    }
+
+    fn append_entry_without_graph(
+        shard: &mut Shard,
+        doc_id: String,
+        pk: PartitionKeyValue,
+        vector: Vec<f32>,
+    ) {
+        let id = shard.entries.len();
+        let pk_header = pk.to_header_string();
+        let doc_key = Self::doc_key(&doc_id, &pk);
+        shard.entries.push(Entry {
+            doc_id,
+            pk,
+            pk_header: pk_header.clone(),
+            vector,
+            deleted: false,
+        });
+        shard.key_to_id.insert(doc_key, id);
+        shard
+            .partition_entries
+            .entry(pk_header)
+            .or_default()
+            .push(id);
+    }
+
+    fn append_entry(
+        shard: &mut Shard,
+        options: &VectorIndexOptions,
+        doc_id: String,
+        pk: PartitionKeyValue,
+        vector: Vec<f32>,
+    ) {
+        Self::append_entry_without_graph(shard, doc_id, pk, vector);
+        let id = shard.entries.len() - 1;
+        if let Some(graph) = shard.graph.as_mut() {
+            graph.insert(id, &shard.entries);
+        } else {
+            Self::rebuild_graph_if_needed(shard, options);
+        }
+    }
+
+    fn rebuild_graph_if_needed(shard: &mut Shard, options: &VectorIndexOptions) {
+        if shard.dimensions > 0 && !Self::is_flat(&shard.index_type) && shard.live_count() > 0 {
+            shard.graph = Some(HnswGraph::build(
+                &shard.entries,
+                options,
+                shard.distance_function,
+            ));
+        } else {
+            shard.graph = None;
+        }
+    }
+
+    fn maybe_rebuild(shard: &mut Shard, options: &VectorIndexOptions) {
+        if shard.tombstones == 0 {
+            return;
+        }
+        let live = shard.live_count();
+        if live == 0
+            || (shard.tombstones >= 32
+                && (shard.tombstones as f64)
+                    >= (shard.entries.len() as f64 * options.rebuild_tombstone_ratio))
+        {
+            let live_entries: Vec<Entry> = shard
+                .entries
+                .iter()
+                .filter(|e| !e.deleted)
+                .cloned()
+                .map(|mut e| {
+                    e.deleted = false;
+                    e
+                })
+                .collect();
+            shard.entries.clear();
+            shard.key_to_id.clear();
+            shard.partition_entries.clear();
+            shard.tombstones = 0;
+            shard.graph = None;
+            for entry in live_entries {
+                Self::append_entry_without_graph(shard, entry.doc_id, entry.pk, entry.vector);
+            }
+            Self::rebuild_graph_if_needed(shard, options);
+        }
+    }
+
     fn for_built_shards(
         &self,
         database_id: &str,
         container_id: &str,
-        mut f: impl FnMut(&mut Shard),
+        mut f: impl FnMut(&mut Shard, &VectorIndexOptions),
     ) {
         let prefix = Self::shard_key_prefix(database_id, container_id);
         let mut shards = self.shards.lock().unwrap();
         for (key, shard) in shards.iter_mut() {
             if key.starts_with(&prefix) {
-                f(shard);
+                f(shard, &self.options);
             }
         }
     }
 }
 
 #[async_trait]
-impl VectorIndexProvider for FlatVectorIndexProvider {
+impl VectorIndexProvider for HnswVectorIndexProvider {
     fn is_enabled(&self) -> bool {
         self.options.enabled
     }
@@ -202,7 +679,6 @@ impl VectorIndexProvider for FlatVectorIndexProvider {
             return Ok(true);
         }
 
-        // Build without holding the lock (the build reads from the store).
         let shard = self
             .build_shard(
                 database_id,
@@ -246,40 +722,58 @@ impl VectorIndexProvider for FlatVectorIndexProvider {
         };
 
         let query = &request.query_vector;
-        if shard.dimensions == 0 || query.len() != shard.dimensions {
+        if shard.dimensions == 0 || query.len() != shard.dimensions || request.top_k == 0 {
             return Ok(Vec::new());
         }
 
-        let pk_header = request
-            .partition_key
-            .as_ref()
-            .map(|pk| pk.to_header_string());
-        let mut ranked: Vec<(&Entry, f64)> = shard
-            .entries
-            .values()
-            .filter(|e| match &pk_header {
-                Some(h) => &e.pk.to_header_string() == h,
-                None => true,
-            })
-            .map(|e| {
-                (
-                    e,
-                    vector_math::nearest_first_distance(&e.vector, query, shard.distance_function),
+        let ranked: Vec<(usize, f64)> = if let Some(pk) = request.partition_key.as_ref() {
+            let pk_header = pk.to_header_string();
+            let Some(ids) = shard.partition_entries.get(&pk_header) else {
+                return Ok(Vec::new());
+            };
+            let live_count = ids.iter().filter(|id| !shard.entries[**id].deleted).count();
+            if shard.graph.is_none() || live_count <= self.options.partition_exact_scan_threshold {
+                Self::exact_rank(
+                    ids.iter().map(|id| (*id, &shard.entries[*id])),
+                    query,
+                    shard.distance_function,
+                    request.top_k,
                 )
-            })
-            .collect();
-
-        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(request.top_k);
+            } else {
+                Self::partition_filtered_graph_search(shard, query, &pk_header, request.top_k)
+            }
+        } else if let Some(graph) = shard.graph.as_ref() {
+            let k = shard.entries.len().min(request.top_k + shard.tombstones);
+            graph
+                .search(query, k, &shard.entries)
+                .into_iter()
+                .map(|s| (s.id, s.distance))
+                .take(request.top_k)
+                .collect()
+        } else {
+            Self::exact_rank(
+                shard.entries.iter().enumerate(),
+                query,
+                shard.distance_function,
+                request.top_k,
+            )
+        };
 
         let hits = ranked
             .into_iter()
-            .map(|(e, distance)| VectorHit {
-                document_id: e.doc_id.clone(),
-                partition_key: e.pk.clone(),
-                distance,
-                score: vector_math::score(&e.vector, query, shard.distance_function),
+            .filter_map(|(id, distance)| {
+                let e = shard.entries.get(id)?;
+                if e.deleted {
+                    return None;
+                }
+                Some(VectorHit {
+                    document_id: e.doc_id.clone(),
+                    partition_key: e.pk.clone(),
+                    distance,
+                    score: vector_math::score(&e.vector, query, shard.distance_function),
+                })
             })
+            .take(request.top_k)
             .collect();
         Ok(hits)
     }
@@ -288,24 +782,23 @@ impl VectorIndexProvider for FlatVectorIndexProvider {
         let doc_id = document.id.clone();
         let pk = document.partition_key.clone();
         let body = document.body.clone();
-        self.for_built_shards(database_id, container_id, |shard| {
+        self.for_built_shards(database_id, container_id, |shard, options| {
             let doc_key = Self::doc_key(&doc_id, &pk);
-            shard.entries.remove(&doc_key);
+            if let Some(old_id) = shard.key_to_id.remove(&doc_key) {
+                if !shard.entries[old_id].deleted {
+                    shard.entries[old_id].deleted = true;
+                    shard.tombstones += 1;
+                }
+            }
             if let Some(vector) = Self::extract_vector(&body, &shard.path) {
                 if shard.dimensions == 0 {
                     shard.dimensions = vector.len();
                 }
                 if vector.len() == shard.dimensions {
-                    shard.entries.insert(
-                        doc_key,
-                        Entry {
-                            doc_id: doc_id.clone(),
-                            pk: pk.clone(),
-                            vector,
-                        },
-                    );
+                    Self::append_entry(shard, options, doc_id.clone(), pk.clone(), vector);
                 }
             }
+            Self::maybe_rebuild(shard, options);
         });
     }
 
@@ -317,14 +810,24 @@ impl VectorIndexProvider for FlatVectorIndexProvider {
         partition_key: &PartitionKeyValue,
     ) {
         let doc_key = Self::doc_key(document_id, partition_key);
-        self.for_built_shards(database_id, container_id, |shard| {
-            shard.entries.remove(&doc_key);
+        self.for_built_shards(database_id, container_id, |shard, options| {
+            if let Some(old_id) = shard.key_to_id.remove(&doc_key) {
+                if !shard.entries[old_id].deleted {
+                    shard.entries[old_id].deleted = true;
+                    shard.tombstones += 1;
+                    Self::maybe_rebuild(shard, options);
+                }
+            }
         });
     }
 
     fn on_container_cleared(&self, database_id: &str, container_id: &str) {
-        self.for_built_shards(database_id, container_id, |shard| {
+        self.for_built_shards(database_id, container_id, |shard, _| {
             shard.entries.clear();
+            shard.key_to_id.clear();
+            shard.partition_entries.clear();
+            shard.tombstones = 0;
+            shard.graph = None;
         });
     }
 
@@ -811,6 +1314,49 @@ mod tests {
         let hits = provider.search(req).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].document_id, "b");
+    }
+
+    #[tokio::test]
+    async fn non_flat_index_builds_hnsw_graph() {
+        let (store, provider) = build();
+        store.create_database("db1").await.unwrap();
+        let mut container =
+            CosmosContainer::new("db1", "c1", PartitionKeyDefinition::new(vec!["/pk".into()]));
+        container.indexing_policy.vector_indexes = Some(vec![VectorIndex {
+            path: "/embedding".into(),
+            index_type: "quantizedFlat".into(),
+        }]);
+        store.create_container("db1", container).await.unwrap();
+        for i in 0..80 {
+            store
+                .create_document(
+                    "db1",
+                    "c1",
+                    doc(&format!("left-{i}"), "p1", [1.0 + i as f32 * 0.001, 0.0]),
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .create_document(
+                    "db1",
+                    "c1",
+                    doc(&format!("right-{i}"), "p1", [0.0, 1.0 + i as f32 * 0.001]),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut req = request(vec![1.0, 0.0], 5);
+        req.index_type = "quantizedFlat".into();
+        let hits = provider.search(req).await.unwrap();
+
+        assert_eq!(hits.len(), 5);
+        assert!(hits.iter().all(|hit| hit.document_id.starts_with("left-")));
+        let shards = provider.shards.lock().unwrap();
+        let shard = shards.values().next().unwrap();
+        assert!(shard.graph.is_some());
     }
 
     #[tokio::test]

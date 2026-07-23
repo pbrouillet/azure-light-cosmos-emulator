@@ -1,6 +1,7 @@
 //! Integration tests for the JS programmability engine (sprocs/triggers/UDFs).
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cosmos_core::models::partition_key::{PartitionKeyDefinition, PartitionKeyValue};
 use cosmos_core::models::programmability::{
@@ -8,8 +9,9 @@ use cosmos_core::models::programmability::{
 };
 use cosmos_core::models::resources::CosmosContainer;
 use cosmos_core::traits::{DocumentStore, ProgrammabilityEngine};
-use cosmos_query::SqlQueryEngine;
+use cosmos_query::{SqlQueryEngine, UdfResolver};
 use cosmos_storage::inmemory::InMemoryDocumentStore;
+use cosmos_storage::{ProgrammabilityRecordStore, SqliteDocumentStore};
 use cosmos_triggers::JsProgrammabilityEngine;
 use serde_json::json;
 
@@ -126,6 +128,107 @@ async fn sproc_query_documents() {
         .await
         .unwrap();
     assert_eq!(result, Some(json!(3)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sproc_query_callback_returns_options_and_append_body_matches_cosmos_context() {
+    let (store, engine) = setup().await;
+    store
+        .create_document(
+            DB,
+            COLL,
+            json!({"id": "qo1", "pk": "p1", "n": 10})
+                .as_object()
+                .unwrap()
+                .clone(),
+            None,
+        )
+        .await
+        .unwrap();
+    let body = r#"function() {
+        var ctx = getContext();
+        var coll = ctx.getCollection();
+        coll.queryDocuments(
+            coll.getSelfLink(),
+            { query: "SELECT * FROM c WHERE c.id = @id", parameters: [{ name: "@id", value: "qo1" }] },
+            { marker: "kept" },
+            function(err, docs, opts) {
+                if (err) { throw new Error(err.message); }
+                var response = ctx.getResponse();
+                response.setBody("count=");
+                response.appendBody({ count: opts.count, marker: opts.options.marker, id: docs[0].id });
+            });
+    }"#;
+    engine
+        .create_stored_procedure(
+            DB,
+            COLL,
+            StoredProcedure::new(DB, COLL, "queryOptions", body),
+        )
+        .await
+        .unwrap();
+
+    let result = engine
+        .execute_stored_procedure(DB, COLL, "queryOptions", &[], &pk())
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        Some(json!(
+            "count={\"count\":1,\"marker\":\"kept\",\"id\":\"qo1\"}"
+        ))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sproc_read_replace_and_delete_document() {
+    let (store, engine) = setup().await;
+    store
+        .create_document(
+            DB,
+            COLL,
+            json!({"id": "rd1", "pk": "p1", "value": 1})
+                .as_object()
+                .unwrap()
+                .clone(),
+            None,
+        )
+        .await
+        .unwrap();
+    let body = r#"function() {
+        var ctx = getContext();
+        var coll = ctx.getCollection();
+        var link = coll.getSelfLink() + "docs/rd1";
+        coll.readDocument(link, {}, function(err, doc) {
+            if (err) { throw new Error(err.message); }
+            doc.value = 2;
+            coll.replaceDocument(link, doc, {}, function(err2, replaced) {
+                if (err2) { throw new Error(err2.message); }
+                coll.deleteDocument(link, {}, function(err3) {
+                    if (err3) { throw new Error(err3.message); }
+                    ctx.getResponse().setBody(replaced.value);
+                });
+            });
+        });
+    }"#;
+    engine
+        .create_stored_procedure(DB, COLL, StoredProcedure::new(DB, COLL, "mutate", body))
+        .await
+        .unwrap();
+
+    let result = engine
+        .execute_stored_procedure(DB, COLL, "mutate", &[], &pk())
+        .await
+        .unwrap();
+    assert_eq!(result, Some(json!(2)));
+    assert_eq!(
+        store
+            .read_document(DB, COLL, "rd1", &pk())
+            .await
+            .unwrap_err()
+            .status_code,
+        404
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -336,6 +439,22 @@ async fn udf_crud_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udf_resolver_executes_registered_body() {
+    let (_store, engine) = setup().await;
+    engine
+        .create_udf(
+            DB,
+            COLL,
+            UserDefinedFunction::new(DB, COLL, "tax", "function tax(v){ return v * 1.1; }"),
+        )
+        .await
+        .unwrap();
+
+    let result = UdfResolver::eval(&engine, DB, COLL, "tax", &[json!(10)]);
+    assert_eq!(result, Some(json!(11.0)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sproc_runaway_loop_is_terminated() {
     let (_store, engine) = setup().await;
     engine
@@ -361,4 +480,63 @@ async fn execute_missing_sproc_not_found() {
         .await
         .unwrap_err();
     assert_eq!(err.status_code, 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_record_store_persists_across_reopen() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::path::PathBuf::from(format!("target/programmability-persist-{unique}"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let sqlite = SqliteDocumentStore::open(&dir).unwrap();
+        sqlite.create_database(DB).await.unwrap();
+        sqlite
+            .create_container(
+                DB,
+                CosmosContainer::new(DB, COLL, PartitionKeyDefinition::new(vec!["/pk".into()])),
+            )
+            .await
+            .unwrap();
+        let record_store: Arc<dyn ProgrammabilityRecordStore> =
+            Arc::new(sqlite.programmability_store());
+        let store: Arc<dyn DocumentStore> = Arc::new(sqlite);
+        let query_engine = Arc::new(SqlQueryEngine::new(store.clone()));
+        let engine = JsProgrammabilityEngine::with_record_store(store, query_engine, record_store);
+        engine
+            .create_stored_procedure(
+                DB,
+                COLL,
+                StoredProcedure::new(
+                    DB,
+                    COLL,
+                    "persisted",
+                    "function(){ getContext().getResponse().setBody('ok'); }",
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    {
+        let sqlite = SqliteDocumentStore::open(&dir).unwrap();
+        let record_store: Arc<dyn ProgrammabilityRecordStore> =
+            Arc::new(sqlite.programmability_store());
+        let store: Arc<dyn DocumentStore> = Arc::new(sqlite);
+        let query_engine = Arc::new(SqlQueryEngine::new(store.clone()));
+        let engine = JsProgrammabilityEngine::with_record_store(store, query_engine, record_store);
+        let sproc = engine
+            .get_stored_procedure(DB, COLL, "persisted")
+            .await
+            .unwrap();
+        assert_eq!(
+            sproc.body,
+            "function(){ getContext().getResponse().setBody('ok'); }"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

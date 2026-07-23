@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use cosmos_core::error::CosmosError;
 use cosmos_core::models::headers as h;
 use cosmos_core::models::{JsonObject, PartitionKeyValue};
-use cosmos_core::traits::ConsistencyManager as _;
+use cosmos_core::traits::{ConsistencyManager as _, ProgrammabilityEngine as _};
 use serde_json::{json, Value};
 
 use crate::state::AppState;
@@ -158,15 +158,40 @@ pub async fn common_headers(state: &AppState, options: &HeaderOptions) -> Header
 async fn build_resource_usage(state: &AppState) -> String {
     let databases = state.store.list_databases().await.unwrap_or_default();
     let mut collection_count = 0usize;
+    let mut sproc_count = 0usize;
+    let mut trigger_count = 0usize;
+    let mut udf_count = 0usize;
     for db in &databases.resources {
         if let Ok(containers) = state.store.list_containers(&db.id).await {
+            for container in &containers.resources {
+                if let Ok(feed) = state
+                    .programmability
+                    .list_stored_procedures(&db.id, &container.id)
+                    .await
+                {
+                    sproc_count += feed.resources.len();
+                }
+                if let Ok(feed) = state
+                    .programmability
+                    .list_triggers(&db.id, &container.id)
+                    .await
+                {
+                    trigger_count += feed.resources.len();
+                }
+                if let Ok(feed) = state.programmability.list_udfs(&db.id, &container.id).await {
+                    udf_count += feed.resources.len();
+                }
+            }
             collection_count += containers.resources.len();
         }
     }
     format!(
-        "databases={};collections={};storedProcedures=0;triggers=0;functions=0;documentSize=0",
+        "databases={};collections={};storedProcedures={};triggers={};functions={};documentSize=0",
         databases.resources.len(),
-        collection_count
+        collection_count,
+        sproc_count,
+        trigger_count,
+        udf_count
     )
 }
 

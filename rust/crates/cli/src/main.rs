@@ -50,6 +50,9 @@ enum Command {
         /// Enable Entra ID authentication support.
         #[arg(long)]
         enable_entra: bool,
+        /// Serve the NoSQL endpoint over HTTPS with a local self-signed cert.
+        #[arg(long)]
+        enable_ssl: bool,
         /// Default consistency level.
         #[arg(long, default_value = DEFAULT_CONSISTENCY)]
         consistency: String,
@@ -131,6 +134,7 @@ async fn main() -> Result<(), anyhow::Error> {
             data_dir,
             key,
             enable_entra,
+            enable_ssl,
             consistency,
             verbose,
             storage,
@@ -145,6 +149,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     data_dir,
                     key,
                     enable_entra,
+                    enable_ssl,
                     consistency,
                     verbose,
                     storage,
@@ -170,6 +175,7 @@ struct StartArgs {
     data_dir: Option<PathBuf>,
     key: Option<String>,
     enable_entra: bool,
+    enable_ssl: bool,
     consistency: String,
     verbose: bool,
     storage: Storage,
@@ -218,17 +224,23 @@ async fn start(args: StartArgs, run_host_internal: bool) -> Result<i32, anyhow::
         enable_entra_id: args.enable_entra,
         consistency_level: args.consistency.clone(),
         verbose: args.verbose,
-        enable_ssl: false,
+        enable_ssl: args.enable_ssl,
     };
     persist_state(&state)?;
 
     let data_directory = state.data_directory.clone();
     let result = cosmos_host::run(HostOptions {
         port,
+        mongo_port: Some(mongo_port),
         storage: args.storage.into(),
         data_dir: Some(data_dir),
         explorer_dir: args.explorer_dir.clone(),
         master_key: Some(state.master_key.clone()),
+        enable_entra: state.enable_entra_id,
+        enable_ssl: state.enable_ssl,
+        enable_throughput_enforcement: true,
+        enable_maintenance: true,
+        enable_request_tracking: true,
         consistency: cosmos_core::ConsistencyLevel::parse(&state.consistency_level),
     })
     .await;
@@ -263,6 +275,9 @@ async fn start_background(
     }
     if args.enable_entra {
         cmd.arg("--enable-entra");
+    }
+    if args.enable_ssl {
+        cmd.arg("--enable-ssl");
     }
     if args.verbose {
         cmd.arg("--verbose");

@@ -19,15 +19,23 @@
 //! now; streaming/bounded execution is a future refinement.
 
 mod ast;
+mod dml;
 mod engine;
 mod eval;
 mod functions;
 mod lexer;
 mod parser;
+mod services;
+mod udf;
 mod value;
 
+pub use dml::DmlCommandService;
 pub use engine::SqlQueryEngine;
 pub use parser::parse;
+pub use services::{
+    IndexValidationResult, IndexValidationService, QueryExecutionLimiter, QueryExplainService,
+};
+pub use udf::UdfResolver;
 
 /// Convenience: parse and execute a query against in-memory JSON documents,
 /// returning the projected rows. Primarily used by tests and tooling.
@@ -38,6 +46,29 @@ pub fn run_query(
 ) -> Result<Vec<serde_json::Value>, String> {
     let stmt = parser::parse(query)?;
     let result = eval::execute(&stmt, docs, params)?;
+    Ok(result
+        .rows
+        .into_iter()
+        .map(serde_json::Value::Object)
+        .collect())
+}
+
+/// Convenience: parse and execute a query with an optional SQL UDF resolver.
+pub fn run_query_with_udf_resolver(
+    query: &str,
+    docs: &[serde_json::Value],
+    params: &std::collections::HashMap<String, serde_json::Value>,
+    udf_resolver: Option<&dyn UdfResolver>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let stmt = parser::parse(query)?;
+    let result = eval::execute_with_udf_resolver(
+        &stmt,
+        docs,
+        params,
+        Some("db"),
+        Some("coll"),
+        udf_resolver,
+    )?;
     Ok(result
         .rows
         .into_iter()

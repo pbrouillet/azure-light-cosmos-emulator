@@ -183,6 +183,61 @@ pub trait QueryEngine: Send + Sync {
     ) -> CosmosResult<FeedResponse<JsonObject>>;
 }
 
+/// Persistent store for HTTP request activity log entries. Ports
+/// `IActivityStore`.
+#[async_trait]
+pub trait ActivityStore: Send + Sync {
+    /// Records an activity log entry.
+    async fn record(&self, entry: ActivityEntry) -> CosmosResult<()>;
+
+    /// Lists activity log entries, ordered by timestamp descending.
+    async fn list(&self, max_items: i32) -> CosmosResult<Vec<ActivityEntry>>;
+
+    /// Clears all activity log entries.
+    async fn clear(&self) -> CosmosResult<()>;
+
+    /// Trims the activity log to the most recent `max_entries` entries.
+    async fn trim(&self, max_entries: i32) -> CosmosResult<()>;
+}
+
+/// Persistent store for query telemetry data. Ports `IQueryTelemetryStore`.
+#[async_trait]
+pub trait QueryTelemetryStore: Send + Sync {
+    /// Records a query telemetry entry.
+    async fn record(&self, entry: QueryTelemetryEntry) -> CosmosResult<()>;
+
+    /// Lists query telemetry entries, optionally filtered by database and
+    /// container.
+    async fn list(
+        &self,
+        database_id: Option<&str>,
+        container_id: Option<&str>,
+        max_items: i32,
+    ) -> CosmosResult<Vec<QueryTelemetryEntry>>;
+
+    /// Clears all query telemetry entries.
+    async fn clear(&self) -> CosmosResult<()>;
+
+    /// Trims the telemetry store to the most recent `max_entries` entries.
+    async fn trim(&self, max_entries: i32) -> CosmosResult<()>;
+}
+
+/// Emulator information and account metadata service. Ports
+/// `IEmulatorInfoService`.
+#[async_trait]
+pub trait EmulatorInfoService: Send + Sync {
+    async fn get_info(&self) -> CosmosResult<JsonObject>;
+
+    async fn get_stats(&self) -> CosmosResult<JsonObject>;
+
+    async fn update_settings(
+        &self,
+        enable_entra_id: bool,
+        tenant_id: Option<&str>,
+        client_id: Option<&str>,
+    ) -> CosmosResult<JsonObject>;
+}
+
 /// The authentication mechanism used for a request. Ports `AuthType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthType {

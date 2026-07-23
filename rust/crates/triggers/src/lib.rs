@@ -7,15 +7,9 @@
 //! execution) using the pure-Rust `boa_engine` JavaScript interpreter, and adds
 //! inherent pre/post trigger execution helpers mirroring the .NET `TriggerEngine`.
 //!
-//! Record metadata (sproc/trigger/UDF bodies) is held in-memory, keyed by
-//! `(database, container, id)`. Unlike the .NET engine (which persists records
-//! in `cosmos_sprocs`/`cosmos_triggers`/`cosmos_udfs` tables), this port does
-//! **not** persist programmability metadata across restarts — a documented gap.
-
 mod jsexec;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use cosmos_core::error::CosmosError;
@@ -27,7 +21,13 @@ use cosmos_core::models::programmability::{
 use cosmos_core::models::resources::JsonObject;
 use cosmos_core::traits::{DocumentStore, ProgrammabilityEngine, QueryEngine};
 use cosmos_core::CosmosResult;
+use cosmos_query::UdfResolver;
+use cosmos_storage::{
+    make_record_key, InMemoryProgrammabilityRecordStore, ProgrammabilityRecord,
+    ProgrammabilityRecordStore, ProgrammabilityTable,
+};
 use serde_json::Value;
+use tokio::runtime::Handle;
 
 /// Kinds of programmability resources, mirroring the .NET model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,44 +37,48 @@ pub enum ProgrammabilityKind {
     UserDefinedFunction,
 }
 
-type RecordMap<T> = Mutex<HashMap<String, T>>;
-
-fn record_key(database_id: &str, container_id: &str, id: &str) -> String {
-    format!("{database_id}\u{0}{container_id}\u{0}{id}")
-}
-
-/// JavaScript programmability engine backed by `boa_engine` and an in-memory
+/// JavaScript programmability engine backed by `boa_engine` and a pluggable
 /// record store. Ports `JintProgrammabilityEngine` + `TriggerEngine`.
 pub struct JsProgrammabilityEngine {
     store: Arc<dyn DocumentStore>,
     query_engine: Arc<dyn QueryEngine>,
-    sprocs: RecordMap<StoredProcedure>,
-    triggers: RecordMap<Trigger>,
-    udfs: RecordMap<UserDefinedFunction>,
+    record_store: Arc<dyn ProgrammabilityRecordStore>,
 }
 
 impl JsProgrammabilityEngine {
     pub fn new(store: Arc<dyn DocumentStore>, query_engine: Arc<dyn QueryEngine>) -> Self {
+        Self::with_record_store(
+            store,
+            query_engine,
+            Arc::new(InMemoryProgrammabilityRecordStore::new()),
+        )
+    }
+
+    pub fn with_record_store(
+        store: Arc<dyn DocumentStore>,
+        query_engine: Arc<dyn QueryEngine>,
+        record_store: Arc<dyn ProgrammabilityRecordStore>,
+    ) -> Self {
         Self {
             store,
             query_engine,
-            sprocs: Mutex::new(HashMap::new()),
-            triggers: Mutex::new(HashMap::new()),
-            udfs: Mutex::new(HashMap::new()),
+            record_store,
         }
     }
 
-    fn sorted<T>(map: &RecordMap<T>, database_id: &str, container_id: &str) -> Vec<(String, T)>
+    fn sorted<T>(
+        records: impl IntoIterator<Item = T>,
+        database_id: &str,
+        container_id: &str,
+    ) -> Vec<T>
     where
-        T: Clone + HasIdentity,
+        T: HasIdentity,
     {
-        let guard = map.lock().expect("record lock poisoned");
-        let mut items: Vec<(String, T)> = guard
-            .values()
+        let mut items: Vec<T> = records
+            .into_iter()
             .filter(|v| v.database_id() == database_id && v.container_id() == container_id)
-            .map(|v| (v.id().to_string(), v.clone()))
             .collect();
-        items.sort_by(|a, b| a.0.cmp(&b.0));
+        items.sort_by(|a, b| a.id().cmp(b.id()));
         items
     }
 
@@ -204,6 +208,50 @@ impl HasIdentity for UserDefinedFunction {
     }
 }
 
+impl UdfResolver for JsProgrammabilityEngine {
+    fn eval(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Value> {
+        let key = make_record_key(database_id, container_id, name);
+        let record_store = self.record_store.clone();
+        let record = block_on_record_lookup(record_store, key)?;
+        let ProgrammabilityRecord::UserDefinedFunction(udf) = record else {
+            return None;
+        };
+        jsexec::run_udf(&udf.id, &udf.body, args).ok().flatten()
+    }
+}
+
+fn block_on_record_lookup(
+    record_store: Arc<dyn ProgrammabilityRecordStore>,
+    key: String,
+) -> Option<ProgrammabilityRecord> {
+    let fut = async move {
+        record_store
+            .select_record(ProgrammabilityTable::UserDefinedFunctions, &key)
+            .await
+            .ok()
+            .flatten()
+    };
+
+    if let Ok(handle) = Handle::try_current() {
+        std::thread::spawn(move || handle.block_on(fut))
+            .join()
+            .ok()
+            .flatten()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?
+            .block_on(fut)
+    }
+}
+
 #[async_trait]
 impl ProgrammabilityEngine for JsProgrammabilityEngine {
     async fn create_stored_procedure(
@@ -212,9 +260,13 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         mut sproc: StoredProcedure,
     ) -> CosmosResult<StoredProcedure> {
-        let key = record_key(database_id, container_id, &sproc.id);
-        let mut guard = self.sprocs.lock().expect("record lock poisoned");
-        if guard.contains_key(&key) {
+        let key = make_record_key(database_id, container_id, &sproc.id);
+        if self
+            .record_store
+            .select_record(ProgrammabilityTable::StoredProcedures, &key)
+            .await?
+            .is_some()
+        {
             return Err(CosmosError::conflict("StoredProcedure", &sproc.id));
         }
         sproc.database_id = database_id.to_string();
@@ -223,7 +275,13 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
             "dbs/{database_id}/colls/{container_id}/sprocs/{}/",
             sproc.id
         );
-        guard.insert(key, sproc.clone());
+        self.record_store
+            .create_record(
+                ProgrammabilityTable::StoredProcedures,
+                &key,
+                ProgrammabilityRecord::StoredProcedure(sproc.clone()),
+            )
+            .await?;
         Ok(sproc)
     }
 
@@ -233,13 +291,15 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         sproc_id: &str,
     ) -> CosmosResult<StoredProcedure> {
-        let key = record_key(database_id, container_id, sproc_id);
-        self.sprocs
-            .lock()
-            .expect("record lock poisoned")
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| CosmosError::not_found("StoredProcedure", sproc_id))
+        let key = make_record_key(database_id, container_id, sproc_id);
+        match self
+            .record_store
+            .select_record(ProgrammabilityTable::StoredProcedures, &key)
+            .await?
+        {
+            Some(ProgrammabilityRecord::StoredProcedure(s)) => Ok(s),
+            _ => Err(CosmosError::not_found("StoredProcedure", sproc_id)),
+        }
     }
 
     async fn list_stored_procedures(
@@ -247,10 +307,20 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         database_id: &str,
         container_id: &str,
     ) -> CosmosResult<FeedResponse<StoredProcedure>> {
-        let items = Self::sorted(&self.sprocs, database_id, container_id)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect();
+        let records = self
+            .record_store
+            .select_table_records(ProgrammabilityTable::StoredProcedures)
+            .await?;
+        let items = Self::sorted(
+            records.into_iter().filter_map(|record| match record {
+                ProgrammabilityRecord::StoredProcedure(s) => Some(s),
+                _ => None,
+            }),
+            database_id,
+            container_id,
+        )
+        .into_iter()
+        .collect();
         Ok(FeedResponse::new(items))
     }
 
@@ -260,11 +330,9 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         sproc: StoredProcedure,
     ) -> CosmosResult<StoredProcedure> {
-        let key = record_key(database_id, container_id, &sproc.id);
-        let mut guard = self.sprocs.lock().expect("record lock poisoned");
-        let existing = guard
-            .get(&key)
-            .ok_or_else(|| CosmosError::not_found("StoredProcedure", &sproc.id))?;
+        let existing = self
+            .get_stored_procedure(database_id, container_id, &sproc.id)
+            .await?;
         let updated = StoredProcedure {
             id: sproc.id.clone(),
             rid: existing.rid.clone(),
@@ -278,7 +346,14 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
             container_id: container_id.to_string(),
             body: sproc.body,
         };
-        guard.insert(key, updated.clone());
+        let key = make_record_key(database_id, container_id, &updated.id);
+        self.record_store
+            .upsert_record(
+                ProgrammabilityTable::StoredProcedures,
+                &key,
+                ProgrammabilityRecord::StoredProcedure(updated.clone()),
+            )
+            .await?;
         Ok(updated)
     }
 
@@ -288,12 +363,15 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         sproc_id: &str,
     ) -> CosmosResult<()> {
-        let key = record_key(database_id, container_id, sproc_id);
-        let mut guard = self.sprocs.lock().expect("record lock poisoned");
-        if guard.remove(&key).is_none() {
-            return Err(CosmosError::not_found("StoredProcedure", sproc_id));
-        }
-        Ok(())
+        let key = make_record_key(database_id, container_id, sproc_id);
+        self.record_store
+            .delete_record(
+                ProgrammabilityTable::StoredProcedures,
+                &key,
+                "StoredProcedure",
+                sproc_id,
+            )
+            .await
     }
 
     async fn execute_stored_procedure(
@@ -328,9 +406,13 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         mut trigger: Trigger,
     ) -> CosmosResult<Trigger> {
-        let key = record_key(database_id, container_id, &trigger.id);
-        let mut guard = self.triggers.lock().expect("record lock poisoned");
-        if guard.contains_key(&key) {
+        let key = make_record_key(database_id, container_id, &trigger.id);
+        if self
+            .record_store
+            .select_record(ProgrammabilityTable::Triggers, &key)
+            .await?
+            .is_some()
+        {
             return Err(CosmosError::conflict("Trigger", &trigger.id));
         }
         trigger.database_id = database_id.to_string();
@@ -339,7 +421,13 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
             "dbs/{database_id}/colls/{container_id}/triggers/{}/",
             trigger.id
         );
-        guard.insert(key, trigger.clone());
+        self.record_store
+            .create_record(
+                ProgrammabilityTable::Triggers,
+                &key,
+                ProgrammabilityRecord::Trigger(trigger.clone()),
+            )
+            .await?;
         Ok(trigger)
     }
 
@@ -349,13 +437,15 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         trigger_id: &str,
     ) -> CosmosResult<Trigger> {
-        let key = record_key(database_id, container_id, trigger_id);
-        self.triggers
-            .lock()
-            .expect("record lock poisoned")
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| CosmosError::not_found("Trigger", trigger_id))
+        let key = make_record_key(database_id, container_id, trigger_id);
+        match self
+            .record_store
+            .select_record(ProgrammabilityTable::Triggers, &key)
+            .await?
+        {
+            Some(ProgrammabilityRecord::Trigger(t)) => Ok(t),
+            _ => Err(CosmosError::not_found("Trigger", trigger_id)),
+        }
     }
 
     async fn list_triggers(
@@ -363,10 +453,20 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         database_id: &str,
         container_id: &str,
     ) -> CosmosResult<FeedResponse<Trigger>> {
-        let items = Self::sorted(&self.triggers, database_id, container_id)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect();
+        let records = self
+            .record_store
+            .select_table_records(ProgrammabilityTable::Triggers)
+            .await?;
+        let items = Self::sorted(
+            records.into_iter().filter_map(|record| match record {
+                ProgrammabilityRecord::Trigger(t) => Some(t),
+                _ => None,
+            }),
+            database_id,
+            container_id,
+        )
+        .into_iter()
+        .collect();
         Ok(FeedResponse::new(items))
     }
 
@@ -376,11 +476,9 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         trigger: Trigger,
     ) -> CosmosResult<Trigger> {
-        let key = record_key(database_id, container_id, &trigger.id);
-        let mut guard = self.triggers.lock().expect("record lock poisoned");
-        let existing = guard
-            .get(&key)
-            .ok_or_else(|| CosmosError::not_found("Trigger", &trigger.id))?;
+        let existing = self
+            .get_trigger(database_id, container_id, &trigger.id)
+            .await?;
         let updated = Trigger {
             id: trigger.id.clone(),
             rid: existing.rid.clone(),
@@ -396,7 +494,14 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
             trigger_type: trigger.trigger_type,
             trigger_operation: trigger.trigger_operation,
         };
-        guard.insert(key, updated.clone());
+        let key = make_record_key(database_id, container_id, &updated.id);
+        self.record_store
+            .upsert_record(
+                ProgrammabilityTable::Triggers,
+                &key,
+                ProgrammabilityRecord::Trigger(updated.clone()),
+            )
+            .await?;
         Ok(updated)
     }
 
@@ -406,12 +511,10 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         trigger_id: &str,
     ) -> CosmosResult<()> {
-        let key = record_key(database_id, container_id, trigger_id);
-        let mut guard = self.triggers.lock().expect("record lock poisoned");
-        if guard.remove(&key).is_none() {
-            return Err(CosmosError::not_found("Trigger", trigger_id));
-        }
-        Ok(())
+        let key = make_record_key(database_id, container_id, trigger_id);
+        self.record_store
+            .delete_record(ProgrammabilityTable::Triggers, &key, "Trigger", trigger_id)
+            .await
     }
 
     async fn create_udf(
@@ -420,15 +523,25 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         mut udf: UserDefinedFunction,
     ) -> CosmosResult<UserDefinedFunction> {
-        let key = record_key(database_id, container_id, &udf.id);
-        let mut guard = self.udfs.lock().expect("record lock poisoned");
-        if guard.contains_key(&key) {
+        let key = make_record_key(database_id, container_id, &udf.id);
+        if self
+            .record_store
+            .select_record(ProgrammabilityTable::UserDefinedFunctions, &key)
+            .await?
+            .is_some()
+        {
             return Err(CosmosError::conflict("UserDefinedFunction", &udf.id));
         }
         udf.database_id = database_id.to_string();
         udf.container_id = container_id.to_string();
         udf.self_link = format!("dbs/{database_id}/colls/{container_id}/udfs/{}/", udf.id);
-        guard.insert(key, udf.clone());
+        self.record_store
+            .create_record(
+                ProgrammabilityTable::UserDefinedFunctions,
+                &key,
+                ProgrammabilityRecord::UserDefinedFunction(udf.clone()),
+            )
+            .await?;
         Ok(udf)
     }
 
@@ -438,13 +551,15 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         udf_id: &str,
     ) -> CosmosResult<UserDefinedFunction> {
-        let key = record_key(database_id, container_id, udf_id);
-        self.udfs
-            .lock()
-            .expect("record lock poisoned")
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| CosmosError::not_found("UserDefinedFunction", udf_id))
+        let key = make_record_key(database_id, container_id, udf_id);
+        match self
+            .record_store
+            .select_record(ProgrammabilityTable::UserDefinedFunctions, &key)
+            .await?
+        {
+            Some(ProgrammabilityRecord::UserDefinedFunction(u)) => Ok(u),
+            _ => Err(CosmosError::not_found("UserDefinedFunction", udf_id)),
+        }
     }
 
     async fn list_udfs(
@@ -452,10 +567,20 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         database_id: &str,
         container_id: &str,
     ) -> CosmosResult<FeedResponse<UserDefinedFunction>> {
-        let items = Self::sorted(&self.udfs, database_id, container_id)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect();
+        let records = self
+            .record_store
+            .select_table_records(ProgrammabilityTable::UserDefinedFunctions)
+            .await?;
+        let items = Self::sorted(
+            records.into_iter().filter_map(|record| match record {
+                ProgrammabilityRecord::UserDefinedFunction(u) => Some(u),
+                _ => None,
+            }),
+            database_id,
+            container_id,
+        )
+        .into_iter()
+        .collect();
         Ok(FeedResponse::new(items))
     }
 
@@ -465,11 +590,7 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         udf: UserDefinedFunction,
     ) -> CosmosResult<UserDefinedFunction> {
-        let key = record_key(database_id, container_id, &udf.id);
-        let mut guard = self.udfs.lock().expect("record lock poisoned");
-        let existing = guard
-            .get(&key)
-            .ok_or_else(|| CosmosError::not_found("UserDefinedFunction", &udf.id))?;
+        let existing = self.get_udf(database_id, container_id, &udf.id).await?;
         let updated = UserDefinedFunction {
             id: udf.id.clone(),
             rid: existing.rid.clone(),
@@ -480,7 +601,14 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
             container_id: container_id.to_string(),
             body: udf.body,
         };
-        guard.insert(key, updated.clone());
+        let key = make_record_key(database_id, container_id, &updated.id);
+        self.record_store
+            .upsert_record(
+                ProgrammabilityTable::UserDefinedFunctions,
+                &key,
+                ProgrammabilityRecord::UserDefinedFunction(updated.clone()),
+            )
+            .await?;
         Ok(updated)
     }
 
@@ -490,11 +618,14 @@ impl ProgrammabilityEngine for JsProgrammabilityEngine {
         container_id: &str,
         udf_id: &str,
     ) -> CosmosResult<()> {
-        let key = record_key(database_id, container_id, udf_id);
-        let mut guard = self.udfs.lock().expect("record lock poisoned");
-        if guard.remove(&key).is_none() {
-            return Err(CosmosError::not_found("UserDefinedFunction", udf_id));
-        }
-        Ok(())
+        let key = make_record_key(database_id, container_id, udf_id);
+        self.record_store
+            .delete_record(
+                ProgrammabilityTable::UserDefinedFunctions,
+                &key,
+                "UserDefinedFunction",
+                udf_id,
+            )
+            .await
     }
 }

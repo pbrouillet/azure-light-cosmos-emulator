@@ -7,14 +7,41 @@ use serde_json::{Map, Value};
 
 use crate::ast::*;
 use crate::functions;
+use crate::udf::UdfResolver;
 use crate::value::{compare_relational, equals, is_true, number, total_cmp, QVal};
 
-/// Evaluation context: the root alias bound to the current document plus query
-/// parameters.
+#[derive(Clone, Debug, Default)]
+struct QueryRow {
+    aliases: HashMap<String, Value>,
+}
+
+impl QueryRow {
+    fn get(&self, alias: &str) -> Option<Value> {
+        self.aliases.get(&alias.to_ascii_lowercase()).cloned()
+    }
+
+    fn with_alias(&self, alias: &str, value: Value) -> Self {
+        let mut next = self.clone();
+        next.aliases.insert(alias.to_ascii_lowercase(), value);
+        next
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct EvalConfig<'a> {
+    database_id: Option<&'a str>,
+    container_id: Option<&'a str>,
+    udf_resolver: Option<&'a dyn UdfResolver>,
+}
+
+/// Evaluation context: current alias row, all source documents (for subqueries),
+/// optional aggregate group, query parameters, and injected services.
 struct Ctx<'a> {
-    alias: &'a str,
-    doc: &'a Value,
+    row: Option<&'a QueryRow>,
+    docs: &'a [Value],
     params: &'a HashMap<String, Value>,
+    group: Option<&'a [QueryRow]>,
+    cfg: EvalConfig<'a>,
 }
 
 /// The outcome of executing a query: the projected rows (each a JSON object)
@@ -30,85 +57,310 @@ pub fn execute(
     docs: &[Value],
     params: &HashMap<String, Value>,
 ) -> Result<ExecResult, String> {
-    // 1. Filter (WHERE).
-    let mut matched: Vec<&Value> = Vec::new();
-    for doc in docs {
-        let ctx = Ctx {
-            alias: &stmt.from_alias,
-            doc,
-            params,
-        };
-        let keep = match &stmt.where_clause {
-            Some(pred) => is_true(&eval(pred, &ctx)?),
-            None => true,
-        };
-        if keep {
-            matched.push(doc);
-        }
+    execute_with_udf_resolver(stmt, docs, params, None, None, None)
+}
+
+pub fn execute_with_udf_resolver(
+    stmt: &SelectStmt,
+    docs: &[Value],
+    params: &HashMap<String, Value>,
+    database_id: Option<&str>,
+    container_id: Option<&str>,
+    udf_resolver: Option<&dyn UdfResolver>,
+) -> Result<ExecResult, String> {
+    execute_select(
+        stmt,
+        docs,
+        params,
+        None,
+        EvalConfig {
+            database_id,
+            container_id,
+            udf_resolver,
+        },
+    )
+}
+
+fn execute_select(
+    stmt: &SelectStmt,
+    docs: &[Value],
+    params: &HashMap<String, Value>,
+    outer: Option<&QueryRow>,
+    cfg: EvalConfig<'_>,
+) -> Result<ExecResult, String> {
+    let mut rows = build_source_rows(stmt, docs, params, outer, cfg)?;
+
+    if let Some(pred) = &stmt.where_clause {
+        rows = rows
+            .into_iter()
+            .filter_map(|row| {
+                let ctx = Ctx {
+                    row: Some(&row),
+                    docs,
+                    params,
+                    group: None,
+                    cfg,
+                };
+                match eval(pred, &ctx) {
+                    Ok(v) if is_true(&v) => Some(Ok(row)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
     }
 
-    // 2. Aggregates short-circuit ordering/pagination.
-    if is_aggregate_projection(&stmt.projection) {
-        let row = compute_aggregates(stmt, &matched, params)?;
-        let is_value = matches!(stmt.projection, Projection::Value(_));
+    let aggregate_mode = !stmt.group_by.is_empty() || is_aggregate_projection(&stmt.projection);
+    if aggregate_mode {
+        let mut projected = execute_grouped(stmt, rows, docs, params, cfg)?;
+        apply_projected_ordering(&mut projected, stmt, docs, params, cfg)?;
+        apply_distinct_and_window(&mut projected, stmt, params)?;
         return Ok(ExecResult {
-            rows: vec![row],
-            is_value,
+            rows: projected,
+            is_value: matches!(stmt.projection, Projection::Value(_)),
         });
     }
 
-    // 3. ORDER BY (evaluated against source documents).
-    if !stmt.order_by.is_empty() {
-        let mut keyed: Vec<(Vec<QVal>, &Value)> = Vec::with_capacity(matched.len());
-        for doc in &matched {
-            let ctx = Ctx {
-                alias: &stmt.from_alias,
-                doc,
-                params,
-            };
-            let mut keys = Vec::with_capacity(stmt.order_by.len());
-            for (expr, _) in &stmt.order_by {
-                keys.push(eval(expr, &ctx)?);
-            }
-            keyed.push((keys, doc));
+    apply_row_ordering(&mut rows, stmt, docs, params, cfg)?;
+
+    let mut projected = Vec::new();
+    for row in &rows {
+        let ctx = Ctx {
+            row: Some(row),
+            docs,
+            params,
+            group: None,
+            cfg,
+        };
+        if let Some(out) = project(&stmt.projection, &ctx)? {
+            projected.push(out);
         }
-        keyed.sort_by(|a, b| {
-            for (idx, (_, desc)) in stmt.order_by.iter().enumerate() {
-                let ord = total_cmp(&a.0[idx], &b.0[idx]);
-                let ord = if *desc { ord.reverse() } else { ord };
-                if ord != Ordering::Equal {
-                    return ord;
+    }
+
+    apply_distinct_and_window(&mut projected, stmt, params)?;
+    Ok(ExecResult {
+        rows: projected,
+        is_value: matches!(stmt.projection, Projection::Value(_)),
+    })
+}
+
+fn build_source_rows(
+    stmt: &SelectStmt,
+    docs: &[Value],
+    params: &HashMap<String, Value>,
+    outer: Option<&QueryRow>,
+    cfg: EvalConfig<'_>,
+) -> Result<Vec<QueryRow>, String> {
+    let mut seeds = Vec::new();
+
+    if let Some(source) = &stmt.from_in {
+        // Correlated FROM ... IN: evaluate once against the outer row. Top-level
+        // array iteration evaluates the source against each root document.
+        if let Some(outer_row) = outer {
+            let ctx = Ctx {
+                row: Some(outer_row),
+                docs,
+                params,
+                group: None,
+                cfg,
+            };
+            expand_array_source(&mut seeds, outer_row, &stmt.from_alias, eval(source, &ctx)?)?;
+        } else {
+            for doc in docs {
+                let mut base = outer.cloned().unwrap_or_default();
+                base.aliases.insert("c".into(), doc.clone());
+                base.aliases
+                    .insert(stmt.from_alias.to_ascii_lowercase(), doc.clone());
+                let ctx = Ctx {
+                    row: Some(&base),
+                    docs,
+                    params,
+                    group: None,
+                    cfg,
+                };
+                expand_array_source(&mut seeds, &base, &stmt.from_alias, eval(source, &ctx)?)?;
+            }
+        }
+    } else if docs.is_empty() && outer.is_some() {
+        seeds.push(outer.cloned().unwrap_or_default());
+    } else {
+        for doc in docs {
+            let mut aliases = outer.cloned().unwrap_or_default().aliases;
+            aliases.insert(stmt.from_alias.to_ascii_lowercase(), doc.clone());
+            seeds.push(QueryRow { aliases });
+        }
+    }
+
+    if stmt.joins.is_empty() {
+        return Ok(seeds);
+    }
+
+    let mut rows = seeds;
+    for join in &stmt.joins {
+        let mut expanded = Vec::new();
+        for row in &rows {
+            let ctx = Ctx {
+                row: Some(row),
+                docs,
+                params,
+                group: None,
+                cfg,
+            };
+            if let Some(Value::Array(items)) = eval(&join.source, &ctx)? {
+                for item in items {
+                    expanded.push(row.with_alias(&join.alias, item));
                 }
             }
-            Ordering::Equal
-        });
-        matched = keyed.into_iter().map(|(_, d)| d).collect();
-    }
-
-    // 4. Project.
-    let mut rows: Vec<Map<String, Value>> = Vec::new();
-    let is_value = matches!(stmt.projection, Projection::Value(_));
-    for doc in &matched {
-        let ctx = Ctx {
-            alias: &stmt.from_alias,
-            doc,
-            params,
-        };
-        if let Some(row) = project(&stmt.projection, &ctx)? {
-            rows.push(row);
+        }
+        rows = expanded;
+        if rows.is_empty() {
+            break;
         }
     }
 
-    // 5. DISTINCT.
-    if stmt.distinct {
-        let mut seen = std::collections::HashSet::new();
-        rows.retain(|r| {
-            let key = serde_json::to_string(r).unwrap_or_default();
-            seen.insert(key)
-        });
+    Ok(rows)
+}
+
+fn expand_array_source(
+    rows: &mut Vec<QueryRow>,
+    base: &QueryRow,
+    alias: &str,
+    source: QVal,
+) -> Result<(), String> {
+    if let Some(Value::Array(items)) = source {
+        for item in items {
+            rows.push(base.with_alias(alias, item));
+        }
+    }
+    Ok(())
+}
+
+fn apply_row_ordering(
+    rows: &mut Vec<QueryRow>,
+    stmt: &SelectStmt,
+    docs: &[Value],
+    params: &HashMap<String, Value>,
+    cfg: EvalConfig<'_>,
+) -> Result<(), String> {
+    if stmt.order_by.is_empty() || rows.is_empty() {
+        return Ok(());
     }
 
-    // 6. OFFSET / LIMIT / TOP.
+    let vector_order = matches!(
+        &stmt.order_by[0].0,
+        Expr::Call { name, .. } if name.eq_ignore_ascii_case("VectorDistance")
+    );
+    if vector_order {
+        let (expr, desc) = &stmt.order_by[0];
+        let metric = vector_metric(expr, None);
+        let mut keyed = Vec::new();
+        for row in rows.drain(..) {
+            let ctx = Ctx {
+                row: Some(&row),
+                docs,
+                params,
+                group: None,
+                cfg,
+            };
+            let value = eval(expr, &ctx)?;
+            if let Some(Value::Number(n)) = value {
+                let raw = n.as_f64().unwrap_or(0.0);
+                let nearest_key = if metric == VectorMetric::Euclidean {
+                    raw
+                } else {
+                    -raw
+                };
+                keyed.push((nearest_key, row));
+            }
+        }
+        keyed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        if *desc {
+            keyed.reverse();
+        }
+        *rows = keyed.into_iter().map(|(_, row)| row).collect();
+        return Ok(());
+    }
+
+    let mut keyed: Vec<(Vec<QVal>, QueryRow)> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let ctx = Ctx {
+            row: Some(&row),
+            docs,
+            params,
+            group: None,
+            cfg,
+        };
+        let mut keys = Vec::with_capacity(stmt.order_by.len());
+        for (expr, _) in &stmt.order_by {
+            keys.push(eval(expr, &ctx)?);
+        }
+        keyed.push((keys, row));
+    }
+    keyed.sort_by(|a, b| compare_keys(&a.0, &b.0, &stmt.order_by));
+    *rows = keyed.into_iter().map(|(_, row)| row).collect();
+    Ok(())
+}
+
+fn compare_keys(a: &[QVal], b: &[QVal], order_by: &[(Expr, bool)]) -> Ordering {
+    for (idx, (_, desc)) in order_by.iter().enumerate() {
+        let ord = total_cmp(&a[idx], &b[idx]);
+        let ord = if *desc { ord.reverse() } else { ord };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+fn apply_projected_ordering(
+    rows: &mut Vec<Map<String, Value>>,
+    stmt: &SelectStmt,
+    docs: &[Value],
+    params: &HashMap<String, Value>,
+    cfg: EvalConfig<'_>,
+) -> Result<(), String> {
+    if stmt.order_by.is_empty() || rows.is_empty() {
+        return Ok(());
+    }
+    let mut keyed = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let qrow = QueryRow {
+            aliases: HashMap::from([(
+                stmt.from_alias.to_ascii_lowercase(),
+                Value::Object(row.clone()),
+            )]),
+        };
+        let ctx = Ctx {
+            row: Some(&qrow),
+            docs,
+            params,
+            group: None,
+            cfg,
+        };
+        let mut keys = Vec::with_capacity(stmt.order_by.len());
+        for (expr, _) in &stmt.order_by {
+            keys.push(eval(expr, &ctx)?);
+        }
+        keyed.push((keys, row));
+    }
+    keyed.sort_by(|a, b| compare_keys(&a.0, &b.0, &stmt.order_by));
+    *rows = keyed.into_iter().map(|(_, row)| row).collect();
+    Ok(())
+}
+
+fn apply_distinct_and_window(
+    rows: &mut Vec<Map<String, Value>>,
+    stmt: &SelectStmt,
+    params: &HashMap<String, Value>,
+) -> Result<(), String> {
+    if stmt.distinct {
+        let mut seen = std::collections::HashSet::new();
+        rows.retain(|r| seen.insert(serde_json::to_string(r).unwrap_or_default()));
+    }
+
+    if let Some(top) = eval_count(stmt.top.as_ref(), params)? {
+        rows.truncate(top);
+    }
     let offset = eval_count(stmt.offset.as_ref(), params)?.unwrap_or(0);
     if offset > 0 {
         rows.drain(0..offset.min(rows.len()));
@@ -116,11 +368,7 @@ pub fn execute(
     if let Some(limit) = eval_count(stmt.limit.as_ref(), params)? {
         rows.truncate(limit);
     }
-    if let Some(top) = eval_count(stmt.top.as_ref(), params)? {
-        rows.truncate(top);
-    }
-
-    Ok(ExecResult { rows, is_value })
+    Ok(())
 }
 
 fn eval_count(
@@ -131,9 +379,11 @@ fn eval_count(
         return Ok(None);
     };
     let ctx = Ctx {
-        alias: "",
-        doc: &Value::Null,
+        row: None,
+        docs: &[],
         params,
+        group: None,
+        cfg: EvalConfig::default(),
     };
     match eval(expr, &ctx)? {
         Some(Value::Number(n)) => Ok(Some(n.as_f64().unwrap_or(0.0).max(0.0) as usize)),
@@ -143,114 +393,188 @@ fn eval_count(
 
 fn is_aggregate_projection(projection: &Projection) -> bool {
     match projection {
-        Projection::Value(expr) => is_aggregate_expr(expr),
-        Projection::Items(items) => items.iter().any(|i| is_aggregate_expr(&i.expr)),
+        Projection::Value(expr) => contains_aggregate_expr(expr),
+        Projection::Items(items) => items.iter().any(|i| contains_aggregate_expr(&i.expr)),
         Projection::Star => false,
     }
 }
 
-fn is_aggregate_expr(expr: &Expr) -> bool {
-    matches!(expr, Expr::Call { name, .. } if functions::is_aggregate(name))
+fn contains_aggregate_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { name, args } => {
+            functions::is_aggregate(name) || args.iter().any(contains_aggregate_expr)
+        }
+        Expr::Unary(_, e) => contains_aggregate_expr(e),
+        Expr::Binary(_, l, r) => contains_aggregate_expr(l) || contains_aggregate_expr(r),
+        Expr::Between { expr, lo, hi, .. } => {
+            contains_aggregate_expr(expr)
+                || contains_aggregate_expr(lo)
+                || contains_aggregate_expr(hi)
+        }
+        Expr::In { expr, items, .. } => {
+            contains_aggregate_expr(expr) || items.iter().any(contains_aggregate_expr)
+        }
+        Expr::Member(base, _) => contains_aggregate_expr(base),
+        Expr::Index(base, idx) => contains_aggregate_expr(base) || contains_aggregate_expr(idx),
+        Expr::Array(items) => items.iter().any(contains_aggregate_expr),
+        Expr::Object(fields) => fields.iter().any(|(_, e)| contains_aggregate_expr(e)),
+        Expr::Subquery(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Star | Expr::Identifier(_) => {
+            false
+        }
+    }
 }
 
-fn compute_aggregates(
+fn execute_grouped(
     stmt: &SelectStmt,
-    docs: &[&Value],
+    rows: Vec<QueryRow>,
+    docs: &[Value],
     params: &HashMap<String, Value>,
-) -> Result<Map<String, Value>, String> {
-    let mut row = Map::new();
-    match &stmt.projection {
-        Projection::Value(expr) => {
-            let v = eval_aggregate(expr, stmt, docs, params)?;
-            row.insert("$1".into(), v.unwrap_or(Value::Null));
+    cfg: EvalConfig<'_>,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let groups = build_groups(stmt, rows, docs, params, cfg)?;
+    let mut out = Vec::new();
+    for group in groups {
+        let representative = group.rows.first();
+        let ctx = Ctx {
+            row: representative,
+            docs,
+            params,
+            group: Some(&group.rows),
+            cfg,
+        };
+        if let Some(row) = project(&stmt.projection, &ctx)? {
+            out.push(row);
         }
-        Projection::Items(items) => {
-            for (idx, item) in items.iter().enumerate() {
-                let name = item
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| format!("${}", idx + 1));
-                let v = if is_aggregate_expr(&item.expr) {
-                    eval_aggregate(&item.expr, stmt, docs, params)?
-                } else {
-                    // Constant / scalar item over the first row (rare in aggregate mode).
-                    None
-                };
-                if let Some(v) = v {
-                    row.insert(name, v);
-                }
+    }
+    Ok(out)
+}
+
+struct Group {
+    key: Vec<QVal>,
+    rows: Vec<QueryRow>,
+}
+
+fn build_groups(
+    stmt: &SelectStmt,
+    rows: Vec<QueryRow>,
+    docs: &[Value],
+    params: &HashMap<String, Value>,
+    cfg: EvalConfig<'_>,
+) -> Result<Vec<Group>, String> {
+    if stmt.group_by.is_empty() {
+        return Ok(vec![Group {
+            key: Vec::new(),
+            rows,
+        }]);
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for row in rows {
+        let ctx = Ctx {
+            row: Some(&row),
+            docs,
+            params,
+            group: None,
+            cfg,
+        };
+        let key = stmt
+            .group_by
+            .iter()
+            .map(|e| eval(e, &ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(existing) = groups.iter_mut().find(|g| keys_equal(&g.key, &key)) {
+            existing.rows.push(row);
+        } else {
+            groups.push(Group {
+                key,
+                rows: vec![row],
+            });
+        }
+    }
+    Ok(groups)
+}
+
+fn keys_equal(a: &[QVal], b: &[QVal]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(left, right)| match (left, right) {
+            (None, None) => true,
+            _ => equals(left, right) == Some(true),
+        })
+}
+
+fn eval_aggregate_call(name: &str, args: &[Expr], ctx: &Ctx) -> Result<QVal, String> {
+    let group = ctx
+        .group
+        .ok_or_else(|| format!("Aggregate {name} is only valid in aggregate context"))?;
+    let upper = name.to_ascii_uppercase();
+    if args.len() != 1 {
+        return Err(format!("Function '{name}' expects a single argument"));
+    }
+    let argument = &args[0];
+    if upper == "COUNT" {
+        let count = match argument {
+            Expr::Star | Expr::Lit(_) => group.len(),
+            _ => group
+                .iter()
+                .filter(|row| {
+                    let inner = Ctx {
+                        row: Some(row),
+                        docs: ctx.docs,
+                        params: ctx.params,
+                        group: None,
+                        cfg: ctx.cfg,
+                    };
+                    matches!(eval(argument, &inner), Ok(Some(v)) if !v.is_null())
+                })
+                .count(),
+        };
+        return Ok(Some(Value::from(count as i64)));
+    }
+
+    let mut values = Vec::new();
+    for row in group {
+        let inner = Ctx {
+            row: Some(row),
+            docs: ctx.docs,
+            params: ctx.params,
+            group: None,
+            cfg: ctx.cfg,
+        };
+        if let Some(v) = eval(argument, &inner)? {
+            if !v.is_null() {
+                values.push(Some(v));
             }
         }
-        Projection::Star => {}
-    }
-    Ok(row)
-}
-
-fn eval_aggregate(
-    expr: &Expr,
-    stmt: &SelectStmt,
-    docs: &[&Value],
-    params: &HashMap<String, Value>,
-) -> Result<QVal, String> {
-    let Expr::Call { name, args } = expr else {
-        return Ok(None);
-    };
-    let upper = name.to_ascii_uppercase();
-    let inner = args.first();
-
-    // Evaluate the argument for each document.
-    let mut values: Vec<QVal> = Vec::new();
-    for doc in docs {
-        let ctx = Ctx {
-            alias: &stmt.from_alias,
-            doc,
-            params,
-        };
-        let v = match inner {
-            Some(e) => eval(e, &ctx)?,
-            None => Some(Value::Null),
-        };
-        values.push(v);
     }
 
     let result = match upper.as_str() {
-        "COUNT" => {
-            let count = match inner {
-                // COUNT(1) / COUNT(*) — count all rows.
-                Some(Expr::Lit(_)) | None => docs.len(),
-                // COUNT(expr) — count defined (non-undefined) values.
-                _ => values.iter().filter(|v| v.is_some()).count(),
-            };
-            Some(Value::from(count as i64))
-        }
         "SUM" => {
             let nums: Vec<f64> = values.iter().filter_map(crate::value::as_f64).collect();
             if nums.is_empty() {
-                None
+                Some(Value::Null)
             } else {
-                number(nums.iter().sum())
+                number(nums.iter().sum()).or(Some(Value::Null))
             }
         }
         "AVG" => {
             let nums: Vec<f64> = values.iter().filter_map(crate::value::as_f64).collect();
             if nums.is_empty() {
-                None
+                Some(Value::Null)
             } else {
-                number(nums.iter().sum::<f64>() / nums.len() as f64)
+                number(nums.iter().sum::<f64>() / nums.len() as f64).or(Some(Value::Null))
             }
         }
         "MIN" => values
             .iter()
-            .filter(|v| v.is_some())
             .min_by(|a, b| total_cmp(a, b))
             .cloned()
-            .flatten(),
+            .flatten()
+            .or(Some(Value::Null)),
         "MAX" => values
             .iter()
-            .filter(|v| v.is_some())
             .max_by(|a, b| total_cmp(a, b))
             .cloned()
-            .flatten(),
+            .flatten()
+            .or(Some(Value::Null)),
         _ => None,
     };
     Ok(result)
@@ -259,9 +583,14 @@ fn eval_aggregate(
 fn project(projection: &Projection, ctx: &Ctx) -> Result<Option<Map<String, Value>>, String> {
     match projection {
         Projection::Star => {
-            // `SELECT *` returns the root document object.
-            match ctx.doc {
-                Value::Object(map) => Ok(Some(map.clone())),
+            let Some(row) = ctx.row else {
+                return Ok(None);
+            };
+            match row
+                .get("c")
+                .or_else(|| row.aliases.values().next().cloned())
+            {
+                Some(Value::Object(map)) => Ok(Some(map)),
                 _ => Ok(None),
             }
         }
@@ -275,7 +604,6 @@ fn project(projection: &Projection, ctx: &Ctx) -> Result<Option<Map<String, Valu
             let mut row = Map::new();
             for (idx, item) in items.iter().enumerate() {
                 let v = eval(&item.expr, ctx)?;
-                // Undefined properties are omitted from the output object.
                 let Some(v) = v else {
                     continue;
                 };
@@ -303,13 +631,8 @@ fn eval(expr: &Expr, ctx: &Ctx) -> Result<QVal, String> {
     match expr {
         Expr::Lit(v) => Ok(Some(v.clone())),
         Expr::Param(p) => Ok(ctx.params.get(p).cloned()),
-        Expr::Identifier(name) => {
-            if name == ctx.alias {
-                Ok(Some(ctx.doc.clone()))
-            } else {
-                Ok(None)
-            }
-        }
+        Expr::Star => Ok(None),
+        Expr::Identifier(name) => Ok(ctx.row.and_then(|r| r.get(name))),
         Expr::Member(base, name) => {
             let base = eval(base, ctx)?;
             match base {
@@ -383,15 +706,58 @@ fn eval(expr: &Expr, ctx: &Ctx) -> Result<QVal, String> {
         }
         Expr::Call { name, args } => {
             if functions::is_aggregate(name) {
-                return Err(format!(
-                    "Aggregate {name} is only valid in the SELECT projection"
-                ));
+                return eval_aggregate_call(name, args, ctx);
             }
             let mut evaluated = Vec::with_capacity(args.len());
             for a in args {
                 evaluated.push(eval(a, ctx)?);
             }
+            if name.len() > 4 && name[..4].eq_ignore_ascii_case("udf.") {
+                let udf_name = &name[4..];
+                let (Some(database_id), Some(container_id), Some(resolver)) = (
+                    ctx.cfg.database_id,
+                    ctx.cfg.container_id,
+                    ctx.cfg.udf_resolver,
+                ) else {
+                    return Ok(None);
+                };
+                let args: Vec<Value> = evaluated
+                    .into_iter()
+                    .map(|value| value.unwrap_or(Value::Null))
+                    .collect();
+                return Ok(resolver.eval(database_id, container_id, udf_name, &args));
+            }
             functions::call(name, &evaluated)
+        }
+        Expr::Subquery(stmt) => {
+            let Some(row) = ctx.row else {
+                return Ok(None);
+            };
+            if let Some(source) = &stmt.from_in {
+                let source_ctx = Ctx {
+                    row: Some(row),
+                    docs: ctx.docs,
+                    params: ctx.params,
+                    group: None,
+                    cfg: ctx.cfg,
+                };
+                if !matches!(eval(source, &source_ctx)?, Some(Value::Array(_))) {
+                    return Ok(None);
+                }
+            }
+            let result = execute_select(stmt, ctx.docs, ctx.params, Some(row), ctx.cfg)?;
+            if result.rows.is_empty() {
+                return Ok(None);
+            }
+            if result.rows.len() > 1 {
+                return Err("Scalar subquery must return at most one row".into());
+            }
+            let row = &result.rows[0];
+            if row.len() == 1 && row.contains_key("$1") {
+                Ok(row.get("$1").cloned())
+            } else {
+                Ok(Some(Value::Object(row.clone())))
+            }
         }
         Expr::Array(items) => {
             let mut out = Vec::new();
@@ -415,7 +781,6 @@ fn eval(expr: &Expr, ctx: &Ctx) -> Result<QVal, String> {
 }
 
 fn eval_binary(op: BinOp, l: &Expr, r: &Expr, ctx: &Ctx) -> Result<QVal, String> {
-    // Short-circuit three-valued logic for AND/OR.
     if op == BinOp::And {
         let lv = eval(l, ctx)?;
         if matches!(lv, Some(Value::Bool(false))) {
@@ -467,5 +832,39 @@ fn arith(l: &QVal, r: &QVal, f: impl Fn(f64, f64) -> f64) -> QVal {
     match (crate::value::as_f64(l), crate::value::as_f64(r)) {
         (Some(a), Some(b)) => number(f(a, b)),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorMetric {
+    Cosine,
+    DotProduct,
+    Euclidean,
+}
+
+fn vector_metric(expr: &Expr, evaluated_options: Option<&Value>) -> VectorMetric {
+    if let Some(Value::Object(options)) = evaluated_options {
+        if let Some(Value::String(df)) = options.get("distanceFunction") {
+            return parse_metric(df);
+        }
+    }
+    if let Expr::Call { args, .. } = expr {
+        if let Some(Expr::Object(fields)) = args.get(3) {
+            if let Some((_, Expr::Lit(Value::String(df)))) = fields
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("distanceFunction"))
+            {
+                return parse_metric(df);
+            }
+        }
+    }
+    VectorMetric::Cosine
+}
+
+fn parse_metric(value: &str) -> VectorMetric {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "dotproduct" | "dot product" => VectorMetric::DotProduct,
+        "euclidean" => VectorMetric::Euclidean,
+        _ => VectorMetric::Cosine,
     }
 }

@@ -5,6 +5,7 @@ members = [
     "crates/storage",
     "crates/auth",
     "crates/query",
+    "crates/kql",
     "crates/nosql",
     "crates/mongodb",
     "crates/triggers",
@@ -25,6 +26,7 @@ repository = "https://github.com/pbrouillet/azure-light-cosmos-emulator"
 # Async runtime & HTTP
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 hyper = "1"
@@ -43,6 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+rcgen = "0.13"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -57,6 +60,7 @@ cosmos-core = { path = "crates/core" }
 cosmos-storage = { path = "crates/storage" }
 cosmos-auth = { path = "crates/auth" }
 cosmos-query = { path = "crates/query" }
+cosmos-kql = { path = "crates/kql" }
 cosmos-nosql = { path = "crates/nosql" }
 cosmos-mongodb = { path = "crates/mongodb" }
 cosmos-triggers = { path = "crates/triggers" }

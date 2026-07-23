@@ -36,7 +36,7 @@ pub enum Token {
 
 const KEYWORDS: &[&str] = &[
     "SELECT", "DISTINCT", "VALUE", "TOP", "FROM", "WHERE", "ORDER", "BY", "ASC", "DESC", "OFFSET",
-    "LIMIT", "AND", "OR", "NOT", "IN", "BETWEEN", "AS", "NULL", "TRUE", "FALSE", "JOIN",
+    "LIMIT", "AND", "OR", "NOT", "IN", "BETWEEN", "AS", "NULL", "TRUE", "FALSE", "JOIN", "GROUP",
 ];
 
 /// Tokenizes `input`, returning the token stream or an error message.

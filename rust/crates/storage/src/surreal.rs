@@ -22,7 +22,9 @@ use chrono::{TimeZone, Utc};
 use cosmos_core::error::{CosmosError, CosmosResult};
 use cosmos_core::ids::etag;
 use cosmos_core::models::*;
-use cosmos_core::traits::{ChangeFeedOptions, ChangeFeedProvider, DocumentStore};
+use cosmos_core::traits::{
+    ActivityStore, ChangeFeedOptions, ChangeFeedProvider, DocumentStore, QueryTelemetryStore,
+};
 use serde::{Deserialize, Serialize};
 use surrealdb::engine::local::{Db, SurrealKv};
 use surrealdb::Surreal;
@@ -31,6 +33,9 @@ use crate::changefeed::page_items;
 use crate::common::{
     apply_patch, deserialize_partition_key, extract_partition_key, require_id,
     serialize_partition_key, MAX_DOCUMENT_SIZE_BYTES,
+};
+use crate::programmability::{
+    ProgrammabilityRecord, ProgrammabilityRecordStore, ProgrammabilityTable,
 };
 
 const DATABASE_TABLE: &str = "cosmos_databases";
@@ -41,6 +46,11 @@ const PERMISSION_TABLE: &str = "cosmos_permissions";
 const OFFER_TABLE: &str = "cosmos_offers";
 const META_TABLE: &str = "cosmos_meta";
 const CHANGEFEED_TABLE: &str = "cosmos_changefeed";
+const ACTIVITY_TABLE: &str = "cosmos_activity_log";
+const QUERY_TELEMETRY_TABLE: &str = "cosmos_query_telemetry";
+const SPROC_TABLE: &str = "cosmos_sprocs";
+const TRIGGER_TABLE: &str = "cosmos_triggers";
+const UDF_TABLE: &str = "cosmos_udfs";
 const GLOBAL_LSN_KEY: &str = "global_lsn";
 const NAMESPACE: &str = "emulator";
 const DATABASE: &str = "cosmos";
@@ -142,12 +152,84 @@ struct ChangeRow {
     timestamp: i64,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ActivityRow {
+    method: String,
+    path: String,
+    status_code: i32,
+    request_charge: f64,
+    latency_ms: f64,
+    database_id: Option<String>,
+    container_id: Option<String>,
+    timestamp: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct QueryTelemetryRow {
+    database_id: String,
+    container_id: String,
+    sql_text: String,
+    partition_key: Option<String>,
+    consistency_level: String,
+    request_charge: f64,
+    latency_ms: i64,
+    item_count: i32,
+    status_code: i32,
+    activity_id: String,
+    continuation_token: Option<String>,
+    is_cross_partition: bool,
+    timestamp: i64,
+    query_plan: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SprocRow {
+    cosmos_id: String,
+    database_id: String,
+    container_id: String,
+    rid: String,
+    etag: String,
+    timestamp: i64,
+    body: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct TriggerRow {
+    cosmos_id: String,
+    database_id: String,
+    container_id: String,
+    rid: String,
+    etag: String,
+    timestamp: i64,
+    body: String,
+    trigger_type: i32,
+    trigger_operation: i32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct UdfRow {
+    cosmos_id: String,
+    database_id: String,
+    container_id: String,
+    rid: String,
+    etag: String,
+    timestamp: i64,
+    body: String,
+}
+
 // ─── Store ───────────────────────────────────────────────────────────────────
 
 /// SurrealDB (embedded SurrealKV) implementation of [`DocumentStore`].
 pub struct SurrealDbDocumentStore {
     db: Surreal<Db>,
     next_lsn: AtomicI64,
+}
+
+/// SurrealDB-backed programmability record store.
+pub struct SurrealDbProgrammabilityRecordStore {
+    db: Surreal<Db>,
 }
 
 impl SurrealDbDocumentStore {
@@ -169,8 +251,12 @@ impl SurrealDbDocumentStore {
 
     /// Creates a store backed by an in-memory SurrealKV instance (used by tests).
     pub async fn in_memory() -> CosmosResult<Self> {
-        // A unique temp path per instance keeps parallel tests isolated.
-        let path = std::env::temp_dir().join(format!("cosmos-surreal-{}", uuid_like()));
+        // A unique workspace-local path per instance keeps parallel tests isolated.
+        let path = std::env::current_dir()
+            .map_err(|e| CosmosError::internal_server_error(e.to_string()))?
+            .join("target")
+            .join("cosmos-surreal")
+            .join(uuid_like());
         Self::open(path).await
     }
 
@@ -198,6 +284,27 @@ impl SurrealDbDocumentStore {
     /// the same `cosmos_changefeed` table this store writes to.
     pub fn change_feed(&self) -> SurrealDbChangeFeedProvider {
         SurrealDbChangeFeedProvider {
+            db: self.db.clone(),
+        }
+    }
+
+    /// Returns an activity store sharing this store's SurrealDB connection.
+    pub fn activity_store(&self) -> SurrealDbActivityStore {
+        SurrealDbActivityStore {
+            db: self.db.clone(),
+        }
+    }
+
+    /// Returns a query telemetry store sharing this store's SurrealDB connection.
+    pub fn query_telemetry_store(&self) -> SurrealDbQueryTelemetryStore {
+        SurrealDbQueryTelemetryStore {
+            db: self.db.clone(),
+        }
+    }
+
+    /// Returns a programmability record store sharing this SurrealDB connection.
+    pub fn programmability_store(&self) -> SurrealDbProgrammabilityRecordStore {
+        SurrealDbProgrammabilityRecordStore {
             db: self.db.clone(),
         }
     }
@@ -302,6 +409,333 @@ impl SurrealDbDocumentStore {
             .map_err(surreal_err)?;
         row.map(|_| ())
             .ok_or_else(|| CosmosError::not_found("database", database_id))
+    }
+}
+
+/// SurrealDB-backed activity log store.
+pub struct SurrealDbActivityStore {
+    db: Surreal<Db>,
+}
+
+#[async_trait]
+impl ActivityStore for SurrealDbActivityStore {
+    async fn record(&self, entry: ActivityEntry) -> CosmosResult<()> {
+        let row = ActivityRow {
+            method: entry.method,
+            path: entry.path,
+            status_code: entry.status_code,
+            request_charge: entry.request_charge,
+            latency_ms: entry.latency_ms,
+            database_id: entry.database_id,
+            container_id: entry.container_id,
+            timestamp: entry.timestamp.timestamp_millis(),
+        };
+        let _: Option<ActivityRow> = self
+            .db
+            .upsert((ACTIVITY_TABLE, encode_key(&uuid_like())))
+            .content(row)
+            .await
+            .map_err(surreal_err)?;
+        Ok(())
+    }
+
+    async fn list(&self, max_items: i32) -> CosmosResult<Vec<ActivityEntry>> {
+        let mut rows: Vec<ActivityRow> =
+            self.db.select(ACTIVITY_TABLE).await.map_err(surreal_err)?;
+        rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        rows.truncate(max_items.max(0) as usize);
+        Ok(rows
+            .into_iter()
+            .map(|row| ActivityEntry {
+                timestamp: Utc
+                    .timestamp_millis_opt(row.timestamp)
+                    .single()
+                    .unwrap_or_else(Utc::now),
+                method: row.method,
+                path: row.path,
+                status_code: row.status_code,
+                request_charge: row.request_charge,
+                latency_ms: row.latency_ms,
+                database_id: row.database_id,
+                container_id: row.container_id,
+            })
+            .collect())
+    }
+
+    async fn clear(&self) -> CosmosResult<()> {
+        let _: Vec<ActivityRow> = self.db.delete(ACTIVITY_TABLE).await.map_err(surreal_err)?;
+        Ok(())
+    }
+
+    async fn trim(&self, max_entries: i32) -> CosmosResult<()> {
+        let rows: Vec<ActivityRow> = self.db.select(ACTIVITY_TABLE).await.map_err(surreal_err)?;
+        if rows.len() > max_entries.max(0) as usize {
+            self.clear().await?;
+        }
+        Ok(())
+    }
+}
+
+/// SurrealDB-backed query telemetry store.
+pub struct SurrealDbQueryTelemetryStore {
+    db: Surreal<Db>,
+}
+
+#[async_trait]
+impl QueryTelemetryStore for SurrealDbQueryTelemetryStore {
+    async fn record(&self, entry: QueryTelemetryEntry) -> CosmosResult<()> {
+        let row = QueryTelemetryRow {
+            database_id: entry.database_id,
+            container_id: entry.container_id,
+            sql_text: entry.sql_text,
+            partition_key: entry.partition_key,
+            consistency_level: entry.consistency_level,
+            request_charge: entry.request_charge,
+            latency_ms: entry.latency_ms,
+            item_count: entry.item_count,
+            status_code: entry.status_code,
+            activity_id: entry.activity_id,
+            continuation_token: entry.continuation_token,
+            is_cross_partition: entry.is_cross_partition,
+            timestamp: entry.timestamp.timestamp_millis(),
+            query_plan: entry.query_plan,
+        };
+        let _: Option<QueryTelemetryRow> = self
+            .db
+            .upsert((QUERY_TELEMETRY_TABLE, encode_key(&entry.id)))
+            .content(row)
+            .await
+            .map_err(surreal_err)?;
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        database_id: Option<&str>,
+        container_id: Option<&str>,
+        max_items: i32,
+    ) -> CosmosResult<Vec<QueryTelemetryEntry>> {
+        let mut rows: Vec<QueryTelemetryRow> = self
+            .db
+            .select(QUERY_TELEMETRY_TABLE)
+            .await
+            .map_err(surreal_err)?;
+        rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        let entries = rows
+            .into_iter()
+            .filter(|row| {
+                database_id.is_none_or(|db| row.database_id.eq_ignore_ascii_case(db))
+                    && container_id
+                        .is_none_or(|container| row.container_id.eq_ignore_ascii_case(container))
+            })
+            .take(max_items.max(0) as usize)
+            .map(|row| {
+                let default = QueryTelemetryEntry::default();
+                QueryTelemetryEntry {
+                    id: default.id,
+                    timestamp: Utc
+                        .timestamp_millis_opt(row.timestamp)
+                        .single()
+                        .unwrap_or_else(Utc::now),
+                    database_id: row.database_id,
+                    container_id: row.container_id,
+                    sql_text: row.sql_text,
+                    partition_key: row.partition_key,
+                    consistency_level: row.consistency_level,
+                    request_charge: row.request_charge,
+                    latency_ms: row.latency_ms,
+                    item_count: row.item_count,
+                    status_code: row.status_code,
+                    activity_id: row.activity_id,
+                    continuation_token: row.continuation_token,
+                    is_cross_partition: row.is_cross_partition,
+                    query_plan: row.query_plan,
+                }
+            })
+            .collect();
+        Ok(entries)
+    }
+
+    async fn clear(&self) -> CosmosResult<()> {
+        let _: Vec<QueryTelemetryRow> = self
+            .db
+            .delete(QUERY_TELEMETRY_TABLE)
+            .await
+            .map_err(surreal_err)?;
+        Ok(())
+    }
+
+    async fn trim(&self, max_entries: i32) -> CosmosResult<()> {
+        let rows: Vec<QueryTelemetryRow> = self
+            .db
+            .select(QUERY_TELEMETRY_TABLE)
+            .await
+            .map_err(surreal_err)?;
+        if rows.len() > max_entries.max(0) as usize {
+            self.clear().await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProgrammabilityRecordStore for SurrealDbProgrammabilityRecordStore {
+    async fn select_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+    ) -> CosmosResult<Option<ProgrammabilityRecord>> {
+        match table {
+            ProgrammabilityTable::StoredProcedures => {
+                let row: Option<SprocRow> = self
+                    .db
+                    .select((SPROC_TABLE, record_key.to_string()))
+                    .await
+                    .map_err(surreal_err)?;
+                Ok(row.map(|r| ProgrammabilityRecord::StoredProcedure(row_to_sproc(r))))
+            }
+            ProgrammabilityTable::Triggers => {
+                let row: Option<TriggerRow> = self
+                    .db
+                    .select((TRIGGER_TABLE, record_key.to_string()))
+                    .await
+                    .map_err(surreal_err)?;
+                Ok(row.map(|r| ProgrammabilityRecord::Trigger(row_to_trigger(r))))
+            }
+            ProgrammabilityTable::UserDefinedFunctions => {
+                let row: Option<UdfRow> = self
+                    .db
+                    .select((UDF_TABLE, record_key.to_string()))
+                    .await
+                    .map_err(surreal_err)?;
+                Ok(row.map(|r| ProgrammabilityRecord::UserDefinedFunction(row_to_udf(r))))
+            }
+        }
+    }
+
+    async fn select_table_records(
+        &self,
+        table: ProgrammabilityTable,
+    ) -> CosmosResult<Vec<ProgrammabilityRecord>> {
+        match table {
+            ProgrammabilityTable::StoredProcedures => {
+                let mut rows: Vec<SprocRow> =
+                    self.db.select(SPROC_TABLE).await.map_err(surreal_err)?;
+                rows.sort_by(|a, b| a.cosmos_id.cmp(&b.cosmos_id));
+                Ok(rows
+                    .into_iter()
+                    .map(|r| ProgrammabilityRecord::StoredProcedure(row_to_sproc(r)))
+                    .collect())
+            }
+            ProgrammabilityTable::Triggers => {
+                let mut rows: Vec<TriggerRow> =
+                    self.db.select(TRIGGER_TABLE).await.map_err(surreal_err)?;
+                rows.sort_by(|a, b| a.cosmos_id.cmp(&b.cosmos_id));
+                Ok(rows
+                    .into_iter()
+                    .map(|r| ProgrammabilityRecord::Trigger(row_to_trigger(r)))
+                    .collect())
+            }
+            ProgrammabilityTable::UserDefinedFunctions => {
+                let mut rows: Vec<UdfRow> = self.db.select(UDF_TABLE).await.map_err(surreal_err)?;
+                rows.sort_by(|a, b| a.cosmos_id.cmp(&b.cosmos_id));
+                Ok(rows
+                    .into_iter()
+                    .map(|r| ProgrammabilityRecord::UserDefinedFunction(row_to_udf(r)))
+                    .collect())
+            }
+        }
+    }
+
+    async fn create_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        record: ProgrammabilityRecord,
+    ) -> CosmosResult<()> {
+        self.upsert_record(table, record_key, record).await
+    }
+
+    async fn upsert_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        record: ProgrammabilityRecord,
+    ) -> CosmosResult<()> {
+        match (table, record) {
+            (ProgrammabilityTable::StoredProcedures, ProgrammabilityRecord::StoredProcedure(s)) => {
+                let _: Option<SprocRow> = self
+                    .db
+                    .upsert((SPROC_TABLE, record_key.to_string()))
+                    .content(sproc_to_row(&s))
+                    .await
+                    .map_err(surreal_err)?;
+            }
+            (ProgrammabilityTable::Triggers, ProgrammabilityRecord::Trigger(t)) => {
+                let _: Option<TriggerRow> = self
+                    .db
+                    .upsert((TRIGGER_TABLE, record_key.to_string()))
+                    .content(trigger_to_row(&t))
+                    .await
+                    .map_err(surreal_err)?;
+            }
+            (
+                ProgrammabilityTable::UserDefinedFunctions,
+                ProgrammabilityRecord::UserDefinedFunction(u),
+            ) => {
+                let _: Option<UdfRow> = self
+                    .db
+                    .upsert((UDF_TABLE, record_key.to_string()))
+                    .content(udf_to_row(&u))
+                    .await
+                    .map_err(surreal_err)?;
+            }
+            _ => {
+                return Err(CosmosError::internal_server_error(
+                    "programmability table/record mismatch",
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> CosmosResult<()> {
+        let deleted = match table {
+            ProgrammabilityTable::StoredProcedures => {
+                let row: Option<SprocRow> = self
+                    .db
+                    .delete((SPROC_TABLE, record_key.to_string()))
+                    .await
+                    .map_err(surreal_err)?;
+                row.is_some()
+            }
+            ProgrammabilityTable::Triggers => {
+                let row: Option<TriggerRow> = self
+                    .db
+                    .delete((TRIGGER_TABLE, record_key.to_string()))
+                    .await
+                    .map_err(surreal_err)?;
+                row.is_some()
+            }
+            ProgrammabilityTable::UserDefinedFunctions => {
+                let row: Option<UdfRow> = self
+                    .db
+                    .delete((UDF_TABLE, record_key.to_string()))
+                    .await
+                    .map_err(surreal_err)?;
+                row.is_some()
+            }
+        };
+        if !deleted {
+            return Err(CosmosError::not_found(resource_type, resource_id));
+        }
+        Ok(())
     }
 }
 
@@ -1436,6 +1870,110 @@ fn row_to_offer(row: OfferRow) -> CosmosOffer {
     }
 }
 
+fn sproc_to_row(s: &StoredProcedure) -> SprocRow {
+    SprocRow {
+        cosmos_id: s.id.clone(),
+        database_id: s.database_id.clone(),
+        container_id: s.container_id.clone(),
+        rid: s.rid.clone(),
+        etag: s.etag.clone(),
+        timestamp: s.timestamp,
+        body: s.body.clone(),
+    }
+}
+
+fn trigger_to_row(t: &Trigger) -> TriggerRow {
+    TriggerRow {
+        cosmos_id: t.id.clone(),
+        database_id: t.database_id.clone(),
+        container_id: t.container_id.clone(),
+        rid: t.rid.clone(),
+        etag: t.etag.clone(),
+        timestamp: t.timestamp,
+        body: t.body.clone(),
+        trigger_type: t.trigger_type.as_int(),
+        trigger_operation: t.trigger_operation.as_int(),
+    }
+}
+
+fn udf_to_row(u: &UserDefinedFunction) -> UdfRow {
+    UdfRow {
+        cosmos_id: u.id.clone(),
+        database_id: u.database_id.clone(),
+        container_id: u.container_id.clone(),
+        rid: u.rid.clone(),
+        etag: u.etag.clone(),
+        timestamp: u.timestamp,
+        body: u.body.clone(),
+    }
+}
+
+fn row_to_sproc(row: SprocRow) -> StoredProcedure {
+    StoredProcedure {
+        self_link: format!(
+            "dbs/{}/colls/{}/sprocs/{}/",
+            row.database_id, row.container_id, row.cosmos_id
+        ),
+        id: row.cosmos_id,
+        database_id: row.database_id,
+        container_id: row.container_id,
+        rid: row.rid,
+        etag: row.etag,
+        timestamp: row.timestamp,
+        body: row.body,
+    }
+}
+
+fn row_to_trigger(row: TriggerRow) -> Trigger {
+    Trigger {
+        self_link: format!(
+            "dbs/{}/colls/{}/triggers/{}/",
+            row.database_id, row.container_id, row.cosmos_id
+        ),
+        id: row.cosmos_id,
+        database_id: row.database_id,
+        container_id: row.container_id,
+        rid: row.rid,
+        etag: row.etag,
+        timestamp: row.timestamp,
+        body: row.body,
+        trigger_type: trigger_type_from_int(row.trigger_type),
+        trigger_operation: trigger_operation_from_int(row.trigger_operation),
+    }
+}
+
+fn row_to_udf(row: UdfRow) -> UserDefinedFunction {
+    UserDefinedFunction {
+        self_link: format!(
+            "dbs/{}/colls/{}/udfs/{}/",
+            row.database_id, row.container_id, row.cosmos_id
+        ),
+        id: row.cosmos_id,
+        database_id: row.database_id,
+        container_id: row.container_id,
+        rid: row.rid,
+        etag: row.etag,
+        timestamp: row.timestamp,
+        body: row.body,
+    }
+}
+
+fn trigger_type_from_int(value: i32) -> TriggerType {
+    match value {
+        1 => TriggerType::Post,
+        _ => TriggerType::Pre,
+    }
+}
+
+fn trigger_operation_from_int(value: i32) -> TriggerOperation {
+    match value {
+        1 => TriggerOperation::Create,
+        2 => TriggerOperation::Replace,
+        3 => TriggerOperation::Delete,
+        _ => TriggerOperation::All,
+    }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn permission_mode_str(mode: PermissionMode) -> &'static str {
@@ -1646,7 +2184,11 @@ mod tests {
 
     #[tokio::test]
     async fn persistence_across_reopen() {
-        let dir = std::env::temp_dir().join(format!("cosmos-surreal-test-{}", uuid_like()));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("cosmos-surreal-tests")
+            .join(uuid_like());
         {
             let store = SurrealDbDocumentStore::open(&dir).await.unwrap();
             seed(&store).await;

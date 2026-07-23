@@ -2,15 +2,15 @@
 
 use std::collections::HashMap;
 
-use cosmos_query::run_query;
+use cosmos_query::{run_query, run_query_with_udf_resolver, UdfResolver};
 use serde_json::{json, Value};
 
 fn docs() -> Vec<Value> {
     vec![
-        json!({"id": "1", "name": "Alice", "age": 30, "city": "Paris", "tags": ["a", "b"]}),
-        json!({"id": "2", "name": "Bob", "age": 25, "city": "London", "tags": ["b", "c"]}),
+        json!({"id": "1", "name": "Alice", "age": 30, "city": "Paris", "tags": ["a", "b"], "scores": [1, 2], "embedding": [1, 0, 0], "text": "quick brown fox"}),
+        json!({"id": "2", "name": "Bob", "age": 25, "city": "London", "tags": ["b", "c"], "scores": [3], "embedding": [0, 1, 0], "text": "hello world"}),
         json!({"id": "3", "name": "Carol", "age": 35, "city": "Paris"}),
-        json!({"id": "4", "name": "Dave", "age": 25, "city": "Berlin", "tags": []}),
+        json!({"id": "4", "name": "Dave", "age": 25, "city": "Berlin", "tags": [], "embedding": [0.9, 0.1, 0]}),
     ]
 }
 
@@ -20,6 +20,34 @@ fn run(q: &str) -> Vec<Value> {
 
 fn run_p(q: &str, params: HashMap<String, Value>) -> Vec<Value> {
     run_query(q, &docs(), &params).expect("query should succeed")
+}
+
+struct TestUdfResolver;
+
+impl UdfResolver for TestUdfResolver {
+    fn eval(
+        &self,
+        _database_id: &str,
+        _container_id: &str,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Value> {
+        match name.to_ascii_lowercase().as_str() {
+            "double" => args
+                .first()
+                .and_then(Value::as_f64)
+                .map(|n| json!(n * 2.0)),
+            "citylabel" => args
+                .first()
+                .and_then(Value::as_str)
+                .map(|city| json!(format!("city:{city}"))),
+            "isparis" => args
+                .first()
+                .and_then(Value::as_str)
+                .map(|city| json!(city == "Paris")),
+            _ => None,
+        }
+    }
 }
 
 #[test]
@@ -180,4 +208,142 @@ fn undefined_property_omitted() {
     // Carol has no tags; projecting c.tags omits the property.
     let rows = run("SELECT c.tags FROM c WHERE c.id = '3'");
     assert_eq!(rows[0], json!({}));
+}
+
+#[test]
+fn join_expands_array_items() {
+    let rows = run("SELECT c.id, t AS tag FROM c JOIN t IN c.tags ORDER BY c.id, t");
+    assert_eq!(
+        rows,
+        vec![
+            json!({"id": "1", "tag": "a"}),
+            json!({"id": "1", "tag": "b"}),
+            json!({"id": "2", "tag": "b"}),
+            json!({"id": "2", "tag": "c"}),
+        ]
+    );
+}
+
+#[test]
+fn from_in_iterates_arrays() {
+    let rows = run("SELECT VALUE t FROM t IN c.tags ORDER BY t");
+    let vals: Vec<Value> = rows.into_iter().map(|r| r["$1"].clone()).collect();
+    assert_eq!(vals, vec![json!("a"), json!("b"), json!("b"), json!("c")]);
+}
+
+#[test]
+fn correlated_subquery_counts_array_items() {
+    let rows = run(
+        "SELECT c.id, (SELECT VALUE COUNT(1) FROM t IN c.tags) AS tagCount FROM c ORDER BY c.id",
+    );
+    assert_eq!(rows[0], json!({"id": "1", "tagCount": 2}));
+    assert_eq!(rows[1], json!({"id": "2", "tagCount": 2}));
+    assert_eq!(rows[2], json!({"id": "3"}));
+    assert_eq!(rows[3], json!({"id": "4", "tagCount": 0}));
+}
+
+#[test]
+fn group_by_with_aggregates() {
+    let rows = run("SELECT c.city AS city, COUNT(1) AS count, AVG(c.age) AS avgAge FROM c GROUP BY c.city ORDER BY c.city");
+    assert_eq!(
+        rows,
+        vec![
+            json!({"city": "Berlin", "count": 1, "avgAge": 25}),
+            json!({"city": "London", "count": 1, "avgAge": 25}),
+            json!({"city": "Paris", "count": 2, "avgAge": 32.5}),
+        ]
+    );
+}
+
+#[test]
+fn spatial_functions_use_geojson_fields_and_parameters() {
+    let docs = vec![json!({
+        "id": "geo",
+        "location": {"type": "Point", "coordinates": [2.3522, 48.8566]},
+        "near": {"type": "Point", "coordinates": [2.3622, 48.8566]},
+        "box": {"type": "Polygon", "coordinates": [[[2.0, 48.0], [3.0, 48.0], [3.0, 49.0], [2.0, 49.0], [2.0, 48.0]]]}
+    })];
+    let rows = run_query(
+        "SELECT ST_DISTANCE(c.location, c.near) AS d, ST_WITHIN(c.location, c.box) AS inside, ST_ISVALID(c.box) AS valid FROM c",
+        &docs,
+        &HashMap::new(),
+    ).unwrap();
+    assert!(rows[0]["d"].as_f64().unwrap() > 700.0);
+    assert_eq!(rows[0]["inside"], json!(true));
+    assert_eq!(rows[0]["valid"], json!(true));
+
+    let mut params = HashMap::new();
+    params.insert(
+        "@target".to_string(),
+        json!({"type": "Point", "coordinates": [2.3522, 48.8566]}),
+    );
+    let rows = run_query(
+        "SELECT VALUE ST_DISTANCE(c.location, @target) FROM c",
+        &docs,
+        &params,
+    )
+    .unwrap();
+    assert_eq!(rows[0]["$1"], json!(0));
+}
+
+#[test]
+fn vector_distance_scores_and_orders_nearest_first() {
+    let rows = run("SELECT TOP 2 c.id, VectorDistance(c.embedding, [1, 0, 0]) AS score FROM c ORDER BY VectorDistance(c.embedding, [1, 0, 0])");
+    let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["1", "4"]);
+    assert_eq!(rows[0]["score"], json!(1));
+}
+
+#[test]
+fn vector_distance_supports_euclidean_options() {
+    let rows = run("SELECT VALUE VectorDistance(c.embedding, [0, 0, 0], false, {\"distanceFunction\":\"euclidean\"}) FROM c WHERE c.id = '1'");
+    assert_eq!(rows[0]["$1"], json!(1));
+}
+
+#[test]
+fn full_text_functions_match_terms_case_insensitively() {
+    let rows = run("SELECT VALUE FullTextContains(c.text, 'QUICK') FROM c WHERE c.id = '1'");
+    assert_eq!(rows[0]["$1"], json!(true));
+
+    let rows = run(
+        "SELECT VALUE FullTextScore(c.text, 'quick', 'brown', 'missing') FROM c WHERE c.id = '1'",
+    );
+    assert_eq!(rows[0]["$1"], json!(2));
+
+    let rows = run("SELECT c.id FROM c WHERE FullTextContainsAny(c.text, 'world', 'missing')");
+    assert_eq!(rows, vec![json!({"id": "2"})]);
+}
+
+#[test]
+fn udf_calls_project_and_filter_with_resolver() {
+    let resolver = TestUdfResolver;
+    let rows = run_query_with_udf_resolver(
+        "SELECT c.name, udf.double(c.age) AS doubled, udf.cityLabel(c.city) AS label FROM c WHERE udf.isParis(c.city) ORDER BY c.id",
+        &docs(),
+        &HashMap::new(),
+        Some(&resolver),
+    )
+    .expect("query should succeed");
+
+    assert_eq!(
+        rows,
+        vec![
+            json!({"name": "Alice", "doubled": 60.0, "label": "city:Paris"}),
+            json!({"name": "Carol", "doubled": 70.0, "label": "city:Paris"}),
+        ]
+    );
+}
+
+#[test]
+fn missing_udf_returns_undefined() {
+    let resolver = TestUdfResolver;
+    let rows = run_query_with_udf_resolver(
+        "SELECT c.name, udf.missing(c.age) AS missing FROM c WHERE c.id = '1'",
+        &docs(),
+        &HashMap::new(),
+        Some(&resolver),
+    )
+    .expect("query should succeed");
+
+    assert_eq!(rows, vec![json!({"name": "Alice"})]);
 }

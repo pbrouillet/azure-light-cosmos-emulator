@@ -12,10 +12,13 @@ use async_trait::async_trait;
 use cosmos_core::error::{CosmosError, CosmosResult};
 use cosmos_core::ids::etag;
 use cosmos_core::models::*;
-use cosmos_core::traits::DocumentStore;
+use cosmos_core::traits::{ActivityStore, DocumentStore, QueryTelemetryStore};
 
 use crate::changefeed::{InMemoryChangeFeedProvider, InMemoryChangeLog};
 use crate::common::{apply_patch, extract_partition_key, require_id};
+use crate::programmability::{
+    ProgrammabilityRecord, ProgrammabilityRecordStore, ProgrammabilityTable,
+};
 
 #[derive(Default)]
 struct State {
@@ -25,11 +28,12 @@ struct State {
     users: HashMap<String, CosmosUser>,
     permissions: HashMap<String, CosmosPermission>,
     offers: HashMap<String, CosmosOffer>,
+    programmability: HashMap<String, ProgrammabilityRecord>,
 }
 
 /// In-memory (ephemeral) document store backed by hash maps.
 pub struct InMemoryDocumentStore {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     global_lsn: AtomicI64,
     change_log: Arc<InMemoryChangeLog>,
 }
@@ -43,7 +47,7 @@ impl Default for InMemoryDocumentStore {
 impl InMemoryDocumentStore {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
             global_lsn: AtomicI64::new(0),
             change_log: Arc::new(InMemoryChangeLog::default()),
         }
@@ -64,6 +68,222 @@ impl InMemoryDocumentStore {
     /// Returns a change-feed provider sharing this store's in-memory change log.
     pub fn change_feed(&self) -> InMemoryChangeFeedProvider {
         InMemoryChangeFeedProvider::new(Arc::clone(&self.change_log))
+    }
+
+    /// Returns a programmability record store sharing this store's in-memory
+    /// backend.
+    pub fn programmability_store(&self) -> InMemoryProgrammabilityRecordStore {
+        InMemoryProgrammabilityRecordStore {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+/// In-memory (ephemeral) programmability record store.
+#[derive(Default)]
+pub struct InMemoryProgrammabilityRecordStore {
+    state: Arc<Mutex<State>>,
+}
+
+impl InMemoryProgrammabilityRecordStore {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State::default())),
+        }
+    }
+}
+
+fn prog_key(table: ProgrammabilityTable, record_key: &str) -> String {
+    format!("{}:{record_key}", table.name())
+}
+
+fn record_matches_table(record: &ProgrammabilityRecord, table: ProgrammabilityTable) -> bool {
+    matches!(
+        (record, table),
+        (
+            ProgrammabilityRecord::StoredProcedure(_),
+            ProgrammabilityTable::StoredProcedures
+        ) | (
+            ProgrammabilityRecord::Trigger(_),
+            ProgrammabilityTable::Triggers
+        ) | (
+            ProgrammabilityRecord::UserDefinedFunction(_),
+            ProgrammabilityTable::UserDefinedFunctions
+        )
+    )
+}
+
+#[async_trait]
+impl ProgrammabilityRecordStore for InMemoryProgrammabilityRecordStore {
+    async fn select_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+    ) -> CosmosResult<Option<ProgrammabilityRecord>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .programmability
+            .get(&prog_key(table, record_key))
+            .cloned())
+    }
+
+    async fn select_table_records(
+        &self,
+        table: ProgrammabilityTable,
+    ) -> CosmosResult<Vec<ProgrammabilityRecord>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .programmability
+            .values()
+            .filter(|record| record_matches_table(record, table))
+            .cloned()
+            .collect())
+    }
+
+    async fn create_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        record: ProgrammabilityRecord,
+    ) -> CosmosResult<()> {
+        self.upsert_record(table, record_key, record).await
+    }
+
+    async fn upsert_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        record: ProgrammabilityRecord,
+    ) -> CosmosResult<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .programmability
+            .insert(prog_key(table, record_key), record);
+        Ok(())
+    }
+
+    async fn delete_record(
+        &self,
+        table: ProgrammabilityTable,
+        record_key: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> CosmosResult<()> {
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .programmability
+            .remove(&prog_key(table, record_key))
+            .is_none()
+        {
+            return Err(CosmosError::not_found(resource_type, resource_id));
+        }
+        Ok(())
+    }
+}
+
+/// In-memory (ephemeral) activity log store.
+#[derive(Default)]
+pub struct InMemoryActivityStore {
+    entries: Mutex<Vec<ActivityEntry>>,
+}
+
+impl InMemoryActivityStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl ActivityStore for InMemoryActivityStore {
+    async fn record(&self, entry: ActivityEntry) -> CosmosResult<()> {
+        self.entries.lock().unwrap().push(entry);
+        Ok(())
+    }
+
+    async fn list(&self, max_items: i32) -> CosmosResult<Vec<ActivityEntry>> {
+        let mut entries = self.entries.lock().unwrap().clone();
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.truncate(max_items.max(0) as usize);
+        Ok(entries)
+    }
+
+    async fn clear(&self) -> CosmosResult<()> {
+        self.entries.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn trim(&self, max_entries: i32) -> CosmosResult<()> {
+        let mut entries = self.entries.lock().unwrap();
+        if entries.len() <= max_entries.max(0) as usize {
+            return Ok(());
+        }
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.truncate(max_entries.max(0) as usize);
+        Ok(())
+    }
+}
+
+/// In-memory (ephemeral) query telemetry store.
+#[derive(Default)]
+pub struct InMemoryQueryTelemetryStore {
+    entries: Mutex<Vec<QueryTelemetryEntry>>,
+}
+
+impl InMemoryQueryTelemetryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl QueryTelemetryStore for InMemoryQueryTelemetryStore {
+    async fn record(&self, entry: QueryTelemetryEntry) -> CosmosResult<()> {
+        self.entries.lock().unwrap().push(entry);
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        database_id: Option<&str>,
+        container_id: Option<&str>,
+        max_items: i32,
+    ) -> CosmosResult<Vec<QueryTelemetryEntry>> {
+        let mut entries: Vec<_> = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                database_id.is_none_or(|db| entry.database_id == db)
+                    && container_id.is_none_or(|container| entry.container_id == container)
+            })
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.truncate(max_items.max(0) as usize);
+        Ok(entries)
+    }
+
+    async fn clear(&self) -> CosmosResult<()> {
+        self.entries.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn trim(&self, max_entries: i32) -> CosmosResult<()> {
+        let mut entries = self.entries.lock().unwrap();
+        if entries.len() <= max_entries.max(0) as usize {
+            return Ok(());
+        }
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.truncate(max_entries.max(0) as usize);
+        Ok(())
     }
 }
 
@@ -685,6 +905,7 @@ impl DocumentStore for InMemoryDocumentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
     use serde_json::json;
 
     fn body(id: &str, pk: &str) -> JsonObject {
@@ -771,5 +992,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(patched.body.get("value").unwrap().as_f64().unwrap(), 5.0);
+    }
+
+    #[tokio::test]
+    async fn activity_store_lists_newest_and_trims() {
+        let store = InMemoryActivityStore::new();
+        store
+            .record(ActivityEntry {
+                timestamp: Utc::now() - Duration::seconds(1),
+                method: "GET".into(),
+                path: "/dbs".into(),
+                status_code: 200,
+                request_charge: 1.0,
+                latency_ms: 2.0,
+                database_id: Some("db1".into()),
+                container_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .record(ActivityEntry {
+                timestamp: Utc::now(),
+                method: "POST".into(),
+                path: "/dbs/db1/colls".into(),
+                status_code: 201,
+                request_charge: 3.0,
+                latency_ms: 4.0,
+                database_id: Some("db1".into()),
+                container_id: Some("c1".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.list(1).await.unwrap()[0].method, "POST");
+        store.trim(1).await.unwrap();
+        let entries = store.list(10).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status_code, 201);
+    }
+
+    #[tokio::test]
+    async fn query_telemetry_store_filters_and_clears() {
+        let store = InMemoryQueryTelemetryStore::new();
+        let mut first = QueryTelemetryEntry {
+            database_id: "db1".into(),
+            container_id: "c1".into(),
+            sql_text: "SELECT * FROM c".into(),
+            timestamp: Utc::now() - Duration::seconds(1),
+            ..Default::default()
+        };
+        first.id = "first".into();
+        let second = QueryTelemetryEntry {
+            id: "second".into(),
+            database_id: "db1".into(),
+            container_id: "c2".into(),
+            sql_text: "SELECT VALUE COUNT(1) FROM c".into(),
+            timestamp: Utc::now(),
+            ..Default::default()
+        };
+        store.record(first).await.unwrap();
+        store.record(second).await.unwrap();
+
+        let filtered = store.list(Some("db1"), Some("c1"), 10).await.unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "first");
+
+        store.clear().await.unwrap();
+        assert!(store.list(None, None, 10).await.unwrap().is_empty());
     }
 }

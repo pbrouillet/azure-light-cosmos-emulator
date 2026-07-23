@@ -65,7 +65,7 @@ function __mkCollection() {
     queryDocuments: function(link, query, options, callback) {
       var env = JSON.parse(__queryDocuments(JSON.stringify(query)));
       if (!env.ok) { if (typeof callback === 'function') callback(env.error, null, null); return false; }
-      if (typeof callback === 'function') callback(null, env.result, { count: env.result.length });
+      if (typeof callback === 'function') callback(null, env.result, { count: env.result.length, options: options });
       return true;
     }
   };
@@ -417,6 +417,38 @@ pub fn run_stored_procedure(
     Ok(Some(json))
 }
 
+/// Executes a registered SQL user-defined function body by function name.
+/// Returns `None` for JavaScript `undefined`, preserving the query engine's
+/// Cosmos `Undefined` sentinel semantics.
+pub fn run_udf(function_name: &str, body: &str, args: &[Value]) -> CosmosResult<Option<Value>> {
+    let mut ctx = new_context();
+    set_global_json(&mut ctx, "__args", &Value::Array(args.to_vec()))?;
+
+    let setup = ctx.eval(Source::from_bytes(body.as_bytes()));
+    let lookup_script = format!(
+        "typeof {function_name} === 'function' ? {function_name}.apply(null, __args) : undefined;"
+    );
+    let mut result = match setup {
+        Ok(_) => ctx
+            .eval(Source::from_bytes(lookup_script.as_bytes()))
+            .map_err(|e| map_js_err("UDF execution failed", e))?,
+        Err(_) => JsValue::undefined(),
+    };
+    if result.is_undefined() {
+        let expression_script = format!("({body}).apply(null, __args);");
+        result = ctx
+            .eval(Source::from_bytes(expression_script.as_bytes()))
+            .map_err(|e| map_js_err("UDF execution failed", e))?;
+    }
+    if result.is_undefined() {
+        return Ok(None);
+    }
+    let json = result
+        .to_json(&mut ctx)
+        .map_err(|e| map_js_err("UDF execution failed", e))?;
+    Ok(Some(json))
+}
+
 /// Executes a trigger body against a document. For pre-triggers the mutated
 /// request body is returned; for post-triggers the (possibly mutated) response
 /// body is returned. Trigger bodies have no collection/store access, only
@@ -477,7 +509,12 @@ function getContext() {
     getResponse: function() {
       return {
         setBody: function(b) { __response.__body = b; },
-        getBody: function() { return __response.__body; }
+        getBody: function() { return __response.__body; },
+        appendBody: function(b) {
+          if (__response.__body === undefined || __response.__body === null) { __response.__body = b; }
+          else { __response.__body = (typeof __response.__body === 'string' ? __response.__body : JSON.stringify(__response.__body)) +
+                                   (typeof b === 'string' ? b : JSON.stringify(b)); }
+        }
       };
     },
     getRequest: function() {
