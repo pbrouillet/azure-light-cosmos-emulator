@@ -1,18 +1,30 @@
+# Docker Compose for the Rust/Axum Cosmos DB light emulator.
+#
+# Build context is the repository root (the Cargo workspace) so the whole
+# workspace — including the committed Explorer assets under
+# crates/host/wwwroot/explorer — is available to the multi-stage Dockerfile.
+#
+#   docker compose -f docker/docker-compose.yml up --build
+
 services:
   cosmos-emulator:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: cosmos-light-emulator-rust:latest
     ports:
-      - "8081:8081"
-      - "10255:10255"
+      - "8081:8081" # Cosmos NoSQL REST API
+      - "10255:10255" # MongoDB wire protocol
     volumes:
       - cosmos-data:/data
-    environment:
-      Emulator__DataDirectory: /data
-      Emulator__EnableSsl: "false"
-      DOTNET_GCConserveMemory: "9"
-    mem_limit: 512m
+    restart: unless-stopped
+    healthcheck:
+      # The host exposes an unauthenticated /health endpoint.
+      test: ["CMD", "cosmos-emulator", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   cosmos-data:

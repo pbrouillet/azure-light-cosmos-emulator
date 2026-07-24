@@ -1,47 +1,41 @@
-FROM node:20-bookworm-slim AS node
+# Multi-stage build for the Rust/Axum Cosmos DB light emulator.
+#
+# Build context is the repository root (the Cargo workspace); see
+# docker-compose.yml. The final image runs the `cosmos-emulator` CLI in the
+# foreground, serving the Cosmos NoSQL REST API on 8081 and the MongoDB wire
+# protocol on 10255. The committed Explorer SPA assets under
+# crates/host/wwwroot/explorer are embedded into the binary at build time.
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-WORKDIR /src
+FROM rust:1-bookworm AS build
+WORKDIR /build
 
-COPY --from=node /usr/local/ /usr/local/
+# System build deps. reqwest is http-only and SurrealKV is pure-Rust, so no
+# OpenSSL/RocksDB system libraries are required; pkg-config is kept for crates
+# that probe for it during their build scripts.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY ["Azure.Cosmos.LightEmulator.slnx", "Directory.Build.props", "Directory.Packages.props", "global.json", "./"]
-COPY ["src/Auth/Azure.Cosmos.LightEmulator.Auth.csproj", "src/Auth/"]
-COPY ["src/Cli/Azure.Cosmos.LightEmulator.Cli.csproj", "src/Cli/"]
-COPY ["src/Core/Azure.Cosmos.LightEmulator.Core.csproj", "src/Core/"]
-COPY ["src/Host/Azure.Cosmos.LightEmulator.Host.csproj", "src/Host/"]
-COPY ["src/Kql/Azure.Cosmos.LightEmulator.Kql.csproj", "src/Kql/"]
-COPY ["src/MongoDB/Azure.Cosmos.LightEmulator.MongoDB.csproj", "src/MongoDB/"]
-COPY ["src/NoSql/Azure.Cosmos.LightEmulator.NoSql.csproj", "src/NoSql/"]
-COPY ["src/Storage/Azure.Cosmos.LightEmulator.Storage.csproj", "src/Storage/"]
-COPY ["src/Triggers/Azure.Cosmos.LightEmulator.Triggers.csproj", "src/Triggers/"]
-COPY ["tests/Auth.Tests/Azure.Cosmos.LightEmulator.Auth.Tests.csproj", "tests/Auth.Tests/"]
-COPY ["tests/Core.Tests/Azure.Cosmos.LightEmulator.Core.Tests.csproj", "tests/Core.Tests/"]
-COPY ["tests/Host.Tests/Azure.Cosmos.LightEmulator.Host.Tests.csproj", "tests/Host.Tests/"]
-COPY ["tests/Kql.Tests/Azure.Cosmos.LightEmulator.Kql.Tests.csproj", "tests/Kql.Tests/"]
-COPY ["tests/MongoDB.Tests/Azure.Cosmos.LightEmulator.MongoDB.Tests.csproj", "tests/MongoDB.Tests/"]
-COPY ["tests/NoSql.Tests/Azure.Cosmos.LightEmulator.NoSql.Tests.csproj", "tests/NoSql.Tests/"]
-COPY ["tests/Parity.Tests/Azure.Cosmos.LightEmulator.Parity.Tests.csproj", "tests/Parity.Tests/"]
-COPY ["tests/Storage.Tests/Azure.Cosmos.LightEmulator.Storage.Tests.csproj", "tests/Storage.Tests/"]
-
-RUN dotnet restore src/Host/Azure.Cosmos.LightEmulator.Host.csproj
-
+# Copy the whole workspace and build the CLI binary in release mode.
 COPY . .
+RUN cargo build --release -p cosmos-cli
 
-RUN if [ -f src/Explorer/package.json ]; then \
-      cd src/Explorer && npm ci && npm run build; \
-    fi
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --home-dir /home/cosmos --shell /usr/sbin/nologin cosmos
 
-RUN dotnet build src/Host/Azure.Cosmos.LightEmulator.Host.csproj -c Release --no-restore
-RUN dotnet publish src/Host/Azure.Cosmos.LightEmulator.Host.csproj -c Release -o /app/publish --no-build
+COPY --from=build /build/target/release/cosmos-emulator /usr/local/bin/cosmos-emulator
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
-WORKDIR /app
-
-COPY --from=build /app/publish .
-
-EXPOSE 8081 10255
-ENV ASPNETCORE_URLS=http://+:8081
+# Persist emulator data across container restarts.
+RUN mkdir -p /data && chown cosmos:cosmos /data
 VOLUME ["/data"]
 
-ENTRYPOINT ["dotnet", "Azure.Cosmos.LightEmulator.Host.dll"]
+USER cosmos
+
+# 8081 = Cosmos NoSQL REST API; 10255 = MongoDB wire protocol.
+EXPOSE 8081 10255
+
+ENTRYPOINT ["cosmos-emulator"]
+CMD ["start", "--port", "8081", "--data-dir", "/data"]

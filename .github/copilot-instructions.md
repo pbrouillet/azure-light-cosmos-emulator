@@ -1,240 +1,192 @@
-# Copilot Instructions — Azure.Cosmos.LightEmulator
+# Copilot Instructions — Azure Light Cosmos Emulator (Rust/Axum)
 
 ## Build, Test & Lint
 
+The repository root is a Cargo **workspace**. CI runs on **stable**; the local
+default toolchain may be nightly, so validate with `rustup run stable ...`.
+
 ```bash
-# Full solution build
-dotnet build Azure.Cosmos.LightEmulator.slnx
+# Build the CLI binary
+cargo build -p cosmos-cli
+cargo build --release -p cosmos-cli
 
-# Run all tests
-dotnet test Azure.Cosmos.LightEmulator.slnx
+# Run all workspace tests
+cargo test --workspace
 
-# Run a single test project
-dotnet test tests\Core.Tests
+# Run one crate's tests
+cargo test -p cosmos-query
 
 # Run a single test by name
-dotnet test tests\Core.Tests --filter "FullyQualifiedName~ConsistencyManagerTests.DefaultLevel"
+cargo test -p cosmos-query engine::tests::group_by
 
-# Explorer SPA (React/Vite)
-cd src\Explorer
-npm run dev          # dev server with hot reload (proxies /dbs → localhost:8081)
-npm run build        # production build → src\Host\wwwroot\explorer\
-npm run lint         # ESLint
+# Lint & format (must be clean — CI treats warnings as errors)
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
 
-# Docker
-docker build -f docker\Dockerfile .
-docker compose -f docker\docker-compose.yml up
+# Run the emulator
+cargo run -p cosmos-cli -- start          # NoSQL :8081, MongoDB :10255, Explorer /explorer
+
+# Explorer SPA (React/Vite) — Node comes from nvm, not system apt
+cd explorer
+npm ci
+npm run dev          # dev server, proxies /dbs and /api to :8081
+npm run build         # production build → crates/host/wwwroot/explorer/
+npm run lint          # ESLint
+
+# Docker (build context = repo root)
+docker build -f docker/Dockerfile .
+docker compose -f docker/docker-compose.yml up --build
 ```
 
 ## Architecture
 
-The emulator implements the Azure Cosmos DB REST API (port 8081) and MongoDB wire protocol (port 10255). The **default storage backend is Sqlite** (file-backed `emulator.db`); `InMemory` and `SurrealDb` are also selectable.
+The emulator implements the Azure Cosmos DB REST API (port 8081) and MongoDB
+wire protocol (port 10255). The **default storage backend is Sqlite**
+(file-backed); `InMemory` and `SurrealDb` are also selectable via `--storage`.
 
-> **Storage backend gotcha:** `StorageServiceRegistration.ParseStorageType` returns `StorageType.Sqlite` for null/empty/unrecognized values — Sqlite is the real default the CLI/`start` path uses, **not** SurrealDb (the doc comment on `EmulatorOptions.Storage` is stale). When debugging persistence, memory, or query behavior, assume `SqliteDocumentStore` (`src/Storage/Sqlite/`) unless a backend was explicitly configured.
-
-### Project dependency graph
-
-```
-Cli → Host → NoSql  → Core
-                    → Storage → Core
-                    → Auth    → Core
-            → MongoDB → Core, Storage, Auth
-            → Triggers → Core, Storage
-```
-
-- **Core** — Domain models, interfaces (`IDocumentStore`, `IQueryEngine`, `IAuthProvider`, `IChangeFeedProvider`, `IConsistencyManager`, `IProgrammabilityEngine`), and the `ConsistencyManager` implementation. Pure library with no external dependencies.
-- **Storage** — Multiple `IDocumentStore` implementations. **`SqliteDocumentStore` (default, file-backed `emulator.db`)** is the production path; `InMemoryDocumentStore` (ConcurrentDictionary) and `SurrealDbDocumentStore` are alternatives selected via `StorageType`. `InMemoryChangeFeedProvider` / `SqliteChangeFeedProvider` track document changes with LSNs.
-- **Auth** — Three `IAuthProvider` implementations: `MasterKeyAuthProvider` (HMAC-SHA256), `EntraIdAuthProvider` (OIDC/JWT), `ResourceTokenProvider`. `CompositeAuthProvider` chains them.
-- **NoSql** — ASP.NET controllers matching the Cosmos DB REST API, plus `CosmosAuthMiddleware`, `CosmosExceptionMiddleware`, `CosmosQueryEngine` (SQL parser), and `JintProgrammabilityEngine` (stored procedures via Jint).
-- **MongoDB** — TCP server (`MongoDbServer`) on port 10255 speaking MongoDB wire protocol (OP_MSG, OP_QUERY).
-- **Triggers** — Quartz.NET-based trigger scheduling with Jint execution.
-- **Host** — ASP.NET Core entry point. Registers all services, configures middleware pipeline, serves Explorer static files at `/explorer`.
-- **Cli** — `System.CommandLine` tool (`cosmos-emulator start|stop|reset|status|export|import`).
-- **Explorer** — React 19 + TypeScript + Vite + TailwindCSS SPA. Uses Monaco Editor for JSON (documents), SQL (queries), and JavaScript (sprocs/triggers/UDFs). Builds to `src/Host/wwwroot/explorer/`.
-
-### Middleware pipeline order (Host)
+### Crate dependency graph
 
 ```
-CosmosExceptionMiddleware → CosmosAuthMiddleware → Controllers
-                                                 → Static files (/explorer)
+cli → host → nosql → core
+            → storage → core
+            → auth    → core
+            → mongodb → core, storage, auth
+            → triggers → core, storage
+     query/kql → core   (used by nosql/host)
 ```
 
-Auth is skipped for `/explorer`, `/`, and `/health` paths.
-
-### Configuration
-
-All emulator settings flow through `EmulatorOptions` (bound from the `"Emulator"` config section):
-- `Port` (8081), `MongoPort` (10255), `DataDirectory`, `MasterKey`, `EnableEntraId`, `ConsistencyLevel` ("Session"), `EnableSsl`, `EnableExplorer`
+- **`core`** — Domain models and traits (`IDocumentStore`, `IQueryEngine`,
+  `IAuthProvider`, `IChangeFeedProvider`, `IConsistencyManager`, `IActivityStore`,
+  `IQueryTelemetryStore`, `IEmulatorInfoService`). Pure library, no external deps.
+- **`storage`** — `IDocumentStore` implementations: **Sqlite (default)**,
+  InMemory, SurrealDb; change-feed providers (LSN tracked); vector index; activity
+  and query-telemetry stores.
+- **`auth`** — `MasterKeyAuthProvider` (HMAC-SHA256), `EntraIdAuthProvider`
+  (OIDC/JWT), `ResourceTokenProvider`, chained via a composite provider.
+- **`query`** — Cosmos SQL parser/evaluator (JOIN, `GROUP BY`, spatial `ST_*`,
+  `VectorDistance`, full-text/RRF, DML, explain, execution limiter).
+- **`kql`** — KQL operator pipeline (where/project/extend/summarize/sort/top/
+  take/count/distinct) + schema registry + monitoring adapter.
+- **`nosql`** — Axum routers/handlers matching the Cosmos REST API, plus auth /
+  exception / consistency middleware.
+- **`mongodb`** — TCP server speaking the MongoDB wire protocol (OP_MSG/OP_QUERY).
+- **`triggers`** — trigger scheduling + JS execution.
+- **`host`** — Axum app assembly, middleware pipeline, background services, and
+  the embedded Explorer static serving.
+- **`cli`** — `cosmos-emulator` binary (`start`/`stop`/`status`/`reset`/…).
+- **`parity`** — black-box parity harness + official-SDK E2E layer.
 
 ## Key Conventions
 
-### .NET
+### Rust
 
-- **.NET 10** pinned in `global.json`, target framework `net10.0`
-- **Central package management** — all versions in `Directory.Packages.props`. Never add `Version=` to `PackageReference` in `.csproj` files.
-- **Nullable enabled, warnings as errors** — set in `Directory.Build.props`
-- **Root namespace**: `Azure.Cosmos.LightEmulator`. Projects append their name (e.g., `Azure.Cosmos.LightEmulator.Core.Models`)
-- **ASP.NET types in class libraries** — NoSql, Auth, and MongoDB projects use `<FrameworkReference Include="Microsoft.AspNetCore.App" />` (not `Microsoft.NET.Sdk.Web`)
+- **Workspace at the repo root**; `Cargo.toml` declares members under `crates/*`.
+  Shared dependency versions live in `[workspace.dependencies]` — add new deps
+  there and opt in per-crate with `workspace = true`.
+- **Keep `cargo clippy --workspace --all-targets -D warnings` clean** — CI fails
+  on any warning. Keep `cargo fmt` clean.
+- **Return `Undefined`/sentinel, not `null`, for invalid query inputs** — `null`
+  is a valid Cosmos value.
+- **Three registration surfaces must stay in sync** — the host router/run wiring
+  (`crates/host/src/lib.rs`), the CLI (`crates/cli/src/main.rs`), and the test
+  fixtures (`crates/parity`). A new service/option/route added to one must be
+  added to the others or you get resolution errors or 404s.
 
 ### REST API pattern
 
-Controllers in `src/NoSql/Controllers/` follow the Cosmos DB REST URL structure:
-- `/dbs`, `/dbs/{dbId}/colls`, `/dbs/{dbId}/colls/{collId}/docs`, `.../sprocs`, `.../triggers`, `.../udfs`
-- Cosmos-specific headers (`x-ms-*`) are defined as constants in `CosmosHeaders`
-- All responses include `x-ms-request-charge`, `x-ms-activity-id`, `x-ms-serviceversion`
-- Errors return `{ code, message }` JSON with appropriate HTTP status codes
-- Exceptions use `CosmosEmulatorException` static factory methods (`.NotFound()`, `.Conflict()`, `.BadRequest()`, etc.)
-
-### Storage abstraction
-
-All data access goes through `IDocumentStore`. The implementation uses `ConcurrentDictionary` with composite keys:
-- Databases: keyed by `id`
-- Containers: keyed by `{databaseId}/{containerId}`
-- Documents: keyed by `{databaseId}/{containerId}/{partitionKeyHeaderValue}/{documentId}`
-
-Document writes increment a global LSN and record changes via `IChangeFeedProvider`.
-
-**Debugging point-operation 404s (delete / read / replace of a document that exists).** Point operations look up documents by the full composite key `{databaseId}/{containerId}/{partitionKeyValue}/{documentId}`. A 404 on a document you know exists almost always means the **partition-key value mismatches**: the `x-ms-documentdb-partitionkey` header value sent by the client differs from the value extracted from the document's PK-path field at write time. Check the container's partition-key path (e.g. `/vector_store_id`, not `/id`) and confirm the client sends that field's value — not the document id — as the partition key. Compare "stored PK" vs "requested PK" before assuming a routing or storage bug.
+Routes in `crates/nosql/` follow the Cosmos DB REST URL structure (`/dbs`,
+`/dbs/{db}/colls`, `.../docs`, `.../sprocs`, `.../triggers`, `.../udfs`). All
+responses include `x-ms-request-charge`, `x-ms-activity-id`, `x-ms-serviceversion`.
+Errors return `{ code, message }` JSON with appropriate status codes.
 
 ### Auth header format
 
-Master key auth uses the Cosmos DB signature format:
-```
-type=master&ver=1.0&sig={HMAC-SHA256 of "verb\nresourceType\nresourceLink\ndate\n\n"}
-```
+Master-key auth uses the Cosmos signature format:
+`type=master&ver=1.0&sig={HMAC-SHA256 of "verb\nresourceType\nresourceLink\ndate\n\n"}`.
+The HMAC payload is lowercased **except** `resourceLink` — name-based resource
+links are **case-sensitive** and must preserve original casing. Lowercasing the
+resource link is a classic parity regression that breaks signatures for any
+db/container/doc whose name has uppercase characters.
 
-The known test master key is: `C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==`
+The known test master key is:
+`C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==`
 
-**Local auth bypass (`x-ms-cosmos-explorer`).** `CosmosAuthMiddleware.IsExplorerRequest` skips HMAC verification for requests that either have a `Referer` from `/explorer` **or** carry the `x-ms-cosmos-explorer` header (and no `Authorization` header). Set `x-ms-cosmos-explorer: 1` (plus `x-ms-version`) to drive the REST API from local scripts, load tests, or ad-hoc `curl` without computing signatures. Do **not** rely on this for anything testing the auth path itself.
+**Local auth bypass:** the Explorer requests skip HMAC verification. Set
+`x-ms-cosmos-explorer: 1` (plus `x-ms-version`) to drive the REST API from local
+scripts/curl without computing signatures. Do not rely on this when testing the
+auth path itself.
 
-**Debugging `"Invalid master key signature"` (Unauthorized).** The HMAC payload is `"{verb}\n{resourceType}\n{resourceLink}\n{date}\n\n"`, all lowercased **except** `resourceLink`: name-based resource links are **case-sensitive** and must preserve their original casing (only `resourceType` is lowercased). This matches the real SDK (`AuthorizationHelper` lowercases resource IDs *only* for non-name-based paths). Lowercasing the resource link is a classic parity regression that breaks signatures for any db/container/doc whose name has uppercase characters — see the comment in `CosmosAuthMiddleware.ExtractResourceInfo`.
+### Debugging point-operation 404s
 
-### Explorer (React)
+Point operations look up documents by the composite key
+`{db}/{container}/{partitionKeyValue}/{documentId}`. A 404 on a document you know
+exists almost always means the **partition-key value mismatches** — the
+`x-ms-documentdb-partitionkey` header value differs from the value extracted from
+the document's PK-path field at write time. Check the container's PK path and
+confirm the client sends that field's value (not the document id).
 
-- Vite base path: `/explorer/` — all assets served from this prefix
-- Dev proxy: Vite forwards `/dbs` requests to `http://localhost:8081`
-- Build output: `src/Host/wwwroot/explorer/` (committed for Docker builds)
-- Monaco Editor languages: JSON (DocumentEditor), SQL (QueryEditor), JavaScript (ProgrammabilityEditor)
-- Data fetching: `@tanstack/react-query` with `cosmosClient` singleton
-- Routing: React Router v7, routes follow `/db/:dbId/container/:collId/...` pattern
+## Explorer (React)
+
+- **Source** in [`explorer/`](../explorer/); Vite `base: '/explorer/'`,
+  `outDir: '../crates/host/wwwroot/explorer'`.
+- **Built assets** in `crates/host/wwwroot/explorer/` are **committed** and
+  embedded into the host binary at compile time via `rust-embed`
+  (`crates/host/src/explorer.rs`, `#[folder = "wwwroot/explorer"]`). Rebuild them
+  with `cd explorer && npm run build` after changing the SPA; CI has a drift guard.
+- Monaco Editor languages: JSON (documents), SQL (queries), JavaScript
+  (sprocs/triggers/UDFs). Data via `@tanstack/react-query`. Router v7.
+- **Defensive coding:** always use optional chaining (`?.`) and nullish
+  coalescing (`?? default`) on API response fields — backend responses may omit
+  fields or return `null`.
 
 ### Fluent UI v9 — Overlays, Dialogs & Portals
 
-Fluent UI v9 components that render portals (dropdowns, comboboxes, dialogs) need careful handling to avoid content-disappearing bugs:
-
-- **Never use custom backdrop/panel overlays with manual z-index for popover-style panels.** Fluent UI `Combobox`, `Dropdown`, and `Select` render their listboxes through portals at the `FluentProvider` root. A custom `position: fixed; z-index: 1000` backdrop will sit above these portals and intercept clicks, making dropdowns appear broken. Use `Popover` + `PopoverSurface` + `PopoverTrigger` instead — they share the same portal z-index stack and nest correctly with other Fluent portals.
-
-- **Always use `modalType="non-modal"` on `<Dialog>` components with an explicit backdrop.** Modal Dialogs (`modalType="modal"`, the default) trigger three side-effects that can cause content to visually disappear or become unresponsive: (1) `useDisableBodyScroll` adds `overflow-y: hidden/clip` plus `scrollbar-gutter: stable` to `<html>` and `<body>`, which can break `height: 100%` layout chains; (2) tabster's modalizer walks `document.body` and sets `aria-hidden="true"` on all sibling elements, which may interact poorly with custom CSS or browser extensions; (3) legacy focus trapping intercepts keyboard events and can cause focus-loss glitches. Using `modalType="non-modal"` disables all three mechanisms. Add an explicit `backdrop` prop to `<DialogSurface>` to restore the visual overlay and click-outside-to-close behavior:
-  ```tsx
-  <Dialog modalType="non-modal" open={isOpen} onOpenChange={(_, d) => setIsOpen(d.open)}>
-    <DialogSurface backdrop={{ onClick: () => setIsOpen(false) }}>
-      <DialogBody>
-        <DialogTitle>Title</DialogTitle>
-        <DialogContent>...</DialogContent>
-        <DialogActions>
-          <Button onClick={() => setIsOpen(false)}>Cancel</Button>
-          <Button appearance="primary">OK</Button>
-        </DialogActions>
-      </DialogBody>
-    </DialogSurface>
-  </Dialog>
-  ```
-
-- **Pattern for floating panels with nested interactive portals:**
-  ```tsx
-  <Popover positioning="below-start" trapFocus open={isOpen} onOpenChange={(_, d) => setIsOpen(d.open)}>
-    <PopoverTrigger disableButtonEnhancement>
-      <Button>Open panel</Button>
-    </PopoverTrigger>
-    <PopoverSurface>
-      {/* Combobox/Dropdown inside here will portal correctly */}
-      <Combobox>
-        <Option>Item</Option>
-      </Combobox>
-    </PopoverSurface>
-  </Popover>
-  ```
-
-## Testing Patterns
-
-- **Framework**: xUnit with FluentAssertions and Moq
-- **Integration tests** use `TestServerFixture` (`tests/NoSql.Tests/TestServerFixture.cs`) which spins up an in-process `WebApplication` with `TestServer`, registers all services, and provides an `HttpClient` with auto-injected HMAC auth headers
-- **Unit tests** directly instantiate the class under test (no DI container)
-- **SDK parity tests** (`tests/Parity.Tests/`) clone the official Azure Cosmos .NET SDK test suite via MSBuild target (`CloneSdkTests.targets`) and run tests against the emulator. Skip with `-p:SkipCloneSdkTests=true`
-
-### Three DI registration surfaces — keep in sync
-
-There are **three independent** service registration paths. Any new service or controller added to one must be added to the others or you'll get 500 `Unable to resolve service` errors or 404s:
-
-1. **`src/Host/Program.cs`** — production startup (Serilog, explorer static files, throughput enforcement)
-2. **`src/Host/HostApplication.cs`** — CLI / test startup (InMemoryChangeFeedProvider, no throughput middleware, Swagger in dev)
-3. **`tests/NoSql.Tests/TestServerFixture.cs`** — test fixture (minimal DI, test-specific fakes)
-
-### Adding a new integration test
-
-```csharp
-public class MyTests : IAsyncLifetime
-{
-    private TestServerFixture _fixture = null!;
-
-    public async Task InitializeAsync() => _fixture = await TestServerFixture.CreateAsync();
-    public async Task DisposeAsync() => await _fixture.DisposeAsync();
-
-    [Fact]
-    public async Task MyOperation_ShouldSucceed()
-    {
-        var request = _fixture.CreateRequest(HttpMethod.Post, "/dbs", new { id = "testdb" });
-        var response = await _fixture.Client.SendAsync(request);
-        response.StatusCode.Should().Be(HttpStatusCode.Created);
-    }
-}
-```
+- **Never use custom backdrop/panel overlays with manual z-index for
+  popover-style panels.** Fluent `Combobox`/`Dropdown`/`Select` render listboxes
+  through portals at the `FluentProvider` root; a custom `position: fixed;
+  z-index` backdrop sits above them and intercepts clicks. Use `Popover` +
+  `PopoverSurface` + `PopoverTrigger` instead.
+- **Always use `modalType="non-modal"` on `<Dialog>` with an explicit backdrop.**
+  Modal dialogs disable body scroll, set `aria-hidden` on siblings, and trap
+  focus — which can make content visually disappear. Add
+  `<DialogSurface backdrop={{ onClick: () => setOpen(false) }}>` to restore the
+  overlay and click-outside-to-close.
 
 ## Query Engine — Adding New SQL Functions
 
-The query engine (`src/NoSql/Query/CosmosQueryEngine.cs`) is a hand-rolled SQL parser/evaluator. Target API version: `2024-11-30`.
+The query engine (`crates/query/`) is a hand-rolled SQL parser/evaluator.
 
-### Parser limitation: no inline JSON object literals
-
-The expression parser supports array literals (`[1, 2, 3]`), path references (`c.field`), and parameters (`@param`) — but **not** inline JSON object literals (`{"type": "Point", ...}`). Tests for functions that take GeoJSON or complex objects must pass them via document fields or `@parameters`:
-
-```csharp
-// ✅ Correct — use document fields
-await SeedDocumentsAsync(store, CreateDocument("doc-1", "t1", d =>
-{
-    d["location"] = MakePoint(-122.12, 47.67);
-    d["boundary"] = MakePolygon((-122.15, 47.65), ...);
-}));
-var result = await engine.ExecuteQueryAsync("db", "coll",
-    "SELECT ST_DISTANCE(c.location, c.boundary) AS dist FROM c");
-
-// ✅ Also correct — use parameters
-var parameters = new Dictionary<string, object?> { ["@target"] = MakePoint(-122.11, 47.67) };
-var result = await engine.ExecuteQueryAsync("db", "coll",
-    "SELECT ST_DISTANCE(c.location, @target) AS dist FROM c", parameters);
-
-// ❌ Wrong — parser will throw "Unsupported character '{'"
-var result = await engine.ExecuteQueryAsync("db", "coll",
-    """SELECT ST_DISTANCE(c.location, {"type":"Point","coordinates":[-122.11,47.67]}) FROM c""");
-```
-
-### Steps to add a new built-in function
-
-1. Add a case to the `EvaluateBuiltInFunction` switch (around line 1340) — or to `EvaluateFunction` if the function needs container metadata (like `VectorDistance`)
-2. Implement a `private static object? EvaluateMyFunction(IReadOnlyList<object?> arguments)` method
-3. Return `UndefinedValue` for invalid/missing inputs (not `null` — `null` is a valid Cosmos DB value)
-4. Write tests using document fields or parameters (not inline JSON objects)
-5. Update `docs/api-compatibility.md` and `docs/architecture.md`
+- The expression parser supports array literals, path references (`c.field`), and
+  parameters (`@param`) — but **not** inline JSON object literals. Pass GeoJSON /
+  complex objects via document fields or `@parameters`, not `{...}` literals.
+- To add a built-in: add a case to the built-in-function dispatch, implement the
+  evaluator, return the `Undefined` sentinel for invalid inputs, add tests using
+  document fields or parameters, and update `docs/` + `PARITY.md`.
 
 ### Known intentional limitations
 
-- **Request Units**: Formula-based estimation, not real metering (`RuCostCalculator.cs`)
-- **Indexing**: Range/composite index metadata is stored and round-tripped but not used for query optimization — most queries scan all documents. **Exception: vector indexes are real** — `ORDER BY VectorDistance(...)` is accelerated by an in-memory HNSW ANN index (`src/Storage/Vector/`), so vector search does **not** full-scan. See `docs/vector-search.md`.
-- **Query materializes the whole container per call**: `CosmosQueryEngine.ExecuteQueryAsync` loads and parses **every** document in the container into `JsonNode` graphs on every query (via `ListDocumentsAsync` + `.Where(IsIndexed).ToList()` + per-doc `ToResponseBody()`) before paging. Peak transient allocation ≈ `concurrency × containerSize × JsonNode-overhead`, so high query concurrency on a large container can saturate the GC (this was the ~23 GB "memory leak"). It is **bounded** by `QueryExecutionLimiter` (`IQueryExecutionLimiter`, a `SemaphoreSlim` gate acquired only around the top-level `ExecuteQueryAsync` in `DocumentsController` — subqueries call the engine directly to avoid recursion deadlock), configurable via `EmulatorOptions.MaxConcurrentQueries` (default `Max(2, ProcessorCount/2)`). Raise it to trade memory for parallelism. Register `IQueryExecutionLimiter` in all three DI surfaces.
-- **Consistency levels**: All five accepted; only Session tokens actually enforced (single-node emulator)
-- **Spatial indexes**: Stored on containers but not used for query acceleration
-- **Stored procedure context**: Limited `getContext()` API via Jint (no `collection.createDocument()`, etc.)
+- **Request Units**: formula-based estimation, not real metering.
+- **Indexing**: most queries full-scan; **vector indexes are real** (ANN),
+  `ORDER BY VectorDistance(...)` is accelerated.
+- **Query materializes the whole container per call** — peak transient RSS ≈
+  `concurrency × containerSize`, bounded by the query-execution limiter
+  (`--max-concurrent-queries`, default `max(2, CPU/2)`). See `PERF.md`.
+- **Consistency levels**: all five accepted; only Session tokens enforced
+  (single-node emulator).
 
-## Explorer (React) — Defensive Coding
+## Testing Patterns
 
-All Explorer React components must use optional chaining (`?.`) and nullish coalescing (`?? defaultValue`) when accessing API response fields. Backend responses may omit fields or return `null`, and mapping over arrays with missing numeric fields (e.g., `.toFixed()`, `.toUpperCase()`) has caused `TypeError` crashes in multiple sessions.
+- Unit tests live inline (`#[cfg(test)] mod tests`) per crate.
+- **Parity tests** (`crates/parity`) boot the real host on an ephemeral socket
+  and drive it with master-key–signed HTTP (black-box). The opt-in SDK layer
+  (`crates/parity/sdk/`) drives the emulator with real Node/Python Azure Cosmos
+  SDKs and a real MongoDB driver over HTTP and TLS.
+- End each change green: `cargo test --workspace`, `cargo clippy … -D warnings`,
+  `cargo fmt --check`.
+
+## CI
+
+`.github/workflows/ci.yml` runs fmt/clippy/test/release-build over the workspace,
+a Docker image build, an Explorer SPA build with an asset-drift guard, and an
+opt-in official-SDK E2E job. Path filters key off `crates/**`, `Cargo.*`,
+`explorer/**`, and `crates/host/wwwroot/explorer/**`.

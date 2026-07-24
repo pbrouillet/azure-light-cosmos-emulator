@@ -1,6 +1,4 @@
 {
-  "Emulator": {
-    "Storage": "Sqlite",
-    "DataDirectory": ""
-  }
+  "storage": "sqlite",
+  "dataDirectory": ""
 }

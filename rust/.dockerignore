@@ -1,6 +1,0 @@
-# Keep the Docker build context small and deterministic.
-target/
-**/target/
-*.log
-docker/
-README.md

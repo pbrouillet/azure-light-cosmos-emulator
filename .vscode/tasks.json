@@ -1,131 +1,51 @@
 {
   "version": "2.0.0",
   "tasks": [
-    // ── Build ──────────────────────────────────────────────
     {
-      "label": "build",
-      "type": "process",
-      "command": "dotnet",
-      "args": [
-        "build",
-        "${workspaceFolder}/Azure.Cosmos.LightEmulator.slnx",
-        "-p:SkipExplorerBuild=true",
-        "/property:GenerateFullPaths=true",
-        "/consoleloggerparameters:NoSummary;ForceNoAlign"
-      ],
+      "label": "cargo build",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "-p", "cosmos-cli"],
       "group": { "kind": "build", "isDefault": true },
-      "problemMatcher": "$msCompile"
+      "problemMatcher": "$rustc"
     },
     {
-      "label": "build-explorer",
+      "label": "cargo build (release)",
       "type": "shell",
-      "command": "npm run build",
-      "options": {
-        "cwd": "${workspaceFolder}/src/Explorer"
-      },
+      "command": "cargo",
+      "args": ["build", "--release", "-p", "cosmos-cli"],
       "group": "build",
-      "problemMatcher": []
+      "problemMatcher": "$rustc"
     },
     {
-      "label": "build-cli",
-      "type": "process",
-      "command": "dotnet",
-      "args": [
-        "build",
-        "${workspaceFolder}/src/Cli/Azure.Cosmos.LightEmulator.Cli.csproj",
-        "-p:SkipExplorerBuild=true",
-        "/property:GenerateFullPaths=true",
-        "/consoleloggerparameters:NoSummary;ForceNoAlign"
-      ],
-      "group": "build",
-      "problemMatcher": "$msCompile"
-    },
-    {
-      "label": "build-explorer-and-cli",
-      "dependsOn": ["build-explorer", "build-cli"],
-      "dependsOrder": "sequence",
-      "group": "build",
-      "problemMatcher": []
-    },
-    // ── Test — All ─────────────────────────────────────────
-    {
-      "label": "test-all",
-      "type": "process",
-      "command": "dotnet",
-      "args": [
-        "test",
-        "${workspaceFolder}/Azure.Cosmos.LightEmulator.slnx",
-        "--verbosity", "normal",
-        "-p:SkipCloneSdkTests=true"
-      ],
+      "label": "cargo test",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["test", "--workspace"],
       "group": { "kind": "test", "isDefault": true },
-      "problemMatcher": "$msCompile",
-      "presentation": { "reveal": "always", "panel": "dedicated" }
+      "problemMatcher": "$rustc"
     },
-    // ── Test — Unit (Core, Auth, Storage, MongoDB, Kql) ───
     {
-      "label": "test-unit",
-      "type": "process",
-      "command": "dotnet",
-      "args": [
-        "test",
-        "${workspaceFolder}/Azure.Cosmos.LightEmulator.slnx",
-        "--verbosity", "normal",
-        "--filter", "FullyQualifiedName~Core.Tests|FullyQualifiedName~Auth.Tests|FullyQualifiedName~Storage.Tests|FullyQualifiedName~MongoDB.Tests|FullyQualifiedName~Kql.Tests"
-      ],
-      "group": "test",
-      "problemMatcher": "$msCompile",
-      "presentation": { "reveal": "always", "panel": "dedicated" }
-    },
-    // ── Test — Integration (NoSql.Tests, Host.Tests) ──────
-    {
-      "label": "test-integration",
-      "type": "process",
-      "command": "dotnet",
-      "args": [
-        "test",
-        "${workspaceFolder}/Azure.Cosmos.LightEmulator.slnx",
-        "--verbosity", "normal",
-        "--filter", "FullyQualifiedName~NoSql.Tests|FullyQualifiedName~Host.Tests"
-      ],
-      "group": "test",
-      "problemMatcher": "$msCompile",
-      "presentation": { "reveal": "always", "panel": "dedicated" }
-    },
-    // ── Test — Parity / SDK smoke tests ───────────────────
-    {
-      "label": "test-parity",
-      "type": "process",
-      "command": "dotnet",
-      "args": [
-        "test",
-        "${workspaceFolder}/tests/Parity.Tests",
-        "--verbosity", "normal",
-        "-p:SkipCloneSdkTests=true"
-      ],
-      "group": "test",
-      "problemMatcher": "$msCompile",
-      "presentation": { "reveal": "always", "panel": "dedicated" }
-    },
-    // ── Lint — Explorer SPA ───────────────────────────────
-    {
-      "label": "lint-explorer",
+      "label": "cargo clippy",
       "type": "shell",
-      "command": "npm run lint",
-      "options": {
-        "cwd": "${workspaceFolder}/src/Explorer"
-      },
-      "problemMatcher": ["$eslint-stylish"]
+      "command": "cargo",
+      "args": ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+      "problemMatcher": "$rustc"
     },
-    // ── Dev — Explorer hot-reload server ──────────────────
     {
-      "label": "dev-explorer",
+      "label": "explorer dev",
       "type": "shell",
-      "command": "npm run dev",
-      "options": {
-        "cwd": "${workspaceFolder}/src/Explorer"
-      },
-      "isBackground": true,
+      "command": "npm",
+      "args": ["run", "dev"],
+      "options": { "cwd": "${workspaceFolder}/explorer" },
+      "problemMatcher": []
+    },
+    {
+      "label": "explorer build",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "build"],
+      "options": { "cwd": "${workspaceFolder}/explorer" },
       "problemMatcher": []
     }
   ]

@@ -1,10 +1,13 @@
-**/bin
-**/obj
+# Keep the Docker build context small and deterministic.
+# NOTE: crates/host/wwwroot/explorer IS required (embedded into the binary),
+# so it is intentionally NOT excluded.
 .git
 .gitignore
-.sdk-tests
-.vs
-TestResults
-coverage
-node_modules
-src/Explorer/node_modules
+target/
+**/target/
+node_modules/
+explorer/node_modules/
+perf/
+docs/
+*.log
+README.md

@@ -1,122 +1,23 @@
 {
   "version": "0.2.0",
   "configurations": [
-    // ── App ────────────────────────────────────────────────
     {
       "name": "Debug CLI (start)",
-      "type": "coreclr",
+      "type": "lldb",
       "request": "launch",
-      "preLaunchTask": "build-cli",
-      "program": "${workspaceFolder}/src/Cli/bin/Debug/net10.0/Azure.Cosmos.LightEmulator.Cli.dll",
+      "preLaunchTask": "cargo build",
+      "program": "${workspaceFolder}/target/debug/cosmos-emulator",
       "args": ["start"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "stopAtEntry": false
+      "cwd": "${workspaceFolder}"
     },
     {
-      "name": "Debug CLI (start, no SSL)",
-      "type": "coreclr",
+      "name": "Debug CLI (start, in-memory)",
+      "type": "lldb",
       "request": "launch",
-      "preLaunchTask": "build-cli",
-      "program": "${workspaceFolder}/src/Cli/bin/Debug/net10.0/Azure.Cosmos.LightEmulator.Cli.dll",
-      "args": ["start", "--no-ssl"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "stopAtEntry": false,
-      "env": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
-      }
-    },
-    // ── Unit Tests ─────────────────────────────────────────
-    {
-      "name": "Debug Tests — Core",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "dotnet",
-      "args": ["test", "--no-build", "tests/Core.Tests", "--verbosity", "normal"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "Debug Tests — Auth",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "dotnet",
-      "args": ["test", "--no-build", "tests/Auth.Tests", "--verbosity", "normal"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "Debug Tests — Storage",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "dotnet",
-      "args": ["test", "--no-build", "tests/Storage.Tests", "--verbosity", "normal"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "Debug Tests — MongoDB",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "dotnet",
-      "args": ["test", "--no-build", "tests/MongoDB.Tests", "--verbosity", "normal"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "Debug Tests — KQL",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "dotnet",
-      "args": ["test", "--no-build", "tests/Kql.Tests", "--verbosity", "normal"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    },
-    // ── Integration Tests ──────────────────────────────────
-    {
-      "name": "Debug Tests — NoSql (Integration)",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "dotnet",
-      "args": ["test", "--no-build", "tests/NoSql.Tests", "--verbosity", "normal"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "Debug Tests — Host (Integration)",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "dotnet",
-      "args": ["test", "--no-build", "tests/Host.Tests", "--verbosity", "normal"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    },
-    // ── Parity / SDK Tests ─────────────────────────────────
-    {
-      "name": "Debug Tests — Parity (SDK)",
-      "type": "coreclr",
-      "request": "launch",
-      "preLaunchTask": "build",
-      "program": "dotnet",
-      "args": ["test", "--no-build", "tests/Parity.Tests", "--verbosity", "normal", "-p:SkipCloneSdkTests=true"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    }
-  ],
-  "compounds": [
-    {
-      "name": "Debug CLI + Explorer Dev",
-      "configurations": ["Debug CLI (start, no SSL)"],
-      "preLaunchTask": "dev-explorer",
-      "stopAll": true
+      "preLaunchTask": "cargo build",
+      "program": "${workspaceFolder}/target/debug/cosmos-emulator",
+      "args": ["start", "--storage", "in-memory"],
+      "cwd": "${workspaceFolder}"
     }
   ]
 }

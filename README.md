@@ -1,110 +1,114 @@
-# Azure.Cosmos.LightEmulator
+# Azure Light Cosmos Emulator (Rust/Axum)
 
-A lightweight, open-source Azure Cosmos DB emulator supporting NoSQL and MongoDB connectors.
+A lightweight, open-source Azure Cosmos DB emulator implemented in Rust,
+supporting the **NoSQL REST API** (port 8081), the **MongoDB wire protocol**
+(port 10255), and an embedded web-based **Explorer** admin GUI (served at
+`/explorer`).
 
 ## Features
 
-- **NoSQL REST API** — Full Cosmos DB REST API compatibility on port 8081
-- **MongoDB Wire Protocol** — Native MongoDB driver support on port 10255
-- **Embedded Storage** — SurrealDB (RocksDB), SQLite, or In-Memory backends
-- **Authentication** — Master key (HMAC-SHA256) and EntraID (Azure AD) support
-- **Consistency Levels** — All five Cosmos DB consistency levels
-- **Change Feed** — Pull and push model support
-- **Stored Procedures / Triggers / UDFs** — JavaScript execution via Jint
-- **Explorer UI** — React-based data explorer at `/explorer`
-- **CLI** — `cosmos-emulator start|stop|reset|status|export|import`
-- **SDK Parity Tests** — Automated validation against official Azure Cosmos .NET SDK tests
+- **NoSQL REST API** — Cosmos DB REST API compatibility on port 8081
+  (databases, containers, documents, queries, sprocs/triggers/UDFs, change feed,
+  offers/throughput, batch, patch).
+- **MongoDB wire protocol** — native MongoDB driver support on port 10255.
+- **SQL & KQL query engines** — Cosmos SQL (`SELECT`, JOIN, `GROUP BY`,
+  spatial `ST_*`, `VectorDistance`, full-text) plus a KQL operator pipeline.
+- **Pluggable storage** — Sqlite (default, file-backed), InMemory, and SurrealDb
+  backends.
+- **Auth** — master-key HMAC-SHA256, EntraID/OIDC JWT, and resource tokens.
+- **TLS** — optional self-signed HTTPS via `--enable-ssl`.
+- **Embedded Explorer** — React/Vite SPA compiled into the binary and served at
+  `/explorer` (no separate web server required).
 
-## Quick Start
+## Workspace layout
 
-```bash
-# Run via CLI
-dotnet run --project src/Cli -- start
+| Crate | Responsibility |
+|---|---|
+| `core` | Domain models + traits (`IDocumentStore`, `IQueryEngine`, …) |
+| `storage` | InMemory / Sqlite / SurrealDb backends, change feed, vector index |
+| `auth` | Master-key HMAC, EntraID JWT, resource tokens |
+| `query` | Cosmos SQL engine (JOIN/GROUP BY/spatial/vector/FTS + DML/explain) |
+| `kql` | KQL operator pipeline (where/project/summarize/sort/top/…) |
+| `nosql` | Axum routers/handlers + middleware for the Cosmos REST API |
+| `mongodb` | TCP wire-protocol server (port 10255) |
+| `triggers` | Scheduler + JS execution (sprocs/triggers/UDFs) |
+| `host` | Axum app assembly, middleware, embedded Explorer serving |
+| `cli` | `cosmos-emulator` binary (`start`/`stop`/`status`/…) |
+| `parity` | Black-box parity harness + official-SDK E2E layer |
 
-# Run via Docker
-docker compose up
-```
+Dependency edges: `cli → host → nosql → core; host → storage/auth/mongodb/triggers; storage/auth/query → core`.
 
-## Storage Configuration
+The Explorer SPA source lives in [`explorer/`](explorer/); its built assets are
+committed to `crates/host/wwwroot/explorer/` and embedded into the host binary at
+compile time via `rust-embed`.
 
-The emulator supports three storage backends, configurable via a side config file or CLI arguments:
-
-| Backend    | Persistence | Best For                        |
-|------------|-------------|---------------------------------|
-| `Sqlite`   | ✅ Persistent (single file) | Lightweight, portable storage (default) |
-| `SurrealDb` | ✅ Persistent (RocksDB) | Production-like testing         |
-| `InMemory` | ❌ Ephemeral | Fast tests, CI/CD               |
-
-### Config file (`emulator-config.json`)
-
-Place an `emulator-config.json` file next to the executable:
-
-```json
-{
-  "Emulator": {
-    "Storage": "Sqlite",
-    "DataDirectory": "C:\\MyData\\CosmosEmulator"
-  }
-}
-```
-
-### CLI override
-
-CLI arguments take highest priority:
+## Build & run
 
 ```bash
-cosmos-emulator start --storage sqlite --data-dir ./my-data
-cosmos-emulator start --storage inmemory
-cosmos-emulator start                    # uses config file or defaults to Sqlite
+cargo build
+cargo test --workspace
+cargo clippy --workspace --all-targets
+cargo fmt --check
+
+# Run the emulator (NoSQL REST API on :8081, MongoDB on :10255)
+cargo run -p cosmos-cli -- start
+curl http://localhost:8081/health
+# Open the Explorer admin GUI
+open http://localhost:8081/explorer
 ```
 
-### Priority order
-
-`appsettings.json` → `emulator-config.json` → CLI arguments (highest)
-
-## Development
+### Explorer SPA
 
 ```bash
-# Restore & build
-dotnet restore
-dotnet build
-
-# Run tests
-dotnet test
-
-# Run explorer dev server
-cd src/Explorer && npm run dev
+cd explorer
+npm ci
+npm run dev     # dev server (proxies /dbs and /api to :8081)
+npm run build   # rebuilds committed assets in crates/host/wwwroot/explorer/
 ```
 
-## Publishing a Single-File Release
+## Docker
 
-Use `publish.ps1` to produce a self-contained, single-file executable with aggressive IL trimming (`TrimMode=full`):
+A multi-stage image builds the `cosmos-emulator` CLI and runs it in the
+foreground. The build context is the repository root (the Cargo workspace), so
+the committed Explorer assets are embedded into the image.
 
-```powershell
-# Current platform (auto-detects RID)
-./publish.ps1
+```bash
+# Build and run with Docker directly
+docker build -f docker/Dockerfile -t cosmos-light-emulator-rust .
+docker run --rm -p 8081:8081 -p 10255:10255 -v cosmos-data:/data cosmos-light-emulator-rust
 
-# Cross-compile for a specific target
-./publish.ps1 -Runtime linux-x64
-./publish.ps1 -Runtime osx-arm64
-
-# Disable trimming if you hit runtime issues
-./publish.ps1 -Runtime win-x64 -NoTrim
+# Or with Docker Compose
+docker compose -f docker/docker-compose.yml up --build
 ```
 
-The output is written to `publish/<runtime>/`. Tagged CI builds (`v*`) produce
-single-file release assets automatically.
+> The builder stage uses `rust:1-bookworm` (latest stable) because a transitive
+> dependency requires the `edition2024` Cargo feature (Rust ≥ 1.85), even though
+> the workspace's declared MSRV is lower.
 
-## Connection Strings
+## CI
 
-On startup, the emulator prints connection strings:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace`, a
+release build, a Docker image build, an Explorer SPA build (with an asset-drift
+guard), and an opt-in official-SDK E2E job.
 
-```
-NoSQL Endpoint: https://localhost:8081
-MongoDB Endpoint: mongodb://localhost:10255
-Master Key: <generated-key>
-```
+## Parity
+
+`crates/parity` (`cargo test -p cosmos-parity`) is a black-box harness that boots
+the real host on an ephemeral socket and drives it with master-key–signed HTTP.
+An opt-in official-SDK layer drives the emulator with the real Node/Python Azure
+Cosmos SDKs and a real MongoDB driver over HTTP and TLS (`crates/parity/sdk/`,
+runnable via `run_parity.sh --start --tls` and the `sdk-e2e` CI job). See
+[`PARITY.md`](PARITY.md) for the full feature-parity map.
+
+## Performance
+
+[`perf/`](perf/) holds load scripts (Node built-ins + a `/proc` resource sampler)
+that quantify RAM/CPU under concurrent query load — the memory hotspot where the
+query engine materializes the whole container per call. Run a sweep with
+`perf/run_perf.sh`; see [`PERF.md`](PERF.md) for methodology, measured results,
+and the `--max-concurrent-queries` RAM/throughput tradeoff.
 
 ## License
 
-MIT
+MIT.
