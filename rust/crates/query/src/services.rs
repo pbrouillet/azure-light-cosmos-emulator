@@ -185,6 +185,12 @@ impl QueryExecutionLimiter {
                 .expect("query limiter semaphore closed"),
         }
     }
+
+    /// Number of permits currently available (i.e. concurrent queries that can
+    /// start without waiting). Primarily for tests/diagnostics.
+    pub fn available_permits(&self) -> usize {
+        self.gate.available_permits()
+    }
 }
 
 pub struct QueryPermit {
@@ -335,6 +341,34 @@ mod tests {
     use super::*;
     use cosmos_core::models::policies::{CompositeIndexPath, ExcludedPath};
     use cosmos_core::models::CompositeIndex;
+
+    #[test]
+    fn limiter_new_sets_capacity_and_bounds_concurrency() {
+        let limiter = QueryExecutionLimiter::new(3);
+        assert_eq!(limiter.available_permits(), 3);
+    }
+
+    #[test]
+    fn limiter_new_clamps_zero_to_one() {
+        let limiter = QueryExecutionLimiter::new(0);
+        assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn limiter_serializes_when_capacity_is_one() {
+        let limiter = QueryExecutionLimiter::new(1);
+        let permit = limiter.acquire().await;
+        assert_eq!(limiter.available_permits(), 0);
+        // A second acquire must not complete while the first permit is held.
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), limiter.acquire()).await;
+        assert!(
+            blocked.is_err(),
+            "second acquire should block at capacity 1"
+        );
+        drop(permit);
+        assert_eq!(limiter.available_permits(), 1);
+    }
 
     #[test]
     fn validates_excluded_index_path() {

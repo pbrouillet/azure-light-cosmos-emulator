@@ -74,6 +74,14 @@ real Node/Python Azure Cosmos SDKs and a real MongoDB driver over HTTP and TLS
 `sdk-e2e` CI job). See [`PARITY.md`](PARITY.md) for the full feature-parity
 map and remaining gaps.
 
+## Performance
+
+`perf/` holds load scripts (Node built-ins + a `/proc` resource sampler) that
+quantify RAM/CPU under concurrent query load — the memory hotspot where the
+query engine materializes the whole container per call. Run a sweep with
+`perf/run_perf.sh`; see [`PERF.md`](PERF.md) for methodology, measured results,
+and the `--max-concurrent-queries` RAM/throughput tradeoff.
+
 ## Status
 
 Ported and tested (see `plan.md` for details): `core`, `storage` (InMemory /

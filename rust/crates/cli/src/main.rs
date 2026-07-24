@@ -62,6 +62,12 @@ enum Command {
         /// Storage backend to use.
         #[arg(long, value_enum, default_value_t = Storage::Sqlite)]
         storage: Storage,
+        /// Cap on concurrent query executions. Defaults to max(2, CPU/2).
+        #[arg(long)]
+        max_concurrent_queries: Option<usize>,
+        /// Disable RU/throughput enforcement (avoids 429s during load tests).
+        #[arg(long)]
+        disable_throughput_enforcement: bool,
         /// Run the emulator in the background.
         #[arg(long)]
         background: bool,
@@ -140,6 +146,8 @@ async fn main() -> Result<(), anyhow::Error> {
             storage,
             background,
             explorer_dir,
+            max_concurrent_queries,
+            disable_throughput_enforcement,
             run_host_internal,
         } => {
             start(
@@ -155,6 +163,8 @@ async fn main() -> Result<(), anyhow::Error> {
                     storage,
                     background,
                     explorer_dir,
+                    max_concurrent_queries,
+                    disable_throughput_enforcement,
                 },
                 run_host_internal,
             )
@@ -181,6 +191,8 @@ struct StartArgs {
     storage: Storage,
     background: bool,
     explorer_dir: Option<PathBuf>,
+    max_concurrent_queries: Option<usize>,
+    disable_throughput_enforcement: bool,
 }
 
 async fn start(args: StartArgs, run_host_internal: bool) -> Result<i32, anyhow::Error> {
@@ -238,10 +250,11 @@ async fn start(args: StartArgs, run_host_internal: bool) -> Result<i32, anyhow::
         master_key: Some(state.master_key.clone()),
         enable_entra: state.enable_entra_id,
         enable_ssl: state.enable_ssl,
-        enable_throughput_enforcement: true,
+        enable_throughput_enforcement: !args.disable_throughput_enforcement,
         enable_maintenance: true,
         enable_request_tracking: true,
         consistency: cosmos_core::ConsistencyLevel::parse(&state.consistency_level),
+        max_concurrent_queries: args.max_concurrent_queries,
     })
     .await;
     cleanup_state_files(&data_directory);
@@ -284,6 +297,12 @@ async fn start_background(
     }
     if let Some(dir) = &args.explorer_dir {
         cmd.arg("--explorer-dir").arg(dir);
+    }
+    if let Some(max) = args.max_concurrent_queries {
+        cmd.arg("--max-concurrent-queries").arg(max.to_string());
+    }
+    if args.disable_throughput_enforcement {
+        cmd.arg("--disable-throughput-enforcement");
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())

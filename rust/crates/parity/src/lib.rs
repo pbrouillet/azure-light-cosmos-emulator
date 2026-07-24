@@ -57,6 +57,7 @@ impl ParityHarness {
             enable_maintenance: false,
             enable_request_tracking: false,
             consistency: ConsistencyLevel::Session,
+            max_concurrent_queries: None,
         };
 
         let store = build_store(&opts).await?;

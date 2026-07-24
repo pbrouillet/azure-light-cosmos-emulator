@@ -102,6 +102,11 @@ Full operator pipeline ported and served over `api/emulator/kql`.
   **shims** — revisit if exact ranking parity with the service is required.
 - HNSW is an in-memory ANN index (not persisted across restarts); the flat
   provider remains available as a compatible alias.
+- **Query memory**: `SqlQueryEngine` materializes the whole container per query,
+  so peak RSS scales with concurrent-query count, bounded by the
+  `QueryExecutionLimiter` (`--max-concurrent-queries`, default `max(2, CPU/2)`).
+  Load-validated — see [`PERF.md`](PERF.md). Streaming/paged execution is the
+  recommended future refinement.
 
 ## Verifying locally
 

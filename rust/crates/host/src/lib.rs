@@ -65,6 +65,9 @@ pub struct HostOptions {
     pub enable_request_tracking: bool,
     /// Default consistency level for session-token issuance/validation.
     pub consistency: ConsistencyLevel,
+    /// Optional cap on concurrent query executions. `None` uses the engine
+    /// default (`max(2, CPU/2)`), matching .NET's `MaxConcurrentQueries`.
+    pub max_concurrent_queries: Option<usize>,
 }
 
 impl Default for HostOptions {
@@ -82,6 +85,7 @@ impl Default for HostOptions {
             enable_maintenance: false,
             enable_request_tracking: false,
             consistency: ConsistencyLevel::Session,
+            max_concurrent_queries: None,
         }
     }
 }
@@ -131,10 +135,13 @@ pub fn build_router(opts: &HostOptions, store: Arc<dyn DocumentStore>) -> Router
         programmability_record_store,
     ));
     let udf_resolver: Arc<dyn cosmos_query::UdfResolver> = programmability.clone();
-    let query_engine = Arc::new(cosmos_query::SqlQueryEngine::with_udf_resolver(
-        store.clone(),
-        udf_resolver,
-    ));
+    let mut query_engine_impl =
+        cosmos_query::SqlQueryEngine::with_udf_resolver(store.clone(), udf_resolver);
+    if let Some(max) = opts.max_concurrent_queries {
+        query_engine_impl =
+            query_engine_impl.with_query_limiter(cosmos_query::QueryExecutionLimiter::new(max));
+    }
+    let query_engine = Arc::new(query_engine_impl);
     let activity_store: Arc<dyn ActivityStore> =
         Arc::new(cosmos_storage::InMemoryActivityStore::new());
     let telemetry_store: Arc<dyn QueryTelemetryStore> =

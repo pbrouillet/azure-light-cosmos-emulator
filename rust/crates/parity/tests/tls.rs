@@ -45,6 +45,7 @@ async fn tls_signed_crud_round_trips_over_https() {
         enable_maintenance: false,
         enable_request_tracking: false,
         consistency: ConsistencyLevel::Session,
+        max_concurrent_queries: None,
     };
     let store = build_store(&opts).await.unwrap();
     let app = build_router(&opts, store);

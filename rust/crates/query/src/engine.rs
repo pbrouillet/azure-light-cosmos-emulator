@@ -87,6 +87,14 @@ impl SqlQueryEngine {
         }
     }
 
+    /// Overrides the query-execution concurrency limiter, consuming and
+    /// returning `self` for builder-style chaining. Used by the host to honor
+    /// `--max-concurrent-queries`.
+    pub fn with_query_limiter(mut self, limiter: QueryExecutionLimiter) -> Self {
+        self.limiter = limiter;
+        self
+    }
+
     async fn try_vector_order_by_docs(
         &self,
         database_id: &str,
