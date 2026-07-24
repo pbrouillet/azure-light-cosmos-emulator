@@ -151,7 +151,13 @@ impl SqlQueryEngine {
             })
             .unwrap_or_else(|| "quantizedFlat".to_string());
         if !index
-            .ensure_index(database_id, container_id, &path, &index_type, distance_function)
+            .ensure_index(
+                database_id,
+                container_id,
+                &path,
+                &index_type,
+                distance_function,
+            )
             .await?
         {
             return Ok(None);
@@ -173,7 +179,12 @@ impl SqlQueryEngine {
         for hit in hits {
             if let Ok(doc) = self
                 .store
-                .read_document(database_id, container_id, &hit.document_id, &hit.partition_key)
+                .read_document(
+                    database_id,
+                    container_id,
+                    &hit.document_id,
+                    &hit.partition_key,
+                )
                 .await
             {
                 if doc.is_indexed {
@@ -203,7 +214,13 @@ impl QueryEngine for SqlQueryEngine {
         let _permit = self.limiter.acquire().await;
 
         let feed = if let Some(vector_docs) = self
-            .try_vector_order_by_docs(database_id, container_id, &stmt, parameters, options.as_ref())
+            .try_vector_order_by_docs(
+                database_id,
+                container_id,
+                &stmt,
+                parameters,
+                options.as_ref(),
+            )
             .await?
         {
             vector_docs

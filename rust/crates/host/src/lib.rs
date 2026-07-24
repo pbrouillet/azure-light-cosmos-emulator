@@ -258,6 +258,14 @@ pub async fn run(opts: HostOptions) -> Result<(), anyhow::Error> {
 async fn tls_config(
     opts: &HostOptions,
 ) -> Result<axum_server::tls_rustls::RustlsConfig, anyhow::Error> {
+    // Explicitly install a process-wide rustls crypto provider. The binary's
+    // dependency closure pulls in *both* the `ring` (via reqwest in the CLI) and
+    // `aws-lc-rs` (via axum-server) rustls backends, so rustls cannot auto-select
+    // one and would otherwise panic on the first TLS handshake. Installing the
+    // aws-lc-rs provider (the one axum-server uses) resolves the ambiguity; the
+    // call is idempotent and returns Err if a provider is already installed.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let data_dir = opts
         .data_dir
         .clone()

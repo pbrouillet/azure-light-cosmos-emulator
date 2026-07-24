@@ -61,10 +61,8 @@ fn serve(path: &str) -> Response {
         None => match ExplorerAssets::get("index.html") {
             Some(content) => {
                 let mut resp = Response::new(Body::from(content.data.into_owned()));
-                resp.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/html"),
-                );
+                resp.headers_mut()
+                    .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
                 resp
             }
             None => (StatusCode::NOT_FOUND, "Explorer not built").into_response(),

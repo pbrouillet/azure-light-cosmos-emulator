@@ -29,7 +29,21 @@ pub async fn execute(
     if !is_batch {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
+    run(state, db_id, coll_id, &headers, &body).await
+}
 
+/// Executes a transactional batch. Shared by the container-path route
+/// (`POST /dbs/{db}/colls/{coll}`) and the docs-path handler
+/// (`POST /dbs/{db}/colls/{coll}/docs` with `x-ms-cosmos-is-batch-request: true`,
+/// which is the path the official SDKs actually target). Assumes the caller has
+/// already confirmed the batch header is present.
+pub async fn run(
+    state: AppState,
+    db_id: String,
+    coll_id: String,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Response, ApiError> {
     let pk_header = headers.get(h::PARTITION_KEY).and_then(|v| v.to_str().ok());
     let partition_key = parse_partition_key(pk_header);
 
@@ -41,7 +55,7 @@ pub async fn execute(
         )));
     }
 
-    let value: Value = serde_json::from_slice(&body)
+    let value: Value = serde_json::from_slice(body)
         .map_err(|_| ApiError::bad_request("Request body must be a valid JSON array."))?;
     let operations_array = value
         .as_array()

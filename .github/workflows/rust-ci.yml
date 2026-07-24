@@ -12,10 +12,14 @@ on:
     paths:
       - 'rust/**'
       - '.github/workflows/rust-ci.yml'
+      - 'src/Explorer/**'
+      - 'src/Host/wwwroot/explorer/**'
   pull_request:
     paths:
       - 'rust/**'
       - '.github/workflows/rust-ci.yml'
+      - 'src/Explorer/**'
+      - 'src/Host/wwwroot/explorer/**'
 
 permissions:
   contents: read
@@ -71,3 +75,87 @@ jobs:
       - name: Build image
         run: docker build -f docker/Dockerfile .
         working-directory: rust
+
+  explorer-spa:
+    name: explorer SPA build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src/Explorer/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: src/Explorer
+
+      - name: Build (tsc -b && vite build)
+        run: npm run build
+        working-directory: src/Explorer
+
+      # The built assets under src/Host/wwwroot/explorer/ are committed and
+      # embedded into the release binary at compile time (rust-embed). The
+      # committed copy is authoritative; this step surfaces (but does not gate
+      # on) drift, since Rollup content hashes can differ across toolchains.
+      - name: Report committed asset drift (informational)
+        continue-on-error: true
+        run: |
+          if ! git diff --quiet -- src/Host/wwwroot/explorer; then
+            echo "::warning::Committed Explorer assets differ from a fresh build. Run 'cd src/Explorer && npm run build' and commit the result."
+            git --no-pager diff --stat -- src/Host/wwwroot/explorer
+          else
+            echo "Committed Explorer assets are up to date."
+          fi
+
+  sdk-e2e:
+    name: real-SDK / driver E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Build release CLI
+        run: cargo build --release -p cosmos-cli
+        working-directory: rust
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run parity E2E (http + tls, node + python + mongo)
+        run: crates/parity/sdk/run_parity.sh --start --tls
+        working-directory: rust
+        env:
+          PARITY_WORKDIR: ${{ runner.temp }}/parity
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-e2e-logs
+          path: ${{ runner.temp }}/parity/server-*.log
+          if-no-files-found: ignore

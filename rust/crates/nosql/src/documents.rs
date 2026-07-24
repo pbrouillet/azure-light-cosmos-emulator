@@ -35,6 +35,12 @@ pub async fn create_or_query(
     if header_is_true(&headers, h::IS_QUERY) {
         return execute_query(&state, &db_id, &coll_id, &headers, &body).await;
     }
+    // Transactional batch: the official SDKs POST the batch to the *docs* path
+    // (`.../colls/{coll}/docs`) with `x-ms-cosmos-is-batch-request: true`, so
+    // detect it here and delegate to the shared batch executor.
+    if header_is_true(&headers, h::IS_BATCH_REQUEST) {
+        return crate::batch::run(state, db_id, coll_id, &headers, &body).await;
+    }
     if header_is_true(&headers, h::IS_UPSERT) {
         return upsert(&state, &db_id, &coll_id, &headers, &body).await;
     }
@@ -284,11 +290,36 @@ pub async fn patch(
 ) -> Result<Response, ApiError> {
     let pk = require_partition_key(&headers)?;
     let if_match = header_str(&headers, h::IF_MATCH);
-    let (obj, _) = parse_body_object(&body)?;
 
-    let operations_node = obj.get("operations").and_then(|v| v.as_array());
-    let operations_node = match operations_node {
-        Some(arr) if !arr.is_empty() => arr,
+    // The real Cosmos service (and the official SDKs) accept two PATCH body
+    // shapes: the documented object `{ "operations": [...], "condition": "..." }`
+    // and a bare top-level array `[ {op, path, value}, ... ]` (the JS SDK's
+    // `PatchRequestBody = PatchOperation[]` form). Accept both for parity with a
+    // real client; `condition` is only available with the object form.
+    let root: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("Request body must be valid JSON."))?;
+    let (operations_owned, condition_owned): (Vec<Value>, Option<String>) = match root {
+        Value::Array(arr) => (arr, None),
+        Value::Object(obj) => {
+            let ops = obj
+                .get("operations")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let cond = obj
+                .get("condition")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (ops, cond)
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "PATCH request body must be a JSON object or an array of operations.",
+            ))
+        }
+    };
+    let operations_node = match operations_owned.as_slice() {
+        arr if !arr.is_empty() => arr,
         _ => {
             return Err(ApiError::bad_request(
                 "PATCH request must include a non-empty 'operations' array.",
@@ -325,7 +356,7 @@ pub async fn patch(
         });
     }
 
-    let condition = obj.get("condition").and_then(|v| v.as_str());
+    let condition = condition_owned.as_deref();
     let doc = state
         .store
         .patch_document(

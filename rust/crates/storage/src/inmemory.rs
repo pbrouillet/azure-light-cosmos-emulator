@@ -209,7 +209,7 @@ impl ActivityStore for InMemoryActivityStore {
 
     async fn list(&self, max_items: i32) -> CosmosResult<Vec<ActivityEntry>> {
         let mut entries = self.entries.lock().unwrap().clone();
-        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         entries.truncate(max_items.max(0) as usize);
         Ok(entries)
     }
@@ -224,7 +224,7 @@ impl ActivityStore for InMemoryActivityStore {
         if entries.len() <= max_entries.max(0) as usize {
             return Ok(());
         }
-        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         entries.truncate(max_entries.max(0) as usize);
         Ok(())
     }
@@ -266,7 +266,7 @@ impl QueryTelemetryStore for InMemoryQueryTelemetryStore {
             })
             .cloned()
             .collect();
-        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         entries.truncate(max_items.max(0) as usize);
         Ok(entries)
     }
@@ -281,7 +281,7 @@ impl QueryTelemetryStore for InMemoryQueryTelemetryStore {
         if entries.len() <= max_entries.max(0) as usize {
             return Ok(());
         }
-        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         entries.truncate(max_entries.max(0) as usize);
         Ok(())
     }

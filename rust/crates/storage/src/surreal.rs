@@ -442,7 +442,7 @@ impl ActivityStore for SurrealDbActivityStore {
     async fn list(&self, max_items: i32) -> CosmosResult<Vec<ActivityEntry>> {
         let mut rows: Vec<ActivityRow> =
             self.db.select(ACTIVITY_TABLE).await.map_err(surreal_err)?;
-        rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        rows.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         rows.truncate(max_items.max(0) as usize);
         Ok(rows
             .into_iter()
@@ -520,7 +520,7 @@ impl QueryTelemetryStore for SurrealDbQueryTelemetryStore {
             .select(QUERY_TELEMETRY_TABLE)
             .await
             .map_err(surreal_err)?;
-        rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        rows.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         let entries = rows
             .into_iter()
             .filter(|row| {

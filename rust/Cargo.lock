@@ -1191,6 +1191,7 @@ dependencies = [
  "mime_guess",
  "rcgen",
  "rust-embed",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -1254,11 +1255,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "axum-server",
  "chrono",
  "cosmos-auth",
  "cosmos-core",
  "cosmos-host",
+ "rcgen",
  "reqwest",
+ "rustls",
  "serde_json",
  "tokio",
 ]

@@ -33,10 +33,7 @@ impl UdfResolver for TestUdfResolver {
         args: &[Value],
     ) -> Option<Value> {
         match name.to_ascii_lowercase().as_str() {
-            "double" => args
-                .first()
-                .and_then(Value::as_f64)
-                .map(|n| json!(n * 2.0)),
+            "double" => args.first().and_then(Value::as_f64).map(|n| json!(n * 2.0)),
             "citylabel" => args
                 .first()
                 .and_then(Value::as_str)

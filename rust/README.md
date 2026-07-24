@@ -68,8 +68,10 @@ independently of the .NET CI workflow.
 `crates/parity` (`cargo test -p cosmos-parity`) is a black-box harness that boots
 the real host on an ephemeral socket and drives it with master-key–signed HTTP,
 mirroring the .NET `Parity.Tests` smoke suite (database/container/document CRUD +
-auth enforcement). An opt-in official-SDK layer (Node/Python) lives under
-`crates/parity/sdk/`. See [`PARITY.md`](PARITY.md) for the full feature-parity
+auth enforcement). An opt-in official-SDK layer drives the emulator with the
+real Node/Python Azure Cosmos SDKs and a real MongoDB driver over HTTP and TLS
+(`crates/parity/sdk/`, runnable via `run_parity.sh --start --tls` and in the
+`sdk-e2e` CI job). See [`PARITY.md`](PARITY.md) for the full feature-parity
 map and remaining gaps.
 
 ## Status

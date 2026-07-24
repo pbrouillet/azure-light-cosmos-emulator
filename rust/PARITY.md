@@ -16,14 +16,25 @@ Two complementary layers:
    headers, and auth enforcement (unsigned / bad-signature → `401`). Self-
    contained; always runs in CI.
 2. **Official-SDK layer** — `crates/parity/sdk/` (opt-in, needs network).
-   Node `@azure/cosmos` and Python `azure-cosmos` scripts drive a running
-   emulator to prove real SDK wire-compatibility. Not part of `cargo test`.
+   Node `@azure/cosmos`, Python `azure-cosmos`, and a real `mongodb` driver
+   drive a running emulator over **HTTP and TLS** to prove real client wire-
+   compatibility. A runner (`run_parity.sh`) boots the release binary, installs
+   the SDKs, and aggregates pass/fail. Not part of `cargo test`; runs in CI as a
+   separate `sdk-e2e` job. See `crates/parity/sdk/README.md`.
 
-The per-crate suites (`cargo test --workspace`, 149 tests) additionally cover
+Real-SDK validation surfaced (and fixed) three wire-compat bugs the black-box
+harness missed: the `@azure/cosmos` `Item.patch` sends a **bare JSON array**
+(not `{operations:[…]}`); `Items.batch` POSTs a transactional batch to
+`…/colls/{coll}/docs` with `x-ms-cosmos-is-batch-request` (not the container
+path); and TLS panicked on every handshake because no rustls `CryptoProvider`
+was installed. All three are fixed and covered.
+
+The per-crate suites (`cargo test --workspace`, 150 tests) additionally cover
 storage backends (incl. HNSW vector index + activity/telemetry stores), auth
 signing, the SQL and KQL query engines, the MongoDB wire protocol, the JS
-programmability engine (persisted sprocs/triggers/UDFs + trigger hooks), and the
-host services (throughput, TTL, account metadata, admin config).
+programmability engine (persisted sprocs/triggers/UDFs + trigger hooks), the
+host services (throughput, TTL, account metadata, admin config), and an
+always-on **TLS** integration test (signed CRUD round-trip over `https://`).
 
 ## Component status
 
@@ -40,16 +51,18 @@ host services (throughput, TTL, account metadata, admin config).
 | `Triggers` | `cosmos-triggers` | ✅ Complete | `boa_engine` JS; sprocs/triggers/UDFs CRUD + execution; **persisted** records; pre/post trigger hooks; `UdfResolver` for SQL. |
 | `MongoDB` | `cosmos-mongodb` | ✅ Complete | OP_MSG/OP_QUERY framing + handshake via `bson`; started by the host. |
 | `Storage` (vector) | `cosmos-storage` | ✅ Complete | Real in-memory **HNSW** ANN index; activity + query-telemetry stores (InMemory/Sqlite/Surreal). |
-| Docker / CI | `docker/`, `rust-ci.yml` | ✅ Complete | Multi-stage image; path-filtered CI. |
+| Docker / CI | `docker/`, `rust-ci.yml` | ✅ Complete | Multi-stage image; path-filtered CI: `check` (fmt/clippy/test/build), `docker`, `explorer-spa` (Vite build), `sdk-e2e` (real SDK/driver over http+tls). |
 | `Parity.Tests` | `cosmos-parity` | ✅ Complete | Black-box harness + opt-in SDK layer (this doc). |
 
 ## Parity status (cross-cutting)
 
 The previously-deferred follow-ups below are now **implemented and covered by
-tests** (149 workspace tests green; `cargo clippy --workspace --all-targets
--D warnings` clean). Verified live end-to-end: `GET /` account metadata,
-MongoDB listener on `--mongo-port`, CRUD + `GROUP BY` aggregate, emulator
-info/activity endpoints, and KQL over monitoring data (`activity | count`).
+tests** (150 workspace tests green; `cargo clippy --workspace --all-targets
+-D warnings` clean). Verified live end-to-end with the **real** Azure Cosmos
+Node/Python SDKs and MongoDB driver over both `http://` and `https://`: full
+document CRUD, upsert, parameterized/cross-partition/`SUM` queries, JSON-Patch,
+transactional batch, stored-procedure execute, `GET /` account metadata, the
+MongoDB handshake, and KQL over monitoring data (`activity | count`).
 
 ### Host wiring — done
 - **MongoDB listener** started by `cosmos_host::run` as a background task, gated
@@ -78,8 +91,11 @@ dialect lives in the separate `cosmos-kql` crate.
 Full operator pipeline ported and served over `api/emulator/kql`.
 
 ### Transport — done
-- **TLS** via `--enable-ssl` (rustls + self-signed dev cert). Plain `http://`
-  remains the default; SDKs use Gateway mode.
+- **TLS** via `--enable-ssl` (rustls + self-signed dev cert). The host installs
+  the `aws-lc-rs` rustls `CryptoProvider` at startup; verified end-to-end with
+  the real Node SDK over `https://` and an always-on integration test
+  (`crates/parity/tests/tls.rs`). Plain `http://` remains the default; SDKs use
+  Gateway mode.
 
 ### Residual notes
 - Full-text search / RRF / `RANK` are functional but implemented as scoring
@@ -93,11 +109,17 @@ Full operator pipeline ported and served over `api/emulator/kql`.
 # Self-contained black-box parity (always works, no network):
 cargo test -p cosmos-parity
 
-# Whole workspace:
+# Whole workspace (incl. the TLS integration test):
 cargo test --workspace
 
-# Official SDK layer (needs network — see crates/parity/sdk/README.md):
+# Official SDK layer (needs network — see crates/parity/sdk/README.md).
+# One-shot runner: boots the release binary, installs the SDKs, runs the
+# Node + Python Cosmos scripts and the MongoDB driver over http *and* tls:
+crates/parity/sdk/run_parity.sh --start --tls
+
+# …or drive an already-running emulator manually:
 cargo run -p cosmos-cli -- start --key <key>
 python3 crates/parity/sdk/parity_sdk.py --key <key>
 node   crates/parity/sdk/parity_sdk.js --key <key>
+node   crates/parity/sdk/parity_mongo.js --uri mongodb://localhost:10255
 ```
