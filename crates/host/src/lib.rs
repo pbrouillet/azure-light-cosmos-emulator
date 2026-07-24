@@ -1,11 +1,12 @@
 //! Application host. Ports the .NET `Host` project: assembles storage/auth/query
 //! services, builds the middleware pipeline, and serves the Explorer SPA.
 //!
-//! The Explorer React app is NOT ported — its committed build (`wwwroot/explorer/`)
-//! is embedded into the host binary via [`rust_embed`] and served under
-//! `/explorer` with an SPA fallback (parity with the .NET
-//! `ManifestEmbeddedFileProvider`). An explicit `--explorer-dir` overrides this
-//! to serve from a physical directory.
+//! The Explorer React app is NOT ported — its committed build is embedded into
+//! the host binary via the `cosmos-explorer` crate (behind the default
+//! `explorer` feature) and served under `/explorer` with an SPA fallback (parity
+//! with the .NET `ManifestEmbeddedFileProvider`). An explicit `--explorer-dir`
+//! overrides this to serve from a physical directory and works even in a slim
+//! build compiled with `--no-default-features`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,7 +27,6 @@ use cosmos_storage::{
 use serde_json::json;
 
 mod admin;
-mod explorer;
 mod info;
 mod maintenance;
 mod monitoring;
@@ -192,12 +192,16 @@ pub fn build_router(opts: &HostOptions, store: Arc<dyn DocumentStore>) -> Router
         .merge(cosmos_nosql::router(state));
 
     if let Some(dir) = &opts.explorer_dir {
-        // Explicit override: serve the SPA from a physical directory.
+        // Explicit override: serve the SPA from a physical directory. Available
+        // regardless of the `explorer` feature.
         app = app.nest_service("/explorer", tower_http::services::ServeDir::new(dir));
-    } else if explorer::is_available() {
-        // Default: serve the Explorer SPA embedded in the binary (parity with
-        // the .NET host's ManifestEmbeddedFileProvider).
-        app = app.merge(explorer::router());
+    } else {
+        #[cfg(feature = "explorer")]
+        if cosmos_explorer::is_available() {
+            // Default: serve the Explorer SPA embedded in the binary (parity with
+            // the .NET host's ManifestEmbeddedFileProvider).
+            app = app.merge(cosmos_explorer::router());
+        }
     }
 
     if opts.enable_throughput_enforcement {
@@ -222,6 +226,19 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
+/// `true` when the Explorer SPA is embedded in this build (i.e. the `explorer`
+/// feature is enabled and the assets were present at compile time).
+pub(crate) fn embedded_explorer_available() -> bool {
+    #[cfg(feature = "explorer")]
+    {
+        cosmos_explorer::is_available()
+    }
+    #[cfg(not(feature = "explorer"))]
+    {
+        false
+    }
+}
+
 /// Boots the host and serves until shutdown.
 pub async fn run(opts: HostOptions) -> Result<(), anyhow::Error> {
     let store = build_store(&opts).await?;
@@ -243,7 +260,7 @@ pub async fn run(opts: HostOptions) -> Result<(), anyhow::Error> {
         opts.port,
         opts.storage
     );
-    if opts.explorer_dir.is_none() && explorer::is_available() {
+    if opts.explorer_dir.is_none() && embedded_explorer_available() {
         tracing::info!(
             "Explorer: {}://localhost:{}/explorer (embedded)",
             if opts.enable_ssl { "https" } else { "http" },

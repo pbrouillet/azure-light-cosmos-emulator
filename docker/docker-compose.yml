@@ -2,7 +2,7 @@
 #
 # Build context is the repository root (the Cargo workspace) so the whole
 # workspace — including the committed Explorer assets under
-# crates/host/wwwroot/explorer — is available to the multi-stage Dockerfile.
+# crates/explorer/wwwroot/explorer — is available to the multi-stage Dockerfile.
 #
 #   docker compose -f docker/docker-compose.yml up --build
 

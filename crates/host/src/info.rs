@@ -40,7 +40,8 @@ impl HostEmulatorInfoService {
                 master_key: opts.master_key.clone().unwrap_or_default(),
                 consistency: opts.consistency,
                 enable_ssl: opts.enable_ssl,
-                enable_explorer: opts.explorer_dir.is_some(),
+                enable_explorer: opts.explorer_dir.is_some()
+                    || crate::embedded_explorer_available(),
             }),
             store,
             admin_settings,

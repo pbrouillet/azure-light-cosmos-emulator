@@ -33,14 +33,19 @@ supporting the **NoSQL REST API** (port 8081), the **MongoDB wire protocol**
 | `mongodb` | TCP wire-protocol server (port 10255) |
 | `triggers` | Scheduler + JS execution (sprocs/triggers/UDFs) |
 | `host` | Axum app assembly, middleware, embedded Explorer serving |
+| `explorer` | `cosmos-explorer` — embeds the SPA assets + `/explorer` router (optional, `explorer` feature) |
 | `cli` | `cosmos-emulator` binary (`start`/`stop`/`status`/…) |
 | `parity` | Black-box parity harness + official-SDK E2E layer |
 
-Dependency edges: `cli → host → nosql → core; host → storage/auth/mongodb/triggers; storage/auth/query → core`.
+Dependency edges: `cli → host → nosql → core; host → storage/auth/mongodb/triggers; host → explorer (optional); storage/auth/query → core`.
 
 The Explorer SPA source lives in [`explorer/`](explorer/); its built assets are
-committed to `crates/host/wwwroot/explorer/` and embedded into the host binary at
-compile time via `rust-embed`.
+committed to `crates/explorer/wwwroot/explorer/` and embedded into the binary at
+compile time via `rust-embed` in the `cosmos-explorer` crate. Embedding is gated
+by the **`explorer` cargo feature (on by default)** — build a slim binary without
+the Explorer via `cargo build --release -p cosmos-cli --no-default-features`. The
+`--explorer-dir` runtime override still serves an external SPA directory even in
+slim builds.
 
 ## Build & run
 
@@ -55,6 +60,9 @@ cargo run -p cosmos-cli -- start
 curl http://localhost:8081/health
 # Open the Explorer admin GUI
 open http://localhost:8081/explorer
+
+# Slim build without the embedded Explorer
+cargo build --release -p cosmos-cli --no-default-features
 ```
 
 ### Explorer SPA
@@ -63,7 +71,7 @@ open http://localhost:8081/explorer
 cd explorer
 npm ci
 npm run dev     # dev server (proxies /dbs and /api to :8081)
-npm run build   # rebuilds committed assets in crates/host/wwwroot/explorer/
+npm run build   # rebuilds committed assets in crates/explorer/wwwroot/explorer/
 ```
 
 ## Docker
@@ -88,9 +96,10 @@ docker compose -f docker/docker-compose.yml up --build
 ## CI
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `cargo fmt --check`,
-`cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace`, a
-release build, a Docker image build, an Explorer SPA build (with an asset-drift
-guard), and an opt-in official-SDK E2E job.
+`cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace`,
+**two release binaries** (with-Explorer and slim `--no-default-features`, uploaded
+as workflow artifacts), a Docker image build, an Explorer SPA build (with an
+asset-drift guard), and an opt-in official-SDK E2E job.
 
 ## Parity
 

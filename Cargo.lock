@@ -1172,6 +1172,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmos-explorer"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "mime_guess",
+ "rust-embed",
+]
+
+[[package]]
 name = "cosmos-host"
 version = "0.1.0"
 dependencies = [
@@ -1182,15 +1191,14 @@ dependencies = [
  "chrono",
  "cosmos-auth",
  "cosmos-core",
+ "cosmos-explorer",
  "cosmos-kql",
  "cosmos-mongodb",
  "cosmos-nosql",
  "cosmos-query",
  "cosmos-storage",
  "cosmos-triggers",
- "mime_guess",
  "rcgen",
- "rust-embed",
  "rustls",
  "serde",
  "serde_json",

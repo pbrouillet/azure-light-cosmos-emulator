@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 cosmos-core.workspace = true
-cosmos-host.workspace = true
+cosmos-host = { path = "../host", default-features = false }
 cosmos-auth.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -25,3 +25,9 @@ serde_json.workspace = true
 chrono.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 libc = "0.2"
+
+[features]
+default = ["explorer"]
+# Embed the Explorer SPA into the emulator binary (default). Build with
+# `--no-default-features` to produce a slim binary without the Explorer.
+explorer = ["cosmos-host/explorer"]

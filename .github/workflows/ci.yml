@@ -15,7 +15,7 @@ on:
       - 'perf/**'
       - 'docker/**'
       - 'explorer/**'
-      - 'crates/host/wwwroot/explorer/**'
+      - 'crates/explorer/wwwroot/explorer/**'
       - '.github/workflows/ci.yml'
   pull_request:
     paths:
@@ -25,7 +25,7 @@ on:
       - 'perf/**'
       - 'docker/**'
       - 'explorer/**'
-      - 'crates/host/wwwroot/explorer/**'
+      - 'crates/explorer/wwwroot/explorer/**'
       - '.github/workflows/ci.yml'
 
 permissions:
@@ -63,11 +63,63 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Clippy (slim / no Explorer)
+        run: cargo clippy -p cosmos-cli --no-default-features -- -D warnings
+
       - name: Test
         run: cargo test --workspace
 
-      - name: Build (release)
+  binaries:
+    name: release binaries (with-explorer + slim)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (with Explorer)
         run: cargo build --release -p cosmos-cli
+
+      - name: Stage with-Explorer binary
+        run: |
+          mkdir -p dist
+          cp target/release/cosmos-emulator dist/cosmos-emulator-with-explorer
+
+      - name: Build (slim, no Explorer)
+        run: cargo build --release -p cosmos-cli --no-default-features
+
+      - name: Stage slim binary
+        run: cp target/release/cosmos-emulator dist/cosmos-emulator-slim
+
+      - name: Report binary sizes
+        run: ls -lh dist/
+
+      - name: Upload with-Explorer binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmos-emulator-with-explorer
+          path: dist/cosmos-emulator-with-explorer
+          if-no-files-found: error
+
+      - name: Upload slim binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmos-emulator-slim
+          path: dist/cosmos-emulator-slim
+          if-no-files-found: error
 
   docker:
     name: docker build
@@ -99,16 +151,16 @@ jobs:
         run: npm run build
         working-directory: explorer
 
-      # The built assets under crates/host/wwwroot/explorer/ are committed and
+      # The built assets under crates/explorer/wwwroot/explorer/ are committed and
       # embedded into the release binary at compile time (rust-embed). The
       # committed copy is authoritative; this step surfaces (but does not gate
       # on) drift, since Rollup content hashes can differ across toolchains.
       - name: Report committed asset drift (informational)
         continue-on-error: true
         run: |
-          if ! git diff --quiet -- crates/host/wwwroot/explorer; then
+          if ! git diff --quiet -- crates/explorer/wwwroot/explorer; then
             echo "::warning::Committed Explorer assets differ from a fresh build. Run 'cd explorer && npm run build' and commit the result."
-            git --no-pager diff --stat -- crates/host/wwwroot/explorer
+            git --no-pager diff --stat -- crates/explorer/wwwroot/explorer
           else
             echo "Committed Explorer assets are up to date."
           fi

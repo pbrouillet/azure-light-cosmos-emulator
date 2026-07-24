@@ -17,7 +17,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: '../crates/host/wwwroot/explorer',
+    outDir: '../crates/explorer/wwwroot/explorer',
     emptyOutDir: true,
   },
 })

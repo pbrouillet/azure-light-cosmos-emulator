@@ -12,6 +12,7 @@ members = [
     "crates/host",
     "crates/cli",
     "crates/parity",
+    "crates/explorer",
 ]
 
 # Shared dependency versions. Individual crates opt in via `workspace = true`.
@@ -71,6 +72,7 @@ cosmos-mongodb = { path = "crates/mongodb" }
 cosmos-triggers = { path = "crates/triggers" }
 cosmos-host = { path = "crates/host" }
 cosmos-cli = { path = "crates/cli" }
+cosmos-explorer = { path = "crates/explorer" }
 
 # HTTP client (black-box parity harness)
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

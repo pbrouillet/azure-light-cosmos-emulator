@@ -1,5 +1,5 @@
 # Keep the Docker build context small and deterministic.
-# NOTE: crates/host/wwwroot/explorer IS required (embedded into the binary),
+# NOTE: crates/explorer/wwwroot/explorer IS required (embedded into the binary),
 # so it is intentionally NOT excluded.
 .git
 .gitignore

@@ -1,0 +1,13 @@
+[package]
+name = "cosmos-explorer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embedded Explorer SPA: rust-embed assets + /explorer Axum router."
+
+[dependencies]
+axum.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true

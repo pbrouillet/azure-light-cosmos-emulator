@@ -7,8 +7,9 @@ default toolchain may be nightly, so validate with `rustup run stable ...`.
 
 ```bash
 # Build the CLI binary
-cargo build -p cosmos-cli
+cargo build -p cosmos-cli                        # default = with embedded Explorer
 cargo build --release -p cosmos-cli
+cargo build --release -p cosmos-cli --no-default-features   # slim: no Explorer
 
 # Run all workspace tests
 cargo test --workspace
@@ -30,7 +31,7 @@ cargo run -p cosmos-cli -- start          # NoSQL :8081, MongoDB :10255, Explore
 cd explorer
 npm ci
 npm run dev          # dev server, proxies /dbs and /api to :8081
-npm run build         # production build → crates/host/wwwroot/explorer/
+npm run build         # production build → crates/explorer/wwwroot/explorer/
 npm run lint          # ESLint
 
 # Docker (build context = repo root)
@@ -52,6 +53,7 @@ cli → host → nosql → core
             → auth    → core
             → mongodb → core, storage, auth
             → triggers → core, storage
+            → explorer (optional, `explorer` feature — default on)
      query/kql → core   (used by nosql/host)
 ```
 
@@ -72,7 +74,15 @@ cli → host → nosql → core
 - **`mongodb`** — TCP server speaking the MongoDB wire protocol (OP_MSG/OP_QUERY).
 - **`triggers`** — trigger scheduling + JS execution.
 - **`host`** — Axum app assembly, middleware pipeline, background services, and
-  the embedded Explorer static serving.
+  the embedded Explorer static serving (via the optional `cosmos-explorer` dep,
+  gated by the `explorer` feature).
+- **`explorer`** — `cosmos-explorer`: embeds the committed SPA assets
+  (`crates/explorer/wwwroot/explorer/`) via `rust-embed` and exposes
+  `is_available()` + the `/explorer` `router()`. Pulled into `host` only when the
+  `explorer` feature is on (the default). Build the emulator without it via
+  `cargo build -p cosmos-cli --no-default-features` (slim binary). The
+  `--explorer-dir` runtime override still serves an external SPA dir even in slim
+  builds.
 - **`cli`** — `cosmos-emulator` binary (`start`/`stop`/`status`/`reset`/…).
 - **`parity`** — black-box parity harness + official-SDK E2E layer.
 
@@ -128,11 +138,14 @@ confirm the client sends that field's value (not the document id).
 ## Explorer (React)
 
 - **Source** in [`explorer/`](../explorer/); Vite `base: '/explorer/'`,
-  `outDir: '../crates/host/wwwroot/explorer'`.
-- **Built assets** in `crates/host/wwwroot/explorer/` are **committed** and
-  embedded into the host binary at compile time via `rust-embed`
-  (`crates/host/src/explorer.rs`, `#[folder = "wwwroot/explorer"]`). Rebuild them
-  with `cd explorer && npm run build` after changing the SPA; CI has a drift guard.
+  `outDir: '../crates/explorer/wwwroot/explorer'`.
+- **Built assets** in `crates/explorer/wwwroot/explorer/` are **committed** and
+  embedded into the binary at compile time via `rust-embed` in the
+  `cosmos-explorer` crate (`crates/explorer/src/lib.rs`,
+  `#[folder = "wwwroot/explorer"]`). Embedding is gated by the `explorer` feature
+  (default on); build slim with `cargo build -p cosmos-cli --no-default-features`.
+  Rebuild the assets with `cd explorer && npm run build` after changing the SPA;
+  CI has a drift guard.
 - Monaco Editor languages: JSON (documents), SQL (queries), JavaScript
   (sprocs/triggers/UDFs). Data via `@tanstack/react-query`. Router v7.
 - **Defensive coding:** always use optional chaining (`?.`) and nullish
@@ -189,4 +202,4 @@ The query engine (`crates/query/`) is a hand-rolled SQL parser/evaluator.
 `.github/workflows/ci.yml` runs fmt/clippy/test/release-build over the workspace,
 a Docker image build, an Explorer SPA build with an asset-drift guard, and an
 opt-in official-SDK E2E job. Path filters key off `crates/**`, `Cargo.*`,
-`explorer/**`, and `crates/host/wwwroot/explorer/**`.
+`explorer/**`, and `crates/explorer/wwwroot/explorer/**`.

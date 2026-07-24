@@ -4,9 +4,13 @@
 //! `index.html`.
 //!
 //! The assets are produced by the Vite build (`explorer/` → `vite build`,
-//! output `crates/host/wwwroot/explorer/`). In debug builds `rust-embed` reads
-//! them from disk at runtime; in release builds they are embedded into the
+//! output `crates/explorer/wwwroot/explorer/`). In debug builds `rust-embed`
+//! reads them from disk at runtime; in release builds they are embedded into the
 //! binary, so no `--explorer-dir` is required.
+//!
+//! This crate is pulled into the host only when the host's `explorer` feature is
+//! enabled (the default), so a slim emulator binary can be produced by building
+//! with `--no-default-features`.
 
 use axum::body::Body;
 use axum::extract::Path;
@@ -67,5 +71,15 @@ fn serve(path: &str) -> Response {
             }
             None => (StatusCode::NOT_FOUND, "Explorer not built").into_response(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assets_are_embedded() {
+        assert!(is_available(), "Explorer index.html should be embedded");
     }
 }
