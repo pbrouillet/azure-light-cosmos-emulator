@@ -1221,6 +1221,12 @@ public class SurrealDbDocumentStore : IDocumentStore
     {
         var client = await GetClientAsync(ct);
         var response = await client.RawQuery(sql, parameters ?? EmptyParameters, ct);
+        if (SurrealDbErrors.IsMissingTable(response))
+        {
+            // No-op: operating on a table that was never created (e.g. delete before first insert).
+            return;
+        }
+
         response.EnsureAllOks();
     }
 
@@ -1228,6 +1234,11 @@ public class SurrealDbDocumentStore : IDocumentStore
     {
         var client = await GetClientAsync(ct);
         var response = await client.RawQuery(sql, parameters ?? EmptyParameters, ct);
+        if (SurrealDbErrors.IsMissingTable(response))
+        {
+            return [];
+        }
+
         response.EnsureAllOks();
         return response.GetValues<T>(0).ToList();
     }
@@ -1235,7 +1246,14 @@ public class SurrealDbDocumentStore : IDocumentStore
     private async Task<List<T>> SelectTableRecordsAsync<T>(string table, CancellationToken ct)
     {
         var client = await GetClientAsync(ct);
-        return (await client.Select<T>(table, ct)).ToList();
+        try
+        {
+            return (await client.Select<T>(table, ct)).ToList();
+        }
+        catch (Exception ex) when (IsMissingTableException(ex))
+        {
+            return [];
+        }
     }
 
     private async Task<ISurrealDbClient> GetClientAsync(CancellationToken ct)
@@ -1248,8 +1266,19 @@ public class SurrealDbDocumentStore : IDocumentStore
         where T : class
     {
         var client = await GetClientAsync(ct);
-        return await client.Select<T>(new RecordIdOfString(table, recordKey), ct);
+        try
+        {
+            return await client.Select<T>(new RecordIdOfString(table, recordKey), ct);
+        }
+        catch (Exception ex) when (IsMissingTableException(ex))
+        {
+            return null;
+        }
     }
+
+    // SurrealDB 1.0.0 throws when SELECT targets a table that has not been created yet,
+    // whereas 0.9.0 returned an empty result. Treat a missing table as "no records".
+    private static bool IsMissingTableException(Exception ex) => SurrealDbErrors.IsMissingTable(ex);
 
     private async Task<T> GetRequiredRecordAsync<T>(string table, string recordKey, string resourceType, string resourceId, CancellationToken ct)
         where T : class

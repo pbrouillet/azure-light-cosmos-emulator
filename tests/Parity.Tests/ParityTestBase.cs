@@ -141,6 +141,11 @@ public abstract class ParityTestBase : IAsyncLifetime
             }
         }
 
+        // The default Sqlite backend pools connections, which keeps a handle on
+        // emulator.db open after the app is disposed. Clear the pools so the data
+        // directory can be deleted below.
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
         if (_dataDirectory is not null && Directory.Exists(_dataDirectory))
         {
             // RocksDB may still hold file locks briefly after disposal; retry with back-off

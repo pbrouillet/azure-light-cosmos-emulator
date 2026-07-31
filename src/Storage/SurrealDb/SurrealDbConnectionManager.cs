@@ -58,7 +58,11 @@ public class SurrealDbConnectionManager : IAsyncDisposable
         await _initializationLock.WaitAsync(ct);
         try
         {
-            _client?.Dispose();
+            if (_client is not null)
+            {
+                await _client.DisposeAsync();
+            }
+
             _client = null;
 
             await WaitForUnlockedFilesAsync(ct);
@@ -78,7 +82,11 @@ public class SurrealDbConnectionManager : IAsyncDisposable
         await _initializationLock.WaitAsync();
         try
         {
-            _client?.Dispose();
+            if (_client is not null)
+            {
+                await _client.DisposeAsync();
+            }
+
             _client = null;
             await WaitForUnlockedFilesAsync(CancellationToken.None);
         }

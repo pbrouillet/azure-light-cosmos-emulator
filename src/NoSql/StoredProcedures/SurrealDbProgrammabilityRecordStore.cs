@@ -21,13 +21,27 @@ public sealed class SurrealDbProgrammabilityRecordStore : IProgrammabilityRecord
     public async Task<T?> SelectRecordAsync<T>(string table, string recordKey, CancellationToken ct) where T : class
     {
         var client = await GetClientAsync(ct);
-        return await client.Select<T>(new RecordIdOfString(table, recordKey), ct);
+        try
+        {
+            return await client.Select<T>(new RecordIdOfString(table, recordKey), ct);
+        }
+        catch (Exception ex) when (SurrealDbErrors.IsMissingTable(ex))
+        {
+            return null;
+        }
     }
 
     public async Task<List<T>> SelectTableRecordsAsync<T>(string table, CancellationToken ct)
     {
         var client = await GetClientAsync(ct);
-        return (await client.Select<T>(table, ct)).ToList();
+        try
+        {
+            return (await client.Select<T>(table, ct)).ToList();
+        }
+        catch (Exception ex) when (SurrealDbErrors.IsMissingTable(ex))
+        {
+            return [];
+        }
     }
 
     public async Task CreateRecordAsync<T>(string table, string recordKey, T record, CancellationToken ct)
@@ -61,7 +75,16 @@ public sealed class SurrealDbProgrammabilityRecordStore : IProgrammabilityRecord
     public async Task DeleteRecordAsync(string table, string recordKey, string resourceType, string resourceId, CancellationToken ct)
     {
         var client = await GetClientAsync(ct);
-        var deleted = await client.Delete(new RecordIdOfString(table, recordKey), ct);
+        bool deleted;
+        try
+        {
+            deleted = await client.Delete(new RecordIdOfString(table, recordKey), ct);
+        }
+        catch (Exception ex) when (SurrealDbErrors.IsMissingTable(ex))
+        {
+            deleted = false;
+        }
+
         if (!deleted)
         {
             throw CosmosEmulatorException.NotFound(resourceType, resourceId);

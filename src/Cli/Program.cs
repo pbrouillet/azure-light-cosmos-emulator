@@ -27,7 +27,7 @@ public static partial class Program
         {
             var rootCommand = BuildRootCommand();
             return await rootCommand
-                .Parse(args, new CommandLineConfiguration(rootCommand))
+                .Parse(args)
                 .InvokeAsync();
         }
         catch (Exception ex)

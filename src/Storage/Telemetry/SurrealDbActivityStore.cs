@@ -100,6 +100,12 @@ public class SurrealDbActivityStore : IActivityStore
     {
         var client = await GetClientAsync(ct);
         var response = await client.RawQuery(sql, parameters ?? EmptyParameters, ct);
+        if (SurrealDbErrors.IsMissingTable(response))
+        {
+            // No-op: operating on a table that was never created.
+            return;
+        }
+
         response.EnsureAllOks();
     }
 
@@ -107,6 +113,11 @@ public class SurrealDbActivityStore : IActivityStore
     {
         var client = await GetClientAsync(ct);
         var response = await client.RawQuery(sql, parameters ?? EmptyParameters, ct);
+        if (SurrealDbErrors.IsMissingTable(response))
+        {
+            return [];
+        }
+
         response.EnsureAllOks();
         return response.GetValues<T>(0).ToList();
     }

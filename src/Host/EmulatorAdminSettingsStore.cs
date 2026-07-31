@@ -28,7 +28,16 @@ public sealed class EmulatorAdminSettingsStore
     public async Task<EmulatorAdminSettings?> GetStoredSettingsAsync(CancellationToken ct = default)
     {
         if (_connectionManager is not null)
-            return await _connectionManager.Client.Select<EmulatorAdminSettings>(new RecordIdOfString(TableName, RecordKey), ct);
+        {
+            try
+            {
+                return await _connectionManager.Client.Select<EmulatorAdminSettings>(new RecordIdOfString(TableName, RecordKey), ct);
+            }
+            catch (Exception ex) when (SurrealDbErrors.IsMissingTable(ex))
+            {
+                return null;
+            }
+        }
 
         _inMemoryStore.TryGetValue(RecordKey, out var settings);
         return settings;

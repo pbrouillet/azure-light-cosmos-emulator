@@ -244,12 +244,25 @@ public class SurrealDbChangeFeedProvider : IChangeFeedProvider
     {
         var client = await GetClientAsync(ct);
         var response = await client.RawQuery(sql, parameters ?? EmptyParameters, ct);
+        if (SurrealDbErrors.IsMissingTable(response))
+        {
+            // No-op: operating on a table that was never created.
+            return;
+        }
+
         response.EnsureAllOks();
     }
 
     private async Task<List<T>> SelectTableRecordsAsync<T>(string table, CancellationToken ct)
     {
         var client = await GetClientAsync(ct);
-        return (await client.Select<T>(table, ct)).ToList();
+        try
+        {
+            return (await client.Select<T>(table, ct)).ToList();
+        }
+        catch (Exception ex) when (SurrealDbErrors.IsMissingTable(ex))
+        {
+            return [];
+        }
     }
 }
