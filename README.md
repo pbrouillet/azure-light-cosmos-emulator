@@ -101,6 +101,25 @@ docker compose -f docker/docker-compose.yml up --build
 as workflow artifacts), a Docker image build, an Explorer SPA build (with an
 asset-drift guard), and an opt-in official-SDK E2E job.
 
+Pushing a semantic-version tag such as `v0.2.0` runs
+[`release.yml`](.github/workflows/release.yml) and publishes a GitHub Release for
+Linux x86_64. The release contains an Explorer-enabled AppImage, separate
+Explorer-enabled and slim `.tar.gz` archives, and a `SHA256SUMS` file. The same
+files are retained as a GitHub Actions artifact. The tag version must match
+`workspace.package.version` in `Cargo.toml`.
+
+Run the AppImage directly and pass it the normal CLI subcommand:
+
+```bash
+chmod +x cosmos-emulator-0.2.0-linux-x86_64.AppImage
+./cosmos-emulator-0.2.0-linux-x86_64.AppImage start
+sha256sum --check SHA256SUMS
+```
+
+The `with-explorer` archive is the self-contained build used by the AppImage.
+The smaller `slim` archive requires an external Explorer directory if the web
+UI is needed.
+
 ## Parity
 
 `crates/parity` (`cargo test -p cosmos-parity`) is a black-box harness that boots

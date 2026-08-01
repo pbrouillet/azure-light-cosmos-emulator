@@ -14,9 +14,11 @@ on:
       - 'Cargo.lock'
       - 'perf/**'
       - 'docker/**'
+      - 'packaging/**'
       - 'explorer/**'
       - 'crates/explorer/wwwroot/explorer/**'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/release.yml'
   pull_request:
     paths:
       - 'crates/**'
@@ -24,9 +26,11 @@ on:
       - 'Cargo.lock'
       - 'perf/**'
       - 'docker/**'
+      - 'packaging/**'
       - 'explorer/**'
       - 'crates/explorer/wwwroot/explorer/**'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/release.yml'
 
 permissions:
   contents: read

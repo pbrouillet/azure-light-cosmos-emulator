@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version label used for build artifacts
+        required: true
+        default: dev
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  package:
+    name: package Linux x86_64
+    runs-on: ubuntu-22.04
+    needs: check
+    outputs:
+      artifact-name: ${{ steps.names.outputs.artifact-name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve package names
+        id: names
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Release tag must use vMAJOR.MINOR.PATCH format"
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME#v}"
+            cargo_version="$(
+              cargo metadata --no-deps --format-version 1 |
+                jq -r '.packages[] | select(.name == "cosmos-cli") | .version'
+            )"
+            if [[ "$cargo_version" != "$version" ]]; then
+              echo "::error::Tag version $version does not match Cargo version $cargo_version"
+              exit 1
+            fi
+          else
+            version="$INPUT_VERSION"
+          fi
+          if [[ ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::Version label contains unsupported characters"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=cosmos-emulator-$version-linux-x86_64" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+
+      - name: Build with Explorer
+        run: |
+          cargo build --release --locked -p cosmos-cli
+          install -Dm755 target/release/cosmos-emulator \
+            staging/with-explorer/cosmos-emulator
+
+      - name: Build slim
+        run: |
+          cargo build --release --locked -p cosmos-cli --no-default-features
+          install -Dm755 target/release/cosmos-emulator \
+            staging/slim/cosmos-emulator
+
+      - name: Create binary archives
+        env:
+          VERSION: ${{ steps.names.outputs.version }}
+        run: |
+          mkdir -p dist
+          tar -C staging/with-explorer -czf \
+            "dist/cosmos-emulator-$VERSION-linux-x86_64-with-explorer.tar.gz" \
+            cosmos-emulator
+          tar -C staging/slim -czf \
+            "dist/cosmos-emulator-$VERSION-linux-x86_64-slim.tar.gz" \
+            cosmos-emulator
+
+      - name: Assemble AppDir
+        run: |
+          install -Dm755 packaging/appimage/AppRun appdir/AppRun
+          install -Dm755 staging/with-explorer/cosmos-emulator \
+            appdir/usr/bin/cosmos-emulator
+          install -Dm644 packaging/appimage/cosmos-emulator.desktop \
+            appdir/cosmos-emulator.desktop
+          install -Dm644 assets/icon.png appdir/cosmos-emulator.png
+          ln -s cosmos-emulator.png appdir/.DirIcon
+
+      - name: Build AppImage
+        env:
+          VERSION: ${{ steps.names.outputs.version }}
+          APPIMAGETOOL_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
+          APPIMAGE_RUNTIME_SHA256: 1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            --output appimagetool
+          curl --fail --location --silent --show-error \
+            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64 \
+            --output runtime-x86_64
+          echo "$APPIMAGETOOL_SHA256  appimagetool" | sha256sum --check
+          echo "$APPIMAGE_RUNTIME_SHA256  runtime-x86_64" | sha256sum --check
+          chmod +x appimagetool
+          ARCH=x86_64 VERSION="$VERSION" ./appimagetool --appimage-extract-and-run \
+            --runtime-file runtime-x86_64 \
+            appdir "dist/cosmos-emulator-$VERSION-linux-x86_64.AppImage"
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum ./* > SHA256SUMS
+
+      - name: Inspect packages
+        env:
+          VERSION: ${{ steps.names.outputs.version }}
+        run: |
+          tar -tzf "dist/cosmos-emulator-$VERSION-linux-x86_64-with-explorer.tar.gz"
+          tar -tzf "dist/cosmos-emulator-$VERSION-linux-x86_64-slim.tar.gz"
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+            "dist/cosmos-emulator-$VERSION-linux-x86_64.AppImage" --version
+          (cd dist && sha256sum --check SHA256SUMS)
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.names.outputs.artifact-name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    needs: package
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.artifact-name }}
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -f dist/SHA256SUMS
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 4
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

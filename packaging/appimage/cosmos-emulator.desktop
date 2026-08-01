@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Azure Light Cosmos Emulator
+Comment=Run the Azure Cosmos DB light emulator
+Exec=cosmos-emulator start
+Icon=cosmos-emulator
+Terminal=true
+Categories=Development;Database;
