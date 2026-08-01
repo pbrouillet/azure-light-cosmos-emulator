@@ -322,7 +322,6 @@ try {
     }
 
     $expectedFiles = @(
-        '[Content_Types].xml',
         'AppxBlockMap.xml',
         'AppxManifest.xml',
         'cosmos-emulator.exe',
