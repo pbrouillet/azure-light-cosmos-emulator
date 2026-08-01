@@ -77,16 +77,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-registry-release-release-
             ${{ runner.os }}-cargo-
 
       - name: Format check
@@ -110,17 +109,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-release-
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-release-
 
       - name: Build with Explorer
         run: |
@@ -219,17 +216,16 @@ jobs:
         with:
           targets: ${{ matrix.rust-target }}
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
-            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-registry-release-
+            ${{ runner.os }}-cargo-registry-release-
 
       - name: Build with Explorer
         shell: pwsh
@@ -431,17 +427,16 @@ jobs:
         with:
           targets: ${{ matrix.rust-target }}
 
-      - name: Cache cargo registry and target
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
-            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-registry-release-
+            ${{ runner.os }}-cargo-registry-release-
 
       - name: Build with Explorer
         run: |
