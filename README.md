@@ -102,23 +102,53 @@ as workflow artifacts), a Docker image build, an Explorer SPA build (with an
 asset-drift guard), and an opt-in official-SDK E2E job.
 
 Pushing a semantic-version tag such as `v0.2.0` runs
-[`release.yml`](.github/workflows/release.yml) and publishes a GitHub Release for
-Linux x86_64. The release contains an Explorer-enabled AppImage, separate
-Explorer-enabled and slim `.tar.gz` archives, and a `SHA256SUMS` file. The same
-files are retained as a GitHub Actions artifact. The tag version must match
-`workspace.package.version` in `Cargo.toml`.
+[`release.yml`](.github/workflows/release.yml) and publishes a cross-platform
+GitHub Release. The tag version must match `workspace.package.version` in
+`Cargo.toml`.
+
+| Platform | Architectures | Explorer-enabled installer | Binary archives |
+| --- | --- | --- | --- |
+| Linux | x86_64 | AppImage | Explorer and slim `.tar.gz` |
+| Windows | x64, ARM64 | signed MSIX | Explorer and slim `.zip` |
+| macOS | Intel x86_64, Apple Silicon ARM64 | PKG | Explorer and slim `.tar.gz` |
+
+Installers contain the self-contained Explorer build. The smaller `slim`
+archives require an external Explorer directory if the web UI is needed. Every
+release also contains one `SHA256SUMS` manifest, and the complete release is
+retained as a GitHub Actions artifact.
 
 Run the AppImage directly and pass it the normal CLI subcommand:
 
 ```bash
-chmod +x cosmos-emulator-0.2.0-linux-x86_64.AppImage
-./cosmos-emulator-0.2.0-linux-x86_64.AppImage start
+chmod +x cosmos-emulator-1.2.3-linux-x86_64.AppImage
+./cosmos-emulator-1.2.3-linux-x86_64.AppImage start
 sha256sum --check SHA256SUMS
 ```
 
-The `with-explorer` archive is the self-contained build used by the AppImage.
-The smaller `slim` archive requires an external Explorer directory if the web
-UI is needed.
+Install a Windows package with `Add-AppxPackage <package>.msix`. The MSIX adds a
+`cosmos-emulator.exe` app execution alias. Tagged releases require repository
+secrets `WINDOWS_PFX_BASE64` and `WINDOWS_PFX_PASSWORD`; the certificate subject
+is used as the MSIX Publisher and must chain to a certificate trusted by the
+target system.
+
+Install a macOS package with:
+
+```bash
+sudo installer -pkg cosmos-emulator-1.2.3-macos-aarch64.pkg -target /
+```
+
+macOS packages are signed and notarized when all of these repository secrets
+are configured: `APPLE_CERTIFICATE_P12_BASE64`,
+`APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY_APPLICATION`,
+`APPLE_SIGNING_IDENTITY_INSTALLER`, `APPLE_ID`, `APPLE_TEAM_ID`, and
+`APPLE_APP_PASSWORD`. Otherwise unsigned PKGs are published; macOS may require
+explicit approval in Privacy & Security before opening downloaded unsigned
+software. A partially configured Apple secret set fails instead of silently
+falling back to unsigned output when signing is requested.
+
+Manual release workflow runs default to unsigned packages so both fallback
+paths remain testable. Set the `sign_artifacts` input to use configured signing
+credentials during a manual run.
 
 ## Parity
 

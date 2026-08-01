@@ -9,7 +9,12 @@ on:
       version:
         description: Version label used for build artifacts
         required: true
-        default: dev
+        default: 0.0.0
+      sign_artifacts:
+        description: Sign manual-build artifacts when credentials are configured
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,6 +23,49 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  metadata:
+    name: resolve release metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      msix-version: ${{ steps.release.outputs.msix-version }}
+      artifact-base: ${{ steps.release.outputs.artifact-base }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve package names
+        id: release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Release tag must use vMAJOR.MINOR.PATCH format"
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME#v}"
+            cargo_version="$(
+              cargo metadata --no-deps --format-version 1 |
+                jq -r '.packages[] | select(.name == "cosmos-cli") | .version'
+            )"
+            if [[ "$cargo_version" != "$version" ]]; then
+              echo "::error::Tag version $version does not match Cargo version $cargo_version"
+              exit 1
+            fi
+          else
+            version="$INPUT_VERSION"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must use MAJOR.MINOR.PATCH format"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "msix-version=$version.0" >> "$GITHUB_OUTPUT"
+          echo "artifact-base=cosmos-emulator-$version" >> "$GITHUB_OUTPUT"
+
   check:
     name: fmt / clippy / test
     runs-on: ubuntu-22.04
@@ -50,46 +98,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  package:
+  package-linux:
     name: package Linux x86_64
     runs-on: ubuntu-22.04
-    needs: check
-    outputs:
-      artifact-name: ${{ steps.names.outputs.artifact-name }}
+    needs:
+      - metadata
+      - check
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Resolve package names
-        id: names
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::Release tag must use vMAJOR.MINOR.PATCH format"
-              exit 1
-            fi
-            version="${GITHUB_REF_NAME#v}"
-            cargo_version="$(
-              cargo metadata --no-deps --format-version 1 |
-                jq -r '.packages[] | select(.name == "cosmos-cli") | .version'
-            )"
-            if [[ "$cargo_version" != "$version" ]]; then
-              echo "::error::Tag version $version does not match Cargo version $cargo_version"
-              exit 1
-            fi
-          else
-            version="$INPUT_VERSION"
-          fi
-          if [[ ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-            echo "::error::Version label contains unsupported characters"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "artifact-name=cosmos-emulator-$version-linux-x86_64" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4
@@ -117,7 +136,7 @@ jobs:
 
       - name: Create binary archives
         env:
-          VERSION: ${{ steps.names.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           mkdir -p dist
           tar -C staging/with-explorer -czf \
@@ -139,7 +158,7 @@ jobs:
 
       - name: Build AppImage
         env:
-          VERSION: ${{ steps.names.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
           APPIMAGETOOL_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
           APPIMAGE_RUNTIME_SHA256: 1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf
         run: |
@@ -156,25 +175,479 @@ jobs:
             --runtime-file runtime-x86_64 \
             appdir "dist/cosmos-emulator-$VERSION-linux-x86_64.AppImage"
 
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum ./* > SHA256SUMS
-
       - name: Inspect packages
         env:
-          VERSION: ${{ steps.names.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           tar -tzf "dist/cosmos-emulator-$VERSION-linux-x86_64-with-explorer.tar.gz"
           tar -tzf "dist/cosmos-emulator-$VERSION-linux-x86_64-slim.tar.gz"
           APPIMAGE_EXTRACT_AND_RUN=1 \
             "dist/cosmos-emulator-$VERSION-linux-x86_64.AppImage" --version
-          (cd dist && sha256sum --check SHA256SUMS)
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
 
       - name: Upload release packages
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.names.outputs.artifact-name }}
+          name: ${{ needs.metadata.outputs.artifact-base }}-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  package-windows:
+    name: package Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    needs:
+      - metadata
+      - check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            rust-target: x86_64-pc-windows-msvc
+            arch: x86_64
+            msix-arch: x64
+          - runner: windows-11-arm
+            rust-target: aarch64-pc-windows-msvc
+            arch: aarch64
+            msix-arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
+            ${{ runner.os }}-cargo-release-
+
+      - name: Build with Explorer
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p cosmos-cli `
+            --target "${{ matrix.rust-target }}"
+          New-Item -ItemType Directory -Force staging/with-explorer | Out-Null
+          Copy-Item `
+            "target/${{ matrix.rust-target }}/release/cosmos-emulator.exe" `
+            staging/with-explorer/cosmos-emulator.exe
+
+      - name: Build slim
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p cosmos-cli `
+            --no-default-features --target "${{ matrix.rust-target }}"
+          New-Item -ItemType Directory -Force staging/slim | Out-Null
+          Copy-Item `
+            "target/${{ matrix.rust-target }}/release/cosmos-emulator.exe" `
+            staging/slim/cosmos-emulator.exe
+
+      - name: Evaluate Windows signing configuration
+        id: windows-signing
+        shell: pwsh
+        env:
+          CERTIFICATE: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          SIGN_REQUESTED: ${{ github.ref_type == 'tag' || inputs.sign_artifacts }}
+        run: |
+          $hasCertificate = -not [string]::IsNullOrWhiteSpace($env:CERTIFICATE)
+          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:CERTIFICATE_PASSWORD)
+          $signRequested = $env:SIGN_REQUESTED -eq 'true'
+          if ($signRequested -and $hasCertificate -ne $hasPassword) {
+            throw 'Windows signing is partially configured; set both documented secrets'
+          }
+          if ($signRequested -and -not $hasCertificate) {
+            throw 'Signing requires WINDOWS_PFX_BASE64 and WINDOWS_PFX_PASSWORD'
+          }
+          $signingEnabled = $signRequested -and $hasCertificate
+          "enabled=$($signingEnabled.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (-not $signingEnabled) {
+            Write-Warning 'Building unsigned MSIX test artifacts for this manual run'
+          }
+
+      - name: Import Windows signing certificate
+        id: import-windows-certificate
+        if: steps.windows-signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          CERTIFICATE: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString `
+            $env:CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificates = Import-PfxCertificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password
+          $certificate = $certificates |
+            Where-Object HasPrivateKey |
+            Select-Object -First 1
+          if (-not $certificate) {
+            throw 'The Windows PFX does not contain a private signing key'
+          }
+          "publisher=$($certificate.Subject)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "thumbprint=$($certificate.Thumbprint)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Sign Windows binaries
+        if: steps.windows-signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          THUMBPRINT: ${{ steps.import-windows-certificate.outputs.thumbprint }}
+        run: |
+          foreach ($binary in @(
+            'staging/with-explorer/cosmos-emulator.exe',
+            'staging/slim/cosmos-emulator.exe'
+          )) {
+            packaging/msix/Sign-WindowsFile.ps1 `
+              -FilePath $binary `
+              -CertificateThumbprint $env:THUMBPRINT `
+              -TimestampUrl 'http://timestamp.digicert.com'
+          }
+
+      - name: Create Windows binary archives
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive `
+            -LiteralPath staging/with-explorer/cosmos-emulator.exe `
+            -DestinationPath "dist/cosmos-emulator-$env:VERSION-windows-$env:ARCH-with-explorer.zip"
+          Compress-Archive `
+            -LiteralPath staging/slim/cosmos-emulator.exe `
+            -DestinationPath "dist/cosmos-emulator-$env:VERSION-windows-$env:ARCH-slim.zip"
+
+      - name: Build Windows MSIX
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          MSIX_VERSION: ${{ needs.metadata.outputs.msix-version }}
+          ARCH: ${{ matrix.arch }}
+          PUBLISHER: ${{ steps.import-windows-certificate.outputs.publisher }}
+        run: |
+          $publisher = $env:PUBLISHER
+          if ([string]::IsNullOrWhiteSpace($publisher)) {
+            $publisher = 'CN=Unsigned Development Build'
+          }
+          packaging/msix/package.ps1 `
+            -Binary staging/with-explorer/cosmos-emulator.exe `
+            -Output "dist/cosmos-emulator-$env:VERSION-windows-$env:ARCH.msix" `
+            -Version $env:MSIX_VERSION `
+            -Architecture "${{ matrix.msix-arch }}" `
+            -Publisher $publisher
+
+      - name: Sign Windows MSIX
+        if: steps.windows-signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          THUMBPRINT: ${{ steps.import-windows-certificate.outputs.thumbprint }}
+        run: |
+          packaging/msix/Sign-Msix.ps1 `
+            -PackagePath "dist/cosmos-emulator-$env:VERSION-windows-$env:ARCH.msix" `
+            -CertificateThumbprint $env:THUMBPRINT `
+            -TimestampUrl 'http://timestamp.digicert.com'
+
+      - name: Inspect Windows packages
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          & staging/with-explorer/cosmos-emulator.exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Explorer-enabled binary version check failed'
+          }
+          & staging/slim/cosmos-emulator.exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Slim binary version check failed'
+          }
+          $files = Get-ChildItem dist -File
+          if ($files.Count -ne 3) {
+            throw "Expected three Windows packages, found $($files.Count)"
+          }
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.metadata.outputs.artifact-base }}-windows-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove Windows signing material
+        if: always()
+        shell: pwsh
+        env:
+          THUMBPRINT: ${{ steps.import-windows-certificate.outputs.thumbprint }}
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:THUMBPRINT)) {
+            Remove-Item "Cert:\CurrentUser\My\$env:THUMBPRINT" `
+              -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item "$env:RUNNER_TEMP/windows-signing.pfx" `
+            -Force -ErrorAction SilentlyContinue
+
+  package-macos:
+    name: package macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    needs:
+      - metadata
+      - check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            arch: x86_64
+          - runner: macos-15
+            rust-target: aarch64-apple-darwin
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
+            ${{ runner.os }}-cargo-release-
+
+      - name: Build with Explorer
+        run: |
+          cargo build --release --locked -p cosmos-cli \
+            --target "${{ matrix.rust-target }}"
+          mkdir -p staging/with-explorer
+          install -m 0755 \
+            "target/${{ matrix.rust-target }}/release/cosmos-emulator" \
+            staging/with-explorer/cosmos-emulator
+
+      - name: Build slim
+        run: |
+          cargo build --release --locked -p cosmos-cli \
+            --no-default-features --target "${{ matrix.rust-target }}"
+          mkdir -p staging/slim
+          install -m 0755 \
+            "target/${{ matrix.rust-target }}/release/cosmos-emulator" \
+            staging/slim/cosmos-emulator
+
+      - name: Evaluate Apple signing configuration
+        id: apple-signing
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLICATION_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY_APPLICATION }}
+          INSTALLER_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY_INSTALLER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          SIGN_REQUESTED: ${{ github.ref_type == 'tag' || inputs.sign_artifacts }}
+        run: |
+          configured=0
+          for value in \
+            "$CERTIFICATE" "$CERTIFICATE_PASSWORD" "$APPLICATION_IDENTITY" \
+            "$INSTALLER_IDENTITY" "$APPLE_ID" "$TEAM_ID" "$APP_PASSWORD"
+          do
+            if [[ -n "$value" ]]; then
+              configured=$((configured + 1))
+            fi
+          done
+          if [[ "$SIGN_REQUESTED" == "true" &&
+            "$configured" -ne 0 && "$configured" -ne 7 ]]
+          then
+            echo "::error::Apple signing is partially configured; set all documented secrets or none"
+            exit 1
+          fi
+          if [[ "$SIGN_REQUESTED" == "true" && "$configured" -eq 7 ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Apple signing and notarization are enabled"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Publishing unsigned macOS packages because Apple signing secrets are not configured"
+          fi
+
+      - name: Import Apple signing identities
+        if: steps.apple-signing.outputs.enabled == 'true'
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          certificate="$RUNNER_TEMP/apple-signing.p12"
+          keychain="$RUNNER_TEMP/release-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          printf '%s' "$CERTIFICATE" |
+            openssl base64 -d -A -out "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" -A \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          security list-keychains -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$keychain_password" "$keychain"
+
+      - name: Sign macOS binaries
+        if: steps.apple-signing.outputs.enabled == 'true'
+        env:
+          APPLICATION_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY_APPLICATION }}
+        run: |
+          for binary in \
+            staging/with-explorer/cosmos-emulator \
+            staging/slim/cosmos-emulator
+          do
+            codesign --force --options runtime --timestamp \
+              --sign "$APPLICATION_IDENTITY" "$binary"
+            codesign --verify --strict --verbose=2 "$binary"
+          done
+
+      - name: Create binary archives
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          tar -C staging/with-explorer -czf \
+            "dist/cosmos-emulator-$VERSION-macos-$ARCH-with-explorer.tar.gz" \
+            cosmos-emulator
+          tar -C staging/slim -czf \
+            "dist/cosmos-emulator-$VERSION-macos-$ARCH-slim.tar.gz" \
+            cosmos-emulator
+
+      - name: Build signed macOS package
+        if: steps.apple-signing.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          INSTALLER_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY_INSTALLER }}
+        run: |
+          packaging/macos/build-pkg.sh \
+            --version "$VERSION" \
+            --input staging/with-explorer/cosmos-emulator \
+            --output "dist/cosmos-emulator-$VERSION-macos-$ARCH.pkg" \
+            --sign "$INSTALLER_IDENTITY"
+
+      - name: Build unsigned macOS package
+        if: steps.apple-signing.outputs.enabled != 'true'
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          packaging/macos/build-pkg.sh \
+            --version "$VERSION" \
+            --input staging/with-explorer/cosmos-emulator \
+            --output "dist/cosmos-emulator-$VERSION-macos-$ARCH.pkg"
+
+      - name: Notarize macOS package
+        if: steps.apple-signing.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          package="dist/cosmos-emulator-$VERSION-macos-$ARCH.pkg"
+          xcrun notarytool submit "$package" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "$package"
+          xcrun stapler validate "$package"
+
+      - name: Inspect macOS packages
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          SIGNED: ${{ steps.apple-signing.outputs.enabled }}
+        run: |
+          package="dist/cosmos-emulator-$VERSION-macos-$ARCH.pkg"
+          if [[ "$SIGNED" == "true" ]]; then
+            packaging/macos/inspect-pkg.sh --require-signed "$package"
+          else
+            packaging/macos/inspect-pkg.sh --require-unsigned "$package"
+          fi
+          staging/with-explorer/cosmos-emulator --version
+          staging/slim/cosmos-emulator --version
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.metadata.outputs.artifact-base }}-macos-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove Apple signing material
+        if: always()
+        run: |
+          keychain="$RUNNER_TEMP/release-signing.keychain-db"
+          if [[ -f "$keychain" ]]; then
+            security delete-keychain "$keychain"
+          fi
+          rm -f "$RUNNER_TEMP/apple-signing.p12"
+
+  assemble:
+    name: assemble release assets
+    runs-on: ubuntu-22.04
+    needs:
+      - metadata
+      - package-linux
+      - package-windows
+      - package-macos
+    steps:
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ needs.metadata.outputs.artifact-base }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate aggregate checksums
+        run: |
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 15
+          (
+            cd dist
+            sha256sum ./* > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Upload complete release
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.metadata.outputs.artifact-base }}-release
           path: dist/
           if-no-files-found: error
           retention-days: 30
@@ -183,14 +656,16 @@ jobs:
     name: publish GitHub Release
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-22.04
-    needs: package
+    needs:
+      - metadata
+      - assemble
     permissions:
       contents: write
     steps:
       - name: Download release packages
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.package.outputs.artifact-name }}
+          name: ${{ needs.metadata.outputs.artifact-base }}-release
           path: dist
 
       - name: Publish release
@@ -198,7 +673,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           test -f dist/SHA256SUMS
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 4
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 16
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \

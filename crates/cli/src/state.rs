@@ -53,8 +53,25 @@ pub struct CurrentInstancePointer {
     pub data_directory: String,
 }
 
-/// The platform local-application-data directory (matches .NET
-/// `Environment.SpecialFolder.LocalApplicationData`).
+/// The platform local-application-data directory.
+#[cfg(target_os = "windows")]
+fn local_app_data() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(target_os = "macos")]
+fn local_app_data() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join("Library").join("Application Support"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn local_app_data() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
         if !dir.is_empty() {
@@ -75,6 +92,18 @@ pub fn global_state_dir() -> PathBuf {
 /// The default data directory: `<global-state-dir>/data`.
 pub fn default_data_dir() -> PathBuf {
     global_state_dir().join("data")
+}
+
+#[cfg(unix)]
+pub fn current_process_started_at_utc() -> Option<DateTime<Utc>> {
+    Some(Utc::now())
+}
+
+#[cfg(target_os = "windows")]
+pub fn current_process_started_at_utc() -> Option<DateTime<Utc>> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    process_started_at_utc(unsafe { GetCurrentProcess() })
 }
 
 fn current_instance_file() -> PathBuf {
@@ -152,7 +181,8 @@ pub fn cleanup_state_files(data_directory: &str) {
     }
 }
 
-/// Returns `true` if the recorded process is still alive (Unix: signal 0 probe).
+/// Returns `true` if the recorded process is still alive.
+#[cfg(unix)]
 pub fn is_process_running(state: &EmulatorInstanceState) -> bool {
     if state.process_id <= 0 {
         return false;
@@ -166,9 +196,95 @@ pub fn is_process_running(state: &EmulatorInstanceState) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Sends SIGTERM to the recorded process.
-pub fn terminate_process(pid: i32) {
+#[cfg(target_os = "windows")]
+pub fn is_process_running(state: &EmulatorInstanceState) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let Some(handle) = open_matching_process(state, PROCESS_QUERY_LIMITED_INFORMATION) else {
+        return false;
+    };
+    let mut exit_code = 0;
+    let running = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0 && exit_code == 259;
     unsafe {
-        libc::kill(pid, libc::SIGTERM);
+        CloseHandle(handle);
+    }
+    running
+}
+
+#[cfg(target_os = "windows")]
+fn process_started_at_utc(
+    process: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<DateTime<Utc>> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    if unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+    let unix_ticks = ticks.checked_sub(116_444_736_000_000_000)?;
+    let seconds = (unix_ticks / 10_000_000) as i64;
+    let nanoseconds = ((unix_ticks % 10_000_000) * 100) as u32;
+    DateTime::from_timestamp(seconds, nanoseconds)
+}
+
+#[cfg(target_os = "windows")]
+fn open_matching_process(
+    state: &EmulatorInstanceState,
+    access: u32,
+) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+
+    if state.process_id <= 0 {
+        return None;
+    }
+    let expected_started_at = state.process_started_at_utc?;
+    let handle = unsafe { OpenProcess(access, 0, state.process_id as u32) };
+    if handle.is_null() {
+        return None;
+    }
+    if process_started_at_utc(handle) != Some(expected_started_at) {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return None;
+    }
+    Some(handle)
+}
+
+/// Requests that the recorded process terminate.
+#[cfg(unix)]
+pub fn terminate_process(state: &EmulatorInstanceState) {
+    unsafe {
+        libc::kill(state.process_id, libc::SIGTERM);
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn terminate_process(state: &EmulatorInstanceState) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    let Some(handle) =
+        open_matching_process(state, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE)
+    else {
+        return;
+    };
+    unsafe {
+        TerminateProcess(handle, 1);
+        CloseHandle(handle);
     }
 }

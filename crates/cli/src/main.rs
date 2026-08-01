@@ -14,8 +14,9 @@ use std::process::Stdio;
 use clap::{Parser, Subcommand, ValueEnum};
 use cosmos_host::{HostOptions, DEFAULT_PORT};
 use state::{
-    cleanup_state_files, default_data_dir, is_process_running, persist_state, terminate_process,
-    try_load_current_state, EmulatorInstanceState, DEFAULT_CONSISTENCY,
+    cleanup_state_files, current_process_started_at_utc, default_data_dir, is_process_running,
+    persist_state, terminate_process, try_load_current_state, EmulatorInstanceState,
+    DEFAULT_CONSISTENCY,
 };
 
 const DEFAULT_MONGO_PORT: u16 = 10255;
@@ -228,7 +229,7 @@ async fn start(args: StartArgs, run_host_internal: bool) -> Result<i32, anyhow::
     // Foreground / internal host: persist state, then serve.
     let state = EmulatorInstanceState {
         process_id: std::process::id() as i32,
-        process_started_at_utc: Some(chrono::Utc::now()),
+        process_started_at_utc: current_process_started_at_utc(),
         port,
         mongo_port,
         data_directory: data_dir.to_string_lossy().to_string(),
@@ -337,7 +338,7 @@ async fn stop() -> i32 {
         println!("Emulator is not running.");
         return 0;
     }
-    terminate_process(state.process_id);
+    terminate_process(&state);
     // Give the process a moment to exit.
     for _ in 0..40 {
         if !is_process_running(&state) {
