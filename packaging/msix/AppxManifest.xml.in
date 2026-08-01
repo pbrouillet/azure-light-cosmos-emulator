@@ -34,7 +34,8 @@
     <Application
       Id="CosmosEmulator"
       Executable="cosmos-emulator.exe"
-      EntryPoint="Windows.FullTrustApplication">
+      EntryPoint="Windows.FullTrustApplication"
+      desktop4:SupportsMultipleInstances="true">
       <uap:VisualElements
         DisplayName="Azure Light Cosmos Emulator"
         Description="Azure Light Cosmos Emulator with Explorer"

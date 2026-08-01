@@ -374,6 +374,7 @@ try {
     if (-not $application -or
         $application.GetAttribute('Executable') -ne 'cosmos-emulator.exe' -or
         $application.GetAttribute('EntryPoint') -ne 'Windows.FullTrustApplication' -or
+        $application.GetAttribute('SupportsMultipleInstances', $verifiedNamespaces.LookupNamespace('desktop4')) -ne 'true' -or
         -not $fullTrust -or -not $alias -or
         $alias.GetAttribute('Alias') -ne 'cosmos-emulator.exe') {
         throw 'Package verification failed: full-trust application or execution alias is invalid.'

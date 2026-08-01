@@ -124,8 +124,12 @@ case "$(uname -m)" in
     arm64|x86_64) native_arch=$(uname -m) ;;
     *) die "unsupported macOS runner architecture: $(uname -m)" ;;
 esac
-lipo -verify_arch "$native_arch" "$binary" >/dev/null 2>&1 ||
-    die "packaged binary is not a native $native_arch Mach-O executable"
+binary_archs=$(lipo -archs "$binary") ||
+    die "could not inspect packaged Mach-O architectures"
+case " $binary_archs " in
+    *" $native_arch "*) ;;
+    *) die "packaged binary is not a native $native_arch Mach-O executable" ;;
+esac
 strings "$binary" | grep -Fq '/explorer/favicon.svg' ||
     die "packaged binary does not contain the embedded Explorer assets"
 
