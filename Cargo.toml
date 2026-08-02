@@ -17,7 +17,7 @@ members = [
 
 # Shared dependency versions. Individual crates opt in via `workspace = true`.
 [workspace.package]
-version = "1.0.3"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT"
@@ -30,7 +30,7 @@ axum = "0.7"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "cors", "normalize-path"] }
 hyper = "1"
 
 # Embedded static assets (Explorer SPA embedded into the host binary)

@@ -1122,7 +1122,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cosmos-auth"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-cli"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-core"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-explorer"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "axum",
  "mime_guess",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-host"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-kql"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-mongodb"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bson",
@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-nosql"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-parity"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-query"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-storage"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "cosmos-triggers"
-version = "1.0.3"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

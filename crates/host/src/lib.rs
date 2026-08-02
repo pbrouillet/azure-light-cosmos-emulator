@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::{http::HeaderMap, routing::get, Json, Router};
+use axum::{extract::Request, http::HeaderMap, routing::get, Json, Router, ServiceExt};
 use cosmos_core::models::VectorIndexOptions;
 use cosmos_core::traits::{
     ActivityStore, AuthProvider, DocumentStore, EmulatorInfoService, QueryTelemetryStore,
@@ -25,6 +25,8 @@ use cosmos_storage::{
     VectorIndexingDocumentStore,
 };
 use serde_json::json;
+use tower::Layer;
+use tower_http::normalize_path::NormalizePathLayer;
 
 mod admin;
 mod info;
@@ -246,6 +248,13 @@ pub async fn run(opts: HostOptions) -> Result<(), anyhow::Error> {
         maintenance::spawn(store.clone(), opts.consistency);
     }
     let app = build_router(&opts, store);
+    // Azure Cosmos SDKs append a trailing slash to resource-feed URLs (e.g.
+    // `/dbs/{db}/colls/`, `.../docs`). Axum treats `/x` and `/x/` as distinct
+    // routes, so those requests would 404. Normalizing the path *around* the
+    // router (before routing) makes the standard SDKs work unmodified. This must
+    // wrap the whole router rather than be added via `Router::layer`, which runs
+    // after routing and therefore too late to affect matching.
+    let app = NormalizePathLayer::trim_trailing_slash().layer(app);
     let addr = SocketAddr::from(([0, 0, 0, 0], opts.port));
     if let Some(mongo_port) = opts.mongo_port {
         tokio::spawn(async move {
@@ -270,11 +279,11 @@ pub async fn run(opts: HostOptions) -> Result<(), anyhow::Error> {
     if opts.enable_ssl {
         let config = tls_config(&opts).await?;
         axum_server::bind_rustls(addr, config)
-            .serve(app.into_make_service())
+            .serve(ServiceExt::<Request>::into_make_service(app))
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, ServiceExt::<Request>::into_make_service(app)).await?;
     }
     Ok(())
 }
@@ -335,6 +344,26 @@ mod tests {
         let app = build_router(&HostOptions::default(), store);
         let resp = app
             .oneshot(Request::builder().uri("/dbs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_is_normalized() {
+        // Azure Cosmos SDKs append a trailing slash to resource-feed URLs, so
+        // `/dbs/` must route like `/dbs`. The normalization is applied around the
+        // router in `run()`; replicate that wrapping here.
+        let store = Arc::new(InMemoryDocumentStore::new());
+        let app = build_router(&HostOptions::default(), store);
+        let app = NormalizePathLayer::trim_trailing_slash().layer(app);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dbs/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
